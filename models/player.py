@@ -9,6 +9,8 @@ class Player:
         self.balance = 1500
         self.pos = 0
         self.properties = []
+        self.in_jail = False
+        self.remaining_jail = 0
 
     def move(self, steps):
         """
