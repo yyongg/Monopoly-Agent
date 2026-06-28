@@ -30,6 +30,12 @@ class Game:
         # for headless play and the RL layer (which skips these prompts).
         self.notify = None
 
+        # Optional UI hook: called as on_shortfall(payer, amount) when a player
+        # owes more than they hold, before any forced bankruptcy, so they can
+        # raise cash by selling houses / mortgaging. Left as None for headless
+        # play and the RL layer (where liquidation is part of the policy).
+        self.on_shortfall = None
+
     def announce(self, message):
         """
         Reports an automatic game event via the optional ``notify`` hook so the
@@ -157,6 +163,53 @@ class Game:
         """
         return prop.unmortgage(self, player)
 
+    def can_trade_property(self, prop):
+        """
+        Returns whether a property may currently change hands in a trade. A
+        property with houses standing anywhere in its color group can't be
+        traded (the houses must be sold first); mortgaged properties may be
+        traded and carry their mortgage to the new owner.
+        """
+        return not prop.has_buildings(self)
+
+    def execute_trade(self, initiator, partner, give, receive, cash):
+        """
+        Swaps properties and cash between two players if the trade is valid.
+
+        Args:
+            initiator (Player): The player proposing the trade.
+            partner (Player): The other player in the trade.
+            give (list): Initiator's properties going to the partner.
+            receive (list): Partner's properties coming to the initiator.
+            cash (int): Net cash the initiator pays the partner. Negative means
+                the partner pays the initiator.
+
+        Returns:
+            bool: True if the trade was valid and carried out, else False (no
+                state is changed on failure).
+        """
+        # Validate ownership and that nothing carries buildings.
+        if any(p.owner is not initiator for p in give):
+            return False
+        if any(p.owner is not partner for p in receive):
+            return False
+        if any(p.has_buildings(self) for p in list(give) + list(receive)):
+            return False
+
+        # The cash payer must be able to cover the net amount.
+        if cash > 0 and initiator.balance < cash:
+            return False
+        if cash < 0 and partner.balance < -cash:
+            return False
+
+        initiator.balance -= cash
+        partner.balance += cash
+        for prop in give:
+            prop.transfer_ownership(partner)
+        for prop in receive:
+            prop.transfer_ownership(initiator)
+        return True
+
     def advance_to(self, player, dest):
         """
         Moves the player forward to absolute position `dest`, paying the GO
@@ -211,14 +264,19 @@ class Game:
     def pay(self, payer, amount, payee=None):
         """
         Transfers `amount` from `payer`. If `payee` is given the money goes to
-        them, otherwise it goes to the bank. A payer who cannot cover the amount
-        goes bankrupt.
+        them, otherwise it goes to the bank. A payer short of the amount is first
+        given a chance to raise cash (via the ``on_shortfall`` hook); if they
+        still cannot cover it, they go bankrupt.
 
         Args:
             payer (type[Player]): Player making the payment.
             amount (int): Amount owed.
             payee (type[Player]): Recipient, or None to pay the bank.
         """
+        # Let the payer liquidate assets before the payment forces bankruptcy.
+        if payer.balance < amount and self.on_shortfall is not None:
+            self.on_shortfall(payer, amount)
+
         payer.balance -= amount
         if payee is not None:
             payee.balance += amount

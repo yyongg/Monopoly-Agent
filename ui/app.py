@@ -69,6 +69,28 @@ def player_color(name):
     """Returns the marker color for a player name (gray if unknown)."""
     return PLAYER_COLORS.get(name, DEFAULT_COLOR)
 
+
+# Swatch colors for each street color group, plus the non-street property types.
+GROUP_COLORS = {
+    "brown": (124, 78, 51),
+    "light_blue": (170, 224, 250),
+    "pink": (213, 56, 145),
+    "orange": (244, 149, 31),
+    "red": (227, 38, 41),
+    "yellow": (254, 240, 64),
+    "green": (32, 165, 90),
+    "dark_blue": (0, 112, 186),
+}
+RAILROAD_COLOR = (40, 40, 40)
+UTILITY_COLOR = (200, 200, 200)
+
+
+def contrast_text(color):
+    """Returns black or white, whichever reads better on `color`."""
+    r, g, b = color
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return INK if luminance > 140 else (255, 255, 255)
+
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 
 
@@ -123,6 +145,8 @@ class MonopolyApp:
         game.on_card = self._show_card
         # Inform the player of automatic events (rent, tax, GO salary, ...).
         game.notify = self._inform
+        # Let a short player raise cash before being forced into bankruptcy.
+        game.on_shortfall = self._raise_funds
 
     @staticmethod
     def _font(size, bold=False):
@@ -231,6 +255,9 @@ class MonopolyApp:
         return (dx, dy)
 
     def _draw_board(self):
+        # Soft drop shadow behind the board for a bit of depth.
+        shadow = pygame.Rect(BOARD_X + 6, BOARD_Y + 8, BOARD_PX, BOARD_PX)
+        pygame.draw.rect(self.screen, (6, 48, 30), shadow, border_radius=6)
         self.screen.blit(self.board_img, (BOARD_X, BOARD_Y))
         self._draw_ownership()
         self._draw_house_indicators()
@@ -289,6 +316,15 @@ class MonopolyApp:
 
     # ----- players & inventory ------------------------------------------
 
+    def _net_worth(self, player):
+        """Cash plus the value of every property and house the player holds."""
+        total = player.balance
+        for prop in player.properties:
+            total += prop.mortgage_value if prop.mortgaged else prop.price
+            if isinstance(prop, StreetProperty):
+                total += prop.houses * prop.house_cost()
+        return total
+
     def _draw_players(self, y):
         self._text("Players", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         y += 42
@@ -300,17 +336,22 @@ class MonopolyApp:
             fill = ACCENT if player is current and not player.bankrupt else (
                 PANEL_ALT if selected else PANEL)
             self._panel(box, fill)
+            # Colored stripe down the left edge in the player's token color.
+            stripe = pygame.Rect(box.x, box.y, 7, box.height)
+            pygame.draw.rect(self.screen, player_color(player.name), stripe,
+                             border_top_left_radius=10, border_bottom_left_radius=10)
             token = pygame.transform.smoothscale(self.tokens[player.name], (28, 28))
-            self.screen.blit(token, (box.x + 10, box.y + 14))
+            self.screen.blit(token, (box.x + 18, box.y + 14))
             if player.bankrupt:
-                self._text(f"{player.name} — bankrupt", (box.x + 48, box.y + 16),
+                self._text(f"{player.name} — bankrupt", (box.x + 56, box.y + 16),
                            self.f_body, MUTED)
             else:
                 jail = "  (in jail)" if player.in_jail else ""
-                self._text(f"{player.name}{jail}", (box.x + 48, box.y + 8),
+                self._text(f"{player.name}{jail}", (box.x + 56, box.y + 8),
                            self.f_body, INK)
-                meta = f"${player.balance}   ·   {len(player.properties)} properties"
-                self._text(meta, (box.x + 48, box.y + 31), self.f_small, MUTED)
+                meta = (f"${player.balance}   ·   {len(player.properties)} props"
+                        f"   ·   net ${self._net_worth(player)}")
+                self._text(meta, (box.x + 56, box.y + 31), self.f_small, MUTED)
             rects.append((box, index))
             y += 64
         return y, rects
@@ -350,13 +391,33 @@ class MonopolyApp:
             if y > bottom - 30:
                 break
             houses, rent = self._rent_line(prop)
-            self._text(prop.name, (SIDE_X, y), self.f_small, FELT_INK,
-                       shadow=True)
+            self._draw_property_chip(prop, SIDE_X, y)
             info = f"{houses}  ·  {rent}"
             w = self.f_small.size(info)[0]
             self._text(info, (SIDE_X + SIDE_W - w, y), self.f_small, FELT_SUB,
                        shadow=True)
             y += 30
+
+    def _property_color(self, prop):
+        """Returns the color-group swatch color for a property."""
+        if isinstance(prop, StreetProperty):
+            return GROUP_COLORS.get(prop.color, DEFAULT_COLOR)
+        if isinstance(prop, Railroad):
+            return RAILROAD_COLOR
+        if isinstance(prop, Utility):
+            return UTILITY_COLOR
+        return DEFAULT_COLOR
+
+    def _draw_property_chip(self, prop, x, y):
+        """Draws the property name on a highlight chip in its group's color."""
+        color = self._property_color(prop)
+        tw = self.f_small.size(prop.name)[0]
+        chip = pygame.Rect(x - 4, y - 2, tw + 12, self.f_small.get_height() + 4)
+        pygame.draw.rect(self.screen, color, chip, border_radius=4)
+        pygame.draw.rect(self.screen, (0, 0, 0), chip, 1, border_radius=4)
+        self.screen.blit(
+            self.f_small.render(prop.name, True, contrast_text(color)),
+            (x + 2, y))
 
     def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
@@ -601,11 +662,24 @@ class MonopolyApp:
         return [t for t in player.properties
                 if t.can_unmortgage(self.game, player)]
 
+    def _tradeable(self, owner):
+        return [t for t in owner.properties
+                if self.game.can_trade_property(t)]
+
+    def _can_trade(self, player):
+        """Whether a trade is possible: another player is in the game and
+        someone involved has a property that can change hands."""
+        others = [p for p in self.game.active_players() if p is not player]
+        if not others:
+            return False
+        return any(self._tradeable(p) for p in [player, *others])
+
     def _can_manage(self, player):
         """Whether the player has any property action available right now."""
         return bool(self._buildable(player) or self._sellable(player)
                     or self._mortgageable(player)
-                    or self._unmortgageable(player))
+                    or self._unmortgageable(player)
+                    or self._can_trade(player))
 
     def _build_flow(self, player):
         options = [(f"{t.name} (${t.house_cost()})", t.pos)
@@ -669,6 +743,8 @@ class MonopolyApp:
                 options.append(("Mortgage a property", "mortgage"))
             if self._unmortgageable(player):
                 options.append(("Unmortgage a property", "unmortgage"))
+            if self._can_trade(player):
+                options.append(("Propose a trade", "trade"))
             options.append(("Done managing", "done"))
             choice = self.ask(
                 f"{player.name}: manage properties (${player.balance})", options)
@@ -680,8 +756,129 @@ class MonopolyApp:
                 self._mortgage_flow(player)
             elif choice == "unmortgage":
                 self._unmortgage_flow(player)
+            elif choice == "trade":
+                self._trade_flow(player)
             else:
                 return
+
+    # ----- trading -------------------------------------------------------
+
+    def _cash_label(self, initiator, partner, cash):
+        """Describes the net cash term of a trade from a neutral viewpoint."""
+        if cash > 0:
+            return f"{initiator.name} pays ${cash}"
+        if cash < 0:
+            return f"{partner.name} pays ${-cash}"
+        return "no cash"
+
+    def _toggle_trade_items(self, owner, selected, whose):
+        """Loops a checklist of `owner`'s tradeable properties, toggling each
+        in the `selected` set, until the player is done."""
+        while True:
+            tradeable = self._tradeable(owner)
+            if not tradeable:
+                self.ask(f"{owner.name} has no tradeable properties "
+                         f"(sell houses in a group first).", [("OK", "ok")])
+                return
+            options = [(f"{'[x]' if t in selected else '[  ]'}  {t.name}", t.pos)
+                       for t in tradeable]
+            options.append(("Done", None))
+            choice = self.ask(f"Pick {whose} properties (tap to toggle):",
+                              options)
+            if choice is None:
+                return
+            tile = self.game.board.get_tile(choice)
+            selected.discard(tile) if tile in selected else selected.add(tile)
+
+    def _trade_flow(self, player):
+        """Builds and proposes a trade with another player."""
+        partners = [p for p in self.game.active_players() if p is not player]
+        if not partners:
+            return
+        opts = [(p.name, self.game.players.index(p)) for p in partners]
+        opts.append(("Cancel", None))
+        choice = self.ask(f"{player.name}: trade with whom?", opts)
+        if choice is None:
+            return
+        partner = self.game.players[choice]
+
+        give, receive, cash = set(), set(), 0
+        while True:
+            gnames = ", ".join(t.name for t in give) or "nothing"
+            rnames = ", ".join(t.name for t in receive) or "nothing"
+            options = [
+                ("Choose what you give", "mine"),
+                ("Choose what you receive", "theirs"),
+                ("Cash: you pay $50 more", "cash_up"),
+                ("Cash: you pay $50 less", "cash_down"),
+            ]
+            if give or receive or cash:
+                options.append(("Propose this trade", "propose"))
+            options.append(("Cancel trade", "cancel"))
+            choice = self.ask(
+                f"Trade with {partner.name} — you give: {gnames}; you receive: "
+                f"{rnames}; {self._cash_label(player, partner, cash)}.", options)
+            if choice == "mine":
+                self._toggle_trade_items(player, give, "your")
+            elif choice == "theirs":
+                self._toggle_trade_items(partner, receive, f"{partner.name}'s")
+            elif choice == "cash_up":
+                cash += 50
+            elif choice == "cash_down":
+                cash -= 50
+            elif choice == "propose":
+                self._propose_trade(player, partner, give, receive, cash)
+                return
+            else:
+                return
+
+    def _propose_trade(self, initiator, partner, give, receive, cash):
+        """Asks the partner to accept the offer, then carries it out."""
+        gnames = ", ".join(t.name for t in give) or "nothing"
+        rnames = ", ".join(t.name for t in receive) or "nothing"
+        # From the partner's side: they give `receive`, they get `give`.
+        accept = self.ask(
+            f"{partner.name}: {initiator.name} proposes a trade. You give "
+            f"{rnames}; you get {gnames}; "
+            f"{self._cash_label(initiator, partner, cash)}. Accept?",
+            [("Accept", "yes"), ("Decline", "no")])
+        if accept != "yes":
+            self.add_log(f"{partner.name} declined {initiator.name}'s trade.")
+            return
+        if self.game.execute_trade(initiator, partner, list(give),
+                                   list(receive), cash):
+            self.add_log(f"{initiator.name} and {partner.name} made a trade.")
+        else:
+            self.ask("Trade couldn't be completed (the cash payer can't afford "
+                     "it).", [("OK", "ok")])
+
+    def _raise_funds(self, player, amount):
+        """Bound to ``Game.on_shortfall``: when `player` owes `amount` they
+        can't cover, let them sell houses / mortgage to try to raise it before
+        a forced bankruptcy. Loops until they can pay, run out of assets, or
+        choose to give up."""
+        while player.balance < amount:
+            options = []
+            if self._sellable(player):
+                options.append(("Sell a house", "sell"))
+            if self._mortgageable(player):
+                options.append(("Mortgage a property", "mortgage"))
+            if not options:
+                self.ask(
+                    f"{player.name} owes ${amount} but has only "
+                    f"${player.balance} and nothing left to sell — bankrupt!",
+                    [("Continue", "ok")])
+                return
+            options.append(("Give up (declare bankruptcy)", "give_up"))
+            choice = self.ask(
+                f"{player.name} owes ${amount} but has only ${player.balance}. "
+                f"Raise cash to avoid bankruptcy.", options)
+            if choice == "sell":
+                self._sell_flow(player)
+            elif choice == "mortgage":
+                self._mortgage_flow(player)
+            else:
+                return  # gave up; the caller will force bankruptcy
 
     def _set_roll(self, player, dice):
         self.roll_display = {"name": player.name, "dice": dice}
