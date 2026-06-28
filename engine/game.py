@@ -24,6 +24,23 @@ class Game:
         # what they drew. Left as None for headless play.
         self.on_card = None
 
+        # Optional UI hook: called as notify(message) for automatic events the
+        # player should be told about (rent paid, tax paid, GO salary, etc.).
+        # The UI binds this to an acknowledged "Continue" prompt; left as None
+        # for headless play and the RL layer (which skips these prompts).
+        self.notify = None
+
+    def announce(self, message):
+        """
+        Reports an automatic game event via the optional ``notify`` hook so the
+        UI can inform the player. A no-op when no hook is set (headless / RL).
+
+        Args:
+            message (str): Human-readable description of what just happened.
+        """
+        if self.notify is not None:
+            self.notify(message)
+
     def roll_dice(self):
         """
         Rolls two 6-sided dice, records them on ``last_dice`` (so the UI can
@@ -119,6 +136,27 @@ class Game:
         """
         return prop.sell_house(self, player)
 
+    def mortgage_property(self, prop, player):
+        """
+        Entry point to mortgage a property the player owns, paying them its
+        mortgage value. Rules (no buildings on the color group, not already
+        mortgaged) are enforced by the property.
+
+        Returns:
+            bool: True if the property was mortgaged.
+        """
+        return prop.mortgage(self, player)
+
+    def unmortgage_property(self, prop, player):
+        """
+        Entry point to lift the mortgage on a property the player owns, charging
+        the mortgage value plus 10% interest.
+
+        Returns:
+            bool: True if the mortgage was lifted.
+        """
+        return prop.unmortgage(self, player)
+
     def advance_to(self, player, dest):
         """
         Moves the player forward to absolute position `dest`, paying the GO
@@ -127,6 +165,8 @@ class Game:
         # A destination behind the current square means GO was passed.
         if dest < player.pos:
             player.balance += self.go_salary
+            self.announce(
+                f"{player.name} passed GO and collected ${self.go_salary}.")
         player.pos = dest
         self.resolve_tile(player)
 
@@ -198,6 +238,7 @@ class Game:
 
         for prop in list(player.properties):
             prop.owner = None
+            prop.mortgaged = False
             if hasattr(prop, "houses"):
                 prop.houses = 0
         player.properties.clear()

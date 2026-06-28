@@ -52,6 +52,10 @@ class StreetProperty(Property):
         """Returns the price of one house (or hotel) for this color group."""
         return self.HOUSE_COSTS[self.color]
 
+    def has_buildings(self, game):
+        """A street can't be mortgaged while any house stands in its group."""
+        return any(tile.houses > 0 for tile in self.color_group(game))
+
     def can_build_house(self, game, player):
         """
         Returns whether `player` may add one house/hotel to this street right
@@ -67,6 +71,10 @@ class StreetProperty(Property):
             player (type[Player]): Player wishing to build.
         """
         if self.owner is not player or not self.has_monopoly(game):
+            return False
+
+        # Can't build while any street in the group is mortgaged.
+        if any(tile.mortgaged for tile in self.color_group(game)):
             return False
 
         if self.houses >= self.MAX_HOUSES:

@@ -16,19 +16,21 @@ The engine is driven through the hooks it exposes:
 
 import math
 import os
+import random
 import time
 
 import pygame
 
-from ui.board_layout import tile_center, token_offset, interior_offset
+from ui.board_layout import (tile_center, tile_rect, token_offset,
+                             interior_offset, TILE_FRAC)
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
+from models.tiles.property import Property
 
 # Window / board geometry.
 WIDTH, HEIGHT = 1500, 950
 BOARD_X, BOARD_Y, BOARD_PX = 20, 20, 880
-CELL = BOARD_PX / 11
 SIDE_X = 920
 SIDE_W = WIDTH - SIDE_X - 20
 TOKEN_PX = 40
@@ -52,6 +54,20 @@ HOUSE_GREEN = (38, 158, 70)
 HOTEL_RED = (200, 62, 55)
 DIE_FACE = (250, 250, 248)
 PIP = (32, 32, 32)
+
+# Per-player token / marker colors, keyed by player name.
+PLAYER_COLORS = {
+    "Red": (211, 47, 47),
+    "Blue": (33, 99, 199),
+    "Green": (39, 158, 70),
+    "Yellow": (240, 196, 32),
+}
+DEFAULT_COLOR = (120, 120, 120)
+
+
+def player_color(name):
+    """Returns the marker color for a player name (gray if unknown)."""
+    return PLAYER_COLORS.get(name, DEFAULT_COLOR)
 
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 
@@ -77,6 +93,7 @@ class MonopolyApp:
         self.selected = None          # index of player whose inventory is open
         self.roll_display = None      # {"name", "dice"} for the dice panel
         self.vpos = {p.name: float(p.pos) for p in game.players}
+        self.hop = {p.name: 0.0 for p in game.players}  # token landing bounce
 
         pygame.init()
         pygame.display.set_caption("Monopoly")
@@ -104,6 +121,8 @@ class MonopolyApp:
 
         # Show drawn Chance / Community Chest cards to the player.
         game.on_card = self._show_card
+        # Inform the player of automatic events (rent, tax, GO salary, ...).
+        game.notify = self._inform
 
     @staticmethod
     def _font(size, bold=False):
@@ -136,39 +155,79 @@ class MonopolyApp:
         return (x0 + (x1 - x0) * frac, y0 + (y1 - y0) * frac)
 
     def _draw_house_indicators(self):
+        tsize = TILE_FRAC * BOARD_PX
         for tile in self.game.board.tiles:
             if not isinstance(tile, StreetProperty) or tile.houses == 0:
                 continue
             cx, cy = tile_center(tile.pos, BOARD_X, BOARD_Y, BOARD_PX)
             ox, oy = interior_offset(tile.pos)
-            bx, by = cx + ox * CELL * 0.30, cy + oy * CELL * 0.30
+            bx, by = cx + ox * tsize * 0.32, cy + oy * tsize * 0.32
             px, py = -oy, ox  # unit vector along the tile edge
 
             if tile.houses >= 5:  # hotel
-                rect = pygame.Rect(0, 0, 16, 12)
+                rect = pygame.Rect(0, 0, 18, 13)
                 rect.center = (bx, by)
                 pygame.draw.rect(self.screen, HOTEL_RED, rect, border_radius=2)
                 pygame.draw.rect(self.screen, (0, 0, 0), rect, 1, border_radius=2)
             else:
-                size, gap = 9, 12
+                size, gap = 10, 13
                 start = -(tile.houses - 1) / 2
                 for i in range(tile.houses):
                     off = (start + i) * gap
                     rect = pygame.Rect(0, 0, size, size)
                     rect.center = (bx + px * off, by + py * off)
-                    pygame.draw.rect(self.screen, HOUSE_GREEN, rect)
-                    pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
+                    pygame.draw.rect(self.screen, HOUSE_GREEN, rect, border_radius=2)
+                    pygame.draw.rect(self.screen, (0, 0, 0), rect, 1, border_radius=2)
+
+    def _draw_ownership(self):
+        """Draws a small colored dot on each owned property in its owner's
+        color, set toward the outer edge so it doesn't sit under the tokens.
+        Mortgaged properties show as a hollow dot."""
+        tsize = TILE_FRAC * BOARD_PX
+        for tile in self.game.board.tiles:
+            if not isinstance(tile, Property) or tile.owner is None:
+                continue
+            cx, cy = tile_center(tile.pos, BOARD_X, BOARD_Y, BOARD_PX)
+            ox, oy = interior_offset(tile.pos)        # toward interior
+            mx, my = int(cx - ox * tsize * 0.34), int(cy - oy * tsize * 0.34)
+            color = player_color(tile.owner.name)
+            pygame.draw.circle(self.screen, (255, 255, 255), (mx, my), 7)
+            if tile.mortgaged:
+                # Hollow ring marks a mortgaged property.
+                pygame.draw.circle(self.screen, color, (mx, my), 6, 2)
+            else:
+                pygame.draw.circle(self.screen, color, (mx, my), 6)
+            pygame.draw.circle(self.screen, (0, 0, 0), (mx, my), 7, 1)
+
+    def _draw_current_highlight(self):
+        """Pulsing gold outline around the tile the active player occupies."""
+        player = self.game.players[self.game.current_player]
+        if player.bankrupt:
+            return
+        x, y, w, h = tile_rect(player.pos, BOARD_X, BOARD_Y, BOARD_PX)
+        pulse = 0.5 + 0.5 * math.sin(time.time() * 5.0)
+        thick = 2 + int(round(pulse * 2))
+        rect = pygame.Rect(x + 1, y + 1, w - 2, h - 2)
+        pygame.draw.rect(self.screen, ACCENT, rect, thick, border_radius=4)
 
     def _draw_board(self):
         self.screen.blit(self.board_img, (BOARD_X, BOARD_Y))
+        self._draw_ownership()
         self._draw_house_indicators()
+        self._draw_current_highlight()
+        current = self.game.players[self.game.current_player]
         for index, player in enumerate(self.game.players):
             if player.bankrupt:
                 continue
             cx, cy = self._token_center(self.vpos[player.name])
             dx, dy = token_offset(index, BOARD_PX)
+            tx, ty = int(cx + dx), int(cy + dy - self.hop.get(player.name, 0.0))
+            # Glow ring under the active player's token so it's easy to find.
+            if player is current:
+                pygame.draw.circle(self.screen, ACCENT, (tx, ty),
+                                   TOKEN_PX // 2 + 4, 3)
             token = self.tokens[player.name]
-            self.screen.blit(token, token.get_rect(center=(cx + dx, cy + dy)))
+            self.screen.blit(token, token.get_rect(center=(tx, ty)))
 
     # ----- dice ----------------------------------------------------------
 
@@ -235,7 +294,9 @@ class MonopolyApp:
         return y, rects
 
     def _rent_line(self, prop):
-        """Returns (houses_label, rent_label) for a property in an inventory."""
+        """Returns (status_label, rent_label) for a property in an inventory."""
+        if prop.mortgaged:
+            return "Mortgaged", "No rent"
         if isinstance(prop, StreetProperty):
             if prop.houses >= 5:
                 houses = "Hotel"
@@ -403,16 +464,50 @@ class MonopolyApp:
         if self._auto is not None or steps <= 0:
             self._snap(player)
             return
-        duration = min(0.14 * steps, 1.0)
+        duration = min(0.16 * steps, 1.2)
+        hop_h = TOKEN_PX * 0.40
         start = time.time()
         while True:
             t = (time.time() - start) / duration
             if t >= 1:
                 break
             ease = t * t * (3 - 2 * t)
-            self.vpos[name] = from_pos + steps * ease
+            v = from_pos + steps * ease
+            self.vpos[name] = v
+            # A little hop as the token crosses each tile.
+            self.hop[name] = math.sin((v % 1.0) * math.pi) * hop_h
             self._frame()
+        self.hop[name] = 0.0
         self._snap(player)
+        self._animate_land(player)
+
+    def _animate_land(self, player):
+        """A small settling bounce once the token reaches its tile."""
+        if self._auto is not None:
+            return
+        name = player.name
+        start = time.time()
+        dur = 0.24
+        while True:
+            t = (time.time() - start) / dur
+            if t >= 1:
+                break
+            self.hop[name] = math.sin(t * math.pi) * (TOKEN_PX * 0.20) * (1 - t)
+            self._frame()
+        self.hop[name] = 0.0
+
+    def _animate_dice(self, player, final):
+        """Tumbles the dice faces for a moment, then settles on the result."""
+        if self._auto is not None:
+            self._set_roll(player, final)
+            return
+        for _ in range(11):
+            self._set_roll(
+                player, (random.randint(1, 6), random.randint(1, 6)))
+            self._frame()
+            pygame.time.wait(38)
+        self._set_roll(player, final)
+        self._frame()
 
     # ----- decisions -----------------------------------------------------
 
@@ -434,6 +529,15 @@ class MonopolyApp:
         self.add_log(f"{pile}: {card.text}")
         self.ask(f"{pile} card — {card.text}", [("Continue", "ok")])
 
+    def _inform(self, message):
+        """Logs an automatic game event and makes the player acknowledge it.
+
+        Bound to ``Game.notify``. In auto / RL mode ``ask`` returns immediately,
+        so the event is still logged but no prompt blocks play.
+        """
+        self.add_log(message)
+        self.ask(message, [("Continue", "ok")])
+
     def _buildable(self, player):
         return [t for t in self.game.board.tiles
                 if isinstance(t, StreetProperty)
@@ -443,6 +547,20 @@ class MonopolyApp:
         return [t for t in self.game.board.tiles
                 if isinstance(t, StreetProperty)
                 and t.can_sell_house(self.game, player)]
+
+    def _mortgageable(self, player):
+        return [t for t in player.properties
+                if t.can_mortgage(self.game, player)]
+
+    def _unmortgageable(self, player):
+        return [t for t in player.properties
+                if t.can_unmortgage(self.game, player)]
+
+    def _can_manage(self, player):
+        """Whether the player has any property action available right now."""
+        return bool(self._buildable(player) or self._sellable(player)
+                    or self._mortgageable(player)
+                    or self._unmortgageable(player))
 
     def _build_flow(self, player):
         options = [(f"{t.name} (${t.house_cost()})", t.pos)
@@ -467,13 +585,66 @@ class MonopolyApp:
             self.game.sell_house(tile, player)
             self.add_log(f"{player.name} sold a house on {tile.name}.")
 
+    def _mortgage_flow(self, player):
+        options = [(f"{t.name}  (+${t.mortgage_value})", t.pos)
+                   for t in self._mortgageable(player)]
+        options.append(("Cancel", None))
+        choice = self.ask(f"{player.name}: mortgage which property?", options)
+        if choice is not None:
+            tile = self.game.board.get_tile(choice)
+            if self.game.mortgage_property(tile, player):
+                self.add_log(f"{player.name} mortgaged {tile.name} "
+                             f"for ${tile.mortgage_value}.")
+
+    def _unmortgage_flow(self, player):
+        options = [(f"{t.name}  (-${t.unmortgage_cost})", t.pos)
+                   for t in self._unmortgageable(player)]
+        options.append(("Cancel", None))
+        choice = self.ask(f"{player.name}: unmortgage which property?", options)
+        if choice is not None:
+            tile = self.game.board.get_tile(choice)
+            cost = tile.unmortgage_cost
+            if self.game.unmortgage_property(tile, player):
+                self.add_log(f"{player.name} lifted the mortgage on "
+                             f"{tile.name} for ${cost}.")
+
+    def _manage_menu(self, player):
+        """Property-management submenu: build/sell houses, mortgage/unmortgage.
+
+        Reachable both before and after rolling, and loops until the player is
+        done so they can make several changes in one visit.
+        """
+        while True:
+            options = []
+            if self._buildable(player):
+                options.append(("Build a house", "build"))
+            if self._sellable(player):
+                options.append(("Sell a house", "sell"))
+            if self._mortgageable(player):
+                options.append(("Mortgage a property", "mortgage"))
+            if self._unmortgageable(player):
+                options.append(("Unmortgage a property", "unmortgage"))
+            options.append(("Done managing", "done"))
+            choice = self.ask(
+                f"{player.name}: manage properties (${player.balance})", options)
+            if choice == "build":
+                self._build_flow(player)
+            elif choice == "sell":
+                self._sell_flow(player)
+            elif choice == "mortgage":
+                self._mortgage_flow(player)
+            elif choice == "unmortgage":
+                self._unmortgage_flow(player)
+            else:
+                return
+
     def _set_roll(self, player, dice):
         self.roll_display = {"name": player.name, "dice": dice}
 
     # ----- turn flow -----------------------------------------------------
 
     def _turn_menu(self, player):
-        """Management + action menu; returns the jail/roll choice for the turn."""
+        """Pre-roll menu: manage properties, then choose the jail/roll action."""
         while True:
             options = []
             if player.in_jail:
@@ -484,21 +655,29 @@ class MonopolyApp:
                 options.append(("Roll for doubles", "roll"))
             else:
                 options.append(("Roll dice", "roll"))
-            if self._buildable(player):
-                options.append(("Build a house", "build"))
-            if self._sellable(player):
-                options.append(("Sell a house", "sell"))
+            if self._can_manage(player):
+                options.append(("Manage properties", "manage"))
 
             where = "in jail" if player.in_jail else \
                 self.game.board.get_tile(player.pos).name
             choice = self.ask(
                 f"{player.name}'s turn — {where} (${player.balance})", options)
-            if choice == "build":
-                self._build_flow(player)
-            elif choice == "sell":
-                self._sell_flow(player)
+            if choice == "manage":
+                self._manage_menu(player)
             else:
                 return choice
+
+    def _post_roll_manage(self, player):
+        """After the roll resolves, offer one more management pass before the
+        turn ends."""
+        if not self._can_manage(player):
+            return
+        choice = self.ask(
+            f"{player.name}: manage properties before ending your turn? "
+            f"(${player.balance})",
+            [("Manage properties", "manage"), ("End turn", "end")])
+        if choice == "manage":
+            self._manage_menu(player)
 
     def _resolve_and_sync(self, player):
         self.game.resolve_tile(player)
@@ -509,7 +688,7 @@ class MonopolyApp:
         while True:
             from_pos = player.pos
             die1, die2, is_double, to_jail = self.game.roll_once(player)
-            self._set_roll(player, (die1, die2))
+            self._animate_dice(player, (die1, die2))
 
             if to_jail:
                 self.add_log(
@@ -531,7 +710,6 @@ class MonopolyApp:
                          [("Roll again", "roll")])
                 continue
             break
-        self._end_turn(player)
 
     def _handle_jail(self, player, choice):
         result = self.game.handle_jail_turn(player, choice)
@@ -539,26 +717,29 @@ class MonopolyApp:
 
         if result == "released":
             if choice == "pay":
-                self.add_log(f"{player.name} paid $50 and left jail.")
+                msg = f"{player.name} paid $50 and left jail."
             else:
-                self.add_log(f"{player.name} used a Get Out of Jail Free card.")
-            self._play_rolls(player)  # takes a normal turn (ends the turn)
+                msg = f"{player.name} used a Get Out of Jail Free card."
+            self.add_log(msg)
+            # Let the player roll for their normal turn rather than auto-rolling.
+            self.ask(f"{msg} Roll the dice to take your turn.",
+                     [("Roll dice", "roll")])
+            self._play_rolls(player)  # takes a normal turn
             return
 
         if result == "moved":
-            self._set_roll(player, dice)
+            self._animate_dice(player, dice)
             self.add_log(f"{player.name} rolled doubles "
                          f"({dice[0]} + {dice[1]}) and left jail.")
             self._animate_slide(player, self.game.jail_position, sum(dice))
             self._resolve_and_sync(player)
         elif result == "freed":
-            self._set_roll(player, dice)
+            self._animate_dice(player, dice)
             self.add_log(f"{player.name} failed to roll doubles and was released.")
         else:  # jailed
-            self._set_roll(player, dice)
+            self._animate_dice(player, dice)
             self.add_log(f"{player.name} rolled {dice[0]} + {dice[1]} — "
                          f"no doubles, still in jail.")
-        self._end_turn(player)
 
     def _end_turn(self, player):
         player.double_count = 0
@@ -588,6 +769,10 @@ class MonopolyApp:
                     self._handle_jail(player, choice)
                 else:
                     self._play_rolls(player)
+                # Let the player manage properties after rolling, then end turn.
+                if not player.bankrupt:
+                    self._post_roll_manage(player)
+                self._end_turn(player)
                 turns += 1
                 if not self.game.is_over():
                     self._handoff()
