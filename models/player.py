@@ -16,7 +16,7 @@ class Player:
         # jail properties
         self.in_jail = False
         self.jail_turns = 0
-        self.get_out_of_jail_cards = 0
+        self.jail_cards = []  # held Get Out of Jail Free cards
 
         # number of doubles on a turn
         self.double_count = 0
