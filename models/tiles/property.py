@@ -1,18 +1,15 @@
 """Base class for a property"""
 
-from tile import Tile
+from models.tile import Tile
 
 class Property(Tile):
     """
     Class for a Property. Inherits from Tile class.
     """
 
-    def __init__(self, name, pos, price, rent_table):
+    def __init__(self, name, pos, price):
         super().__init__(name, pos)
-
-        self.houses = 0
         self.price = price
-        self.rent_table = rent_table
         self.owner = None
 
     def on_land(self, game, player):
@@ -20,7 +17,7 @@ class Property(Tile):
             game.offer_purchase(self, player)
 
         elif self.owner != player:
-            self.pay_rent(player)
+            self.pay_rent(game, player)
 
     def buy(self, player):
         """
@@ -30,34 +27,31 @@ class Property(Tile):
             player (type[Player]): Player who wishes to purchase property
         """
 
+        if self.owner is not None:
+            return False
+
+        if player.balance < self.price:
+            return False
+
         player.balance -= self.price
         self.transfer_ownership(player)
+        return True
 
-    def get_rent(self):
+    def get_rent(self, game, player):
         """
-        Gets the current rent of the property.
+        Get rent of the property.
         """
 
-        return self.rent_table[self.houses]
+        raise NotImplementedError
 
-    def pay_rent(self,player):
+    def pay_rent(self,game,player):
         """
         Transfers the rent of the property from the current player to owner.
         """
 
-        rent = self.get_rent
+        rent = self.get_rent(game,player)
         player.balance -= rent
         self.owner.balance += rent
-
-    def build_house(self, count):
-        """
-        Builds number of houses based on input.
-
-        Args:
-            count (int): Number of houses to build
-        """
-
-        self.houses += count
 
     def transfer_ownership(self, new_owner):
         """
