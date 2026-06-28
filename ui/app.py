@@ -21,8 +21,8 @@ import time
 
 import pygame
 
-from ui.board_layout import (tile_center, tile_rect, token_offset,
-                             interior_offset, TILE_FRAC)
+from ui.board_layout import (tile_center, tile_rect, interior_offset,
+                             TILE_FRAC)
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
@@ -200,15 +200,35 @@ class MonopolyApp:
             pygame.draw.circle(self.screen, (0, 0, 0), (mx, my), 7, 1)
 
     def _draw_current_highlight(self):
-        """Pulsing gold outline around the tile the active player occupies."""
+        """Pulsing gold outline snug against the current player's tile."""
         player = self.game.players[self.game.current_player]
         if player.bankrupt:
             return
         x, y, w, h = tile_rect(player.pos, BOARD_X, BOARD_Y, BOARD_PX)
         pulse = 0.5 + 0.5 * math.sin(time.time() * 5.0)
         thick = 2 + int(round(pulse * 2))
-        rect = pygame.Rect(x + 1, y + 1, w - 2, h - 2)
-        pygame.draw.rect(self.screen, ACCENT, rect, thick, border_radius=4)
+        # Draw just inside the tile border so the stroke sits on the tile.
+        rect = pygame.Rect(x + thick // 2, y + thick // 2,
+                           w - thick, h - thick)
+        pygame.draw.rect(self.screen, ACCENT, rect, thick)
+
+    def _cluster_offset(self, slot, count):
+        """Returns the (dx, dy) for token `slot` of `count` sharing one tile.
+
+        A lone token is centered; multiple tokens spread out in a centered
+        grid so they all stay over the tile.
+        """
+        if count <= 1:
+            return (0.0, 0.0)
+        step = BOARD_PX * TILE_FRAC * 0.30
+        cols = 2
+        rows = (count + 1) // 2
+        row, col = slot // cols, slot % cols
+        # Tokens in this row (a trailing odd token sits alone, centered).
+        in_row = cols if (row < rows - 1 or count % cols == 0) else count % cols
+        dx = (col - (in_row - 1) / 2) * step
+        dy = (row - (rows - 1) / 2) * step
+        return (dx, dy)
 
     def _draw_board(self):
         self.screen.blit(self.board_img, (BOARD_X, BOARD_Y))
@@ -216,12 +236,14 @@ class MonopolyApp:
         self._draw_house_indicators()
         self._draw_current_highlight()
         current = self.game.players[self.game.current_player]
-        for index, player in enumerate(self.game.players):
-            if player.bankrupt:
-                continue
+        active = [p for p in self.game.players if not p.bankrupt]
+        for player in active:
             cx, cy = self._token_center(self.vpos[player.name])
-            dx, dy = token_offset(index, BOARD_PX)
-            tx, ty = int(cx + dx), int(cy + dy - self.hop.get(player.name, 0.0))
+            # Offset only when others share this tile; otherwise stay centered.
+            sharers = [p for p in active if p.pos == player.pos]
+            dx, dy = self._cluster_offset(sharers.index(player), len(sharers))
+            tx = int(cx + dx)
+            ty = int(cy + dy - self.hop.get(player.name, 0.0))
             # Glow ring under the active player's token so it's easy to find.
             if player is current:
                 pygame.draw.circle(self.screen, ACCENT, (tx, ty),
@@ -314,7 +336,7 @@ class MonopolyApp:
             return "Utility", f"Rent {4 if count == 1 else 10}× dice"
         return "", ""
 
-    def _draw_inventory(self, y, player):
+    def _draw_inventory(self, y, player, bottom):
         self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head,
                    FELT_INK, shadow=True)
         self._text("(click the player again to close)", (SIDE_X, y + 28),
@@ -325,6 +347,8 @@ class MonopolyApp:
                        FELT_SUB, shadow=True)
             return
         for prop in player.properties:
+            if y > bottom - 30:
+                break
             houses, rent = self._rent_line(prop)
             self._text(prop.name, (SIDE_X, y), self.f_small, FELT_INK,
                        shadow=True)
@@ -333,26 +357,27 @@ class MonopolyApp:
             self._text(info, (SIDE_X + SIDE_W - w, y), self.f_small, FELT_SUB,
                        shadow=True)
             y += 30
-            if y > HEIGHT - 30:
-                break
 
-    def _draw_log(self, y):
+    def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         y += 40
-        for line in self.log[-((HEIGHT - y) // 24):]:
+        # Show only as many recent lines as fit above `bottom`.
+        rows = max(0, (bottom - y) // 24)
+        for line in self.log[-rows:] if rows else []:
             self._text(line, (SIDE_X, y), self.f_small, FELT_INK, shadow=True)
             y += 24
 
     # ----- prompt --------------------------------------------------------
 
-    def _draw_prompt(self, question, options, mouse):
-        # Size the box from the actual wrapped question height so the buttons
-        # always fit inside it (a multi-line question used to push them out the
-        # bottom), and clamp it to the screen so it never runs off the top.
+    def _prompt_geometry(self, question, options):
+        """Returns (box, wrapped_lines) for a prompt, sized from the wrapped
+        question so the buttons always fit and clamped to the screen."""
         lines = self._wrap(question, self.f_body, SIDE_W - 28)
         height = 14 + len(lines) * 26 + 10 + len(options) * 52 + 6
         top = max(8, HEIGHT - height - 8)
-        box = pygame.Rect(SIDE_X, top, SIDE_W, height)
+        return pygame.Rect(SIDE_X, top, SIDE_W, height), lines
+
+    def _draw_prompt(self, box, lines, options, mouse):
         self._panel(box)
         y = box.y + 14
         for line in lines:
@@ -404,15 +429,23 @@ class MonopolyApp:
         y = self._draw_dice_panel(54)
         y, player_rects = self._draw_players(y + 14)
         y += 8
+        # Reserve the prompt's space first so the log/inventory stop above it
+        # instead of being hidden behind it.
+        box, lines = (None, None)
+        content_bottom = HEIGHT - 10
+        if question:
+            box, lines = self._prompt_geometry(question, options)
+            content_bottom = box.top - 10
         # Inventory/log always render so a player can be clicked open even while
-        # a decision is pending; the prompt simply overlays the bottom.
+        # a decision is pending.
         if self.selected is not None:
-            self._draw_inventory(y, self.game.players[self.selected])
+            self._draw_inventory(y, self.game.players[self.selected],
+                                 content_bottom)
         else:
-            self._draw_log(y)
+            self._draw_log(y, content_bottom)
         buttons = []
         if question:
-            buttons = self._draw_prompt(question, options, mouse)
+            buttons = self._draw_prompt(box, lines, options, mouse)
         return buttons, player_rects
 
     def render(self):
@@ -449,12 +482,18 @@ class MonopolyApp:
     # ----- animation -----------------------------------------------------
 
     def _frame(self):
+        """Renders one animation frame. Returns True if the user clicked or
+        pressed a key, which means: skip the rest of this animation."""
+        skip = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 raise QuitGame
+            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN):
+                skip = True
         self._draw_scene()
         pygame.display.flip()
         self.clock.tick(60)
+        return skip
 
     def _snap(self, player):
         self.vpos[player.name] = float(player.pos)
@@ -467,6 +506,7 @@ class MonopolyApp:
         duration = min(0.16 * steps, 1.2)
         hop_h = TOKEN_PX * 0.40
         start = time.time()
+        skipped = False
         while True:
             t = (time.time() - start) / duration
             if t >= 1:
@@ -476,10 +516,13 @@ class MonopolyApp:
             self.vpos[name] = v
             # A little hop as the token crosses each tile.
             self.hop[name] = math.sin((v % 1.0) * math.pi) * hop_h
-            self._frame()
+            if self._frame():
+                skipped = True
+                break
         self.hop[name] = 0.0
         self._snap(player)
-        self._animate_land(player)
+        if not skipped:
+            self._animate_land(player)
 
     def _animate_land(self, player):
         """A small settling bounce once the token reaches its tile."""
@@ -493,7 +536,8 @@ class MonopolyApp:
             if t >= 1:
                 break
             self.hop[name] = math.sin(t * math.pi) * (TOKEN_PX * 0.20) * (1 - t)
-            self._frame()
+            if self._frame():
+                break
         self.hop[name] = 0.0
 
     def _animate_dice(self, player, final):
@@ -504,7 +548,8 @@ class MonopolyApp:
         for _ in range(11):
             self._set_roll(
                 player, (random.randint(1, 6), random.randint(1, 6)))
-            self._frame()
+            if self._frame():
+                break
             pygame.time.wait(38)
         self._set_roll(player, final)
         self._frame()
@@ -745,11 +790,6 @@ class MonopolyApp:
         player.double_count = 0
         self.game.advance_turn()
 
-    def _handoff(self):
-        nxt = self.game.players[self.game.current_player]
-        self.selected = None
-        self.ask(f"Pass the computer to {nxt.name}.", [("Continue", "ok")])
-
     def _show_result(self):
         winner = self.game.winner()
         message = f"{winner.name} wins!" if winner else "Game over."
@@ -773,9 +813,8 @@ class MonopolyApp:
                 if not player.bankrupt:
                     self._post_roll_manage(player)
                 self._end_turn(player)
+                self.selected = None  # close any open inventory for the next turn
                 turns += 1
-                if not self.game.is_over():
-                    self._handoff()
             self._show_result()
         except QuitGame:
             pass
