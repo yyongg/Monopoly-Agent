@@ -22,4 +22,5 @@ class Tile:
             game (type[Game]): Game class
             player (type[Player]): Player class
         """
-        pass
+
+        raise NotImplementedError
