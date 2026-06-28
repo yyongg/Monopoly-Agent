@@ -58,6 +58,52 @@ class Game:
         tile = self.board.get_tile(player.pos)
         tile.on_land(self, player)
 
+    def offer_purchase(self, prop, player):
+        """
+        Offers an unowned property to the player who landed on it. The buy or
+        decline decision is delegated to the player (the RL hook); the purchase
+        itself is carried out by the property, which re-checks affordability.
+
+        Args:
+            prop (type[Property]): The unowned property being offered.
+            player (type[Player]): The player who landed on it.
+
+        Returns:
+            bool: True if the property was bought, False otherwise.
+        """
+        if player.decide_purchase(prop):
+            return prop.buy(player)
+        return False
+
+    def build_house(self, prop, player):
+        """
+        Entry point to build one house/hotel on a street the player owns. Rules
+        (full color set, even building, cost, hotel cap) are enforced by the
+        street tile.
+
+        Args:
+            prop (type[StreetProperty]): The street to build on.
+            player (type[Player]): The owner building the house.
+
+        Returns:
+            bool: True if a house was built, False if the build was not allowed.
+        """
+        return prop.build_house(self, player)
+
+    def sell_house(self, prop, player):
+        """
+        Entry point to sell one house/hotel back to the bank from a street the
+        player owns. Even-selling rules are enforced by the street tile.
+
+        Args:
+            prop (type[StreetProperty]): The street to sell from.
+            player (type[Player]): The owner selling the house.
+
+        Returns:
+            bool: True if a house was sold, False if the sale was not allowed.
+        """
+        return prop.sell_house(self, player)
+
     def advance_to(self, player, dest):
         """
         Moves the player forward to absolute position `dest`, paying the GO
