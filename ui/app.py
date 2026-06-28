@@ -720,7 +720,7 @@ class MonopolyApp:
         choice = self.ask(
             f"{player.name}: manage properties before ending your turn? "
             f"(${player.balance})",
-            [("Manage properties", "manage"), ("End turn", "end")])
+            [("End turn", "end"), ("Manage properties", "manage")])
         if choice == "manage":
             self._manage_menu(player)
 
