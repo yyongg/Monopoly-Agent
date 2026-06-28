@@ -2,7 +2,7 @@
 
 from models.tile import Tile
 
-class ChanceCard(Tile):
+class FreeParking(Tile):
     """Free Parking tile for board. Inherits from Tile class."""
 
     def __init__(self,pos):
