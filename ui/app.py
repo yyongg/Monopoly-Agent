@@ -118,6 +118,7 @@ class MonopolyApp:
         self.hop = {p.name: 0.0 for p in game.players}  # token landing bounce
 
         pygame.init()
+        pygame.key.set_repeat(300, 40)  # smooth backspace/typing in text inputs
         pygame.display.set_caption("Monopoly")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
@@ -771,86 +772,216 @@ class MonopolyApp:
             return f"{partner.name} pays ${-cash}"
         return "no cash"
 
-    def _toggle_trade_items(self, owner, selected, whose):
-        """Loops a checklist of `owner`'s tradeable properties, toggling each
-        in the `selected` set, until the player is done."""
-        while True:
-            tradeable = self._tradeable(owner)
-            if not tradeable:
-                self.ask(f"{owner.name} has no tradeable properties "
-                         f"(sell houses in a group first).", [("OK", "ok")])
-                return
-            options = [(f"{'[x]' if t in selected else '[  ]'}  {t.name}", t.pos)
-                       for t in tradeable]
-            options.append(("Done", None))
-            choice = self.ask(f"Pick {whose} properties (tap to toggle):",
-                              options)
-            if choice is None:
-                return
-            tile = self.game.board.get_tile(choice)
-            selected.discard(tile) if tile in selected else selected.add(tile)
-
     def _trade_flow(self, player):
-        """Builds and proposes a trade with another player."""
+        """Opens the graphical trade dialog over the board."""
         partners = [p for p in self.game.active_players() if p is not player]
-        if not partners:
+        if not partners or self._auto is not None:
             return
-        opts = [(p.name, self.game.players.index(p)) for p in partners]
-        opts.append(("Cancel", None))
-        choice = self.ask(f"{player.name}: trade with whom?", opts)
-        if choice is None:
-            return
-        partner = self.game.players[choice]
-
-        give, receive, cash = set(), set(), 0
+        state = {
+            "partner": partners[0],
+            "give": set(),       # the player's tiles being offered
+            "receive": set(),    # the partner's tiles being requested
+            "cash_you": "",      # cash the player adds (digit string)
+            "cash_them": "",     # cash the partner adds (digit string)
+            "active": None,      # which cash box is being typed into
+        }
         while True:
-            gnames = ", ".join(t.name for t in give) or "nothing"
-            rnames = ", ".join(t.name for t in receive) or "nothing"
-            options = [
-                ("Choose what you give", "mine"),
-                ("Choose what you receive", "theirs"),
-                ("Cash: you pay $50 more", "cash_up"),
-                ("Cash: you pay $50 less", "cash_down"),
-            ]
-            if give or receive or cash:
-                options.append(("Propose this trade", "propose"))
-            options.append(("Cancel trade", "cancel"))
-            choice = self.ask(
-                f"Trade with {partner.name} — you give: {gnames}; you receive: "
-                f"{rnames}; {self._cash_label(player, partner, cash)}.", options)
-            if choice == "mine":
-                self._toggle_trade_items(player, give, "your")
-            elif choice == "theirs":
-                self._toggle_trade_items(partner, receive, f"{partner.name}'s")
-            elif choice == "cash_up":
-                cash += 50
-            elif choice == "cash_down":
-                cash -= 50
-            elif choice == "propose":
-                self._propose_trade(player, partner, give, receive, cash)
-                return
-            else:
-                return
+            mouse = pygame.mouse.get_pos()
+            hot = self._draw_trade_dialog(player, partners, state, mouse)
+            pygame.display.flip()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise QuitGame
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self._handle_trade_click(player, state, hot, event.pos):
+                        return
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return
+                    self._handle_trade_key(state, event)
+            self.clock.tick(60)
 
-    def _propose_trade(self, initiator, partner, give, receive, cash):
-        """Asks the partner to accept the offer, then carries it out."""
+    def _handle_trade_click(self, player, state, hot, pos):
+        """Applies a click in the trade dialog. Returns True to close it."""
+        for rect, partner in hot["partners"]:
+            if rect.collidepoint(pos) and state["partner"] is not partner:
+                state["partner"] = partner
+                state["receive"] = set()
+                state["cash_them"] = ""
+                return False
+        for rect, tile in hot["give"] + hot["receive"]:
+            if rect.collidepoint(pos):
+                target = state["give"] if (rect, tile) in hot["give"] \
+                    else state["receive"]
+                target.discard(tile) if tile in target else target.add(tile)
+                return False
+        if hot["cash_you"].collidepoint(pos):
+            state["active"] = "you"
+        elif hot["cash_them"].collidepoint(pos):
+            state["active"] = "them"
+        elif hot["propose"].collidepoint(pos):
+            return self._finalize_trade(player, state)
+        elif hot["cancel"].collidepoint(pos):
+            return True
+        else:
+            state["active"] = None
+        return False
+
+    def _handle_trade_key(self, state, event):
+        """Edits the active cash text box."""
+        if state["active"] is None:
+            return
+        key = "cash_you" if state["active"] == "you" else "cash_them"
+        if event.key == pygame.K_BACKSPACE:
+            state[key] = state[key][:-1]
+        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            state["active"] = None
+        elif event.unicode.isdigit() and len(state[key]) < 6:
+            state[key] = (state[key] + event.unicode).lstrip("0") or ""
+
+    def _finalize_trade(self, player, state):
+        """Confirms with the partner and carries out the trade. Returns True to
+        close the dialog, False to keep editing."""
+        partner = state["partner"]
+        give = [t for t in player.properties if t in state["give"]]
+        receive = [t for t in partner.properties if t in state["receive"]]
+        cash = int(state["cash_you"] or 0) - int(state["cash_them"] or 0)
+        if not give and not receive and cash == 0:
+            return False  # empty offer; keep editing
+
         gnames = ", ".join(t.name for t in give) or "nothing"
         rnames = ", ".join(t.name for t in receive) or "nothing"
-        # From the partner's side: they give `receive`, they get `give`.
         accept = self.ask(
-            f"{partner.name}: {initiator.name} proposes a trade. You give "
+            f"{partner.name}: {player.name} proposes a trade. You give "
             f"{rnames}; you get {gnames}; "
-            f"{self._cash_label(initiator, partner, cash)}. Accept?",
+            f"{self._cash_label(player, partner, cash)}. Accept?",
             [("Accept", "yes"), ("Decline", "no")])
         if accept != "yes":
-            self.add_log(f"{partner.name} declined {initiator.name}'s trade.")
-            return
-        if self.game.execute_trade(initiator, partner, list(give),
-                                   list(receive), cash):
-            self.add_log(f"{initiator.name} and {partner.name} made a trade.")
-        else:
-            self.ask("Trade couldn't be completed (the cash payer can't afford "
-                     "it).", [("OK", "ok")])
+            self.add_log(f"{partner.name} declined {player.name}'s trade.")
+            return True
+        if self.game.execute_trade(player, partner, give, receive, cash):
+            self.add_log(f"{player.name} and {partner.name} made a trade.")
+            return True
+        self.ask("Trade couldn't be completed (the cash payer can't afford it).",
+                 [("OK", "ok")])
+        return False  # let them adjust and try again
+
+    # ----- trade dialog rendering ----------------------------------------
+
+    def _draw_trade_dialog(self, player, partners, state, mouse):
+        """Renders the trade pop-up over the board and returns its hot regions."""
+        self._draw_scene()
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((8, 40, 26, 190))
+        self.screen.blit(overlay, (0, 0))
+
+        dlg = pygame.Rect(BOARD_X + 6, BOARD_Y + 6, BOARD_PX - 12, BOARD_PX - 12)
+        self._panel(dlg, PANEL)
+        partner = state["partner"]
+        pad = 22
+
+        title = self.f_title.render("Propose a Trade", True, INK)
+        self.screen.blit(title, title.get_rect(midtop=(dlg.centerx, dlg.y + 14)))
+
+        # Partner selector buttons.
+        hot = {"partners": [], "give": [], "receive": []}
+        px = dlg.x + pad
+        py = dlg.y + 58
+        self._text("With:", (px, py + 6), self.f_small, MUTED)
+        px += 56
+        for p in partners:
+            fill = player_color(p.name) if p is partner else PANEL_ALT
+            ink = contrast_text(fill) if p is partner else INK
+            label = self.f_body.render(p.name, True, ink)
+            rect = pygame.Rect(px, py, label.get_width() + 28, 36)
+            pygame.draw.rect(self.screen, fill, rect, border_radius=8)
+            pygame.draw.rect(self.screen, EDGE, rect, 1, border_radius=8)
+            self.screen.blit(label, label.get_rect(center=rect.center))
+            hot["partners"].append((rect, p))
+            px += rect.width + 10
+
+        # Two columns: the player's inventory (give) and the partner's (receive).
+        colw = (dlg.w - 3 * pad) // 2
+        col_top = dlg.y + 112
+        cash_y = dlg.bottom - 132
+        chips_bottom = cash_y - 28
+        left_x = dlg.x + pad
+        right_x = dlg.x + pad + colw + pad
+
+        hot["give"] = self._draw_trade_column(
+            player, state["give"], left_x, col_top, colw, chips_bottom,
+            f"You give — {player.name}", player.balance)
+        hot["receive"] = self._draw_trade_column(
+            partner, state["receive"], right_x, col_top, colw, chips_bottom,
+            f"You receive — {partner.name}", partner.balance)
+
+        hot["cash_you"] = self._draw_cash_box(
+            "Your cash to add", state["cash_you"], left_x, cash_y, colw,
+            state["active"] == "you")
+        hot["cash_them"] = self._draw_cash_box(
+            f"{partner.name}'s cash to add", state["cash_them"], right_x, cash_y,
+            colw, state["active"] == "them")
+
+        # Bottom bar: net cash summary + Propose / Cancel.
+        net = int(state["cash_you"] or 0) - int(state["cash_them"] or 0)
+        summary = "Net: " + self._cash_label(player, partner, net)
+        self._text(summary, (dlg.x + pad, dlg.bottom - 50), self.f_body, INK)
+        hot["cancel"] = self._draw_dialog_button(
+            "Cancel", dlg.right - pad - 150, dlg.bottom - 58, 150, mouse,
+            (150, 70, 70))
+        hot["propose"] = self._draw_dialog_button(
+            "Propose", dlg.right - pad - 312, dlg.bottom - 58, 150, mouse, BTN)
+        return hot
+
+    def _draw_trade_column(self, owner, selected, x, y, w, bottom, header, bal):
+        """Draws one player's tradeable inventory as toggle chips."""
+        self._text(header, (x, y), self.f_head, INK)
+        self._text(f"Balance ${bal}", (x, y + 28), self.f_small, MUTED)
+        cy = y + 56
+        rows = []
+        tradeable = self._tradeable(owner)
+        if not tradeable:
+            self._text("Nothing tradeable.", (x, cy), self.f_small, MUTED)
+            return rows
+        for prop in tradeable:
+            if cy > bottom - 30:
+                self._text("…more", (x, cy), self.f_small, MUTED)
+                break
+            rect = pygame.Rect(x, cy, w, 30)
+            color = self._property_color(prop)
+            pygame.draw.rect(self.screen, color, rect, border_radius=5)
+            if prop in selected:
+                pygame.draw.rect(self.screen, ACCENT, rect, 3, border_radius=5)
+            else:
+                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1, border_radius=5)
+            name = prop.name + (" (mortgaged)" if prop.mortgaged else "")
+            name = self._truncate(name, self.f_small, w - 16)
+            self.screen.blit(
+                self.f_small.render(name, True, contrast_text(color)),
+                (x + 8, cy + 5))
+            rows.append((rect, prop))
+            cy += 34
+        return rows
+
+    def _draw_cash_box(self, label, value, x, y, w, active):
+        self._text(label, (x, y - 22), self.f_small, INK)
+        box = pygame.Rect(x, y, w, 40)
+        pygame.draw.rect(self.screen, (255, 255, 255), box, border_radius=6)
+        pygame.draw.rect(self.screen, ACCENT if active else EDGE, box,
+                         3 if active else 1, border_radius=6)
+        shown = "$" + (value or "0") + ("|" if active else "")
+        self.screen.blit(self.f_body.render(shown, True, INK),
+                         (box.x + 12, box.y + 8))
+        return box
+
+    def _draw_dialog_button(self, label, x, y, w, mouse, color):
+        rect = pygame.Rect(x, y, w, 44)
+        hover = rect.collidepoint(mouse) if mouse else False
+        shade = tuple(min(255, c + 24) for c in color) if hover else color
+        pygame.draw.rect(self.screen, shade, rect, border_radius=8)
+        surf = self.f_body.render(label, True, BTN_INK)
+        self.screen.blit(surf, surf.get_rect(center=rect.center))
+        return rect
 
     def _raise_funds(self, player, amount):
         """Bound to ``Game.on_shortfall``: when `player` owes `amount` they
