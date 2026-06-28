@@ -4,12 +4,19 @@ import random
 
 class Game:
     """Class to define the game."""
-    def __init__(self,players,board):
+    def __init__(self,players,board,chance_deck,community_deck):
         self.players = players
         self.board = board
-        self.current_player = 0
-        self.jail_position = 10
         self.roll = 0
+        self.current_player = 0
+
+        # Positions
+        self.jail_position = 10
+        self.go_salary = 200
+
+        # Card Decks
+        self.chance_deck = chance_deck
+        self.community_deck = community_deck
 
     def roll_dice(self):
         """
@@ -19,6 +26,48 @@ class Game:
             tuple: Results from the two rolls
         """
         return (random.randint(1,6), random.randint(1,6))
+
+    def draw_chance(self, player):
+        """Draws and resolves a card from the Chance pile."""
+        self._draw_card(self.chance_deck, player)
+
+    def draw_community(self, player):
+        """Draws and resolves a card from the Community Chest pile."""
+        self._draw_card(self.community_deck, player)
+
+    def _draw_card(self, deck, player):
+        """
+        Draws a card from `deck`, applies its effect, and returns it to `deck`
+        unless it is a Get Out of Jail Free card.
+
+        Get Out of Jail Free cards are kept out of the deck and held by the
+        player until used; the source deck is recorded on the card so it can be
+        returned to the correct pile (Chance or Community Chest) at that point.
+        """
+        card = deck.draw()
+        card.execute(self, player)
+
+        if card.escape_jail:
+            card.source_deck = deck
+            player.jail_cards.append(card)
+        else:
+            deck.return_card(card)
+
+    def resolve_tile(self, player):
+        """Triggers the on-land action for the tile the player is standing on."""
+        tile = self.board.get_tile(player.pos)
+        tile.on_land(self, player)
+
+    def advance_to(self, player, dest):
+        """
+        Moves the player forward to absolute position `dest`, paying the GO
+        salary if GO is passed, then resolves the destination tile.
+        """
+        # A destination behind the current square means GO was passed.
+        if dest < player.pos:
+            player.balance += self.go_salary
+        player.pos = dest
+        self.resolve_tile(player)
 
     def send_to_jail(self, player):
         """Sends player to jail."""
@@ -63,8 +112,10 @@ class Game:
             player.jail_turns = 0
             return "released"
 
-        if choice == "card" and player.get_out_of_jail_cards > 0:
-            player.get_out_of_jail_cards -= 1
+        if choice == "card" and player.jail_cards:
+            # Spend a held card and return it to the pile it came from.
+            card = player.jail_cards.pop()
+            card.source_deck.return_card(card)
             player.in_jail = False
             player.jail_turns = 0
             return "released"
@@ -117,8 +168,7 @@ class Game:
 
             # Escaped via the roll: already moved, resolve the tile, no bonus.
             if result == "moved":
-                tile = self.board.get_tile(player.pos)
-                tile.on_land(self, player)
+                self.resolve_tile(player)
                 self.current_player = (self.current_player + 1) % len(self.players)
                 return
 
@@ -140,8 +190,7 @@ class Game:
         player.move(self.roll)
 
         # gets the tile the player is on and take action on tile
-        tile = self.board.get_tile(player.pos)
-        tile.on_land(self,player)
+        self.resolve_tile(player)
 
         # change action to next player
         self.current_player = (self.current_player + 1) % len(self.players)
