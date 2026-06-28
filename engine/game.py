@@ -75,6 +75,7 @@ class Game:
         player.pos = self.jail_position
         player.in_jail = True
         player.jail_turns = 0
+        self.current_player = (self.current_player + 1) % len(self.players)
 
     def handle_jail_turn(self, player, choice="roll"):
         """
@@ -174,23 +175,36 @@ class Game:
 
             # result == "released": paid or used a card, now take a normal turn.
 
-        # roll dice
-        roll = self.roll_dice()
+        # Keep rolling while doubles are rolled.
+        while True:
+            roll = self.roll_dice()
+            is_double = len(set(roll)) <= 1
 
-        # add to double counter if double
-        player.double_count += len(set(roll)) <= 1
+            # Three doubles in one turn sends the player straight to jail.
+            if is_double:
+                player.double_count += 1
+                if player.double_count >= 3:
+                    player.double_count = 0
+                    self.send_to_jail(player)  # advances current_player
+                    return
 
-        # send to jail if 3 doubles
-        if player.double_count >= 3:
-            player.double_count = 0
-            self.send_to_jail(player)
+            # Move and resolve the tile landed on.
+            self.roll = sum(roll)
+            player.move(self.roll)
+            self.resolve_tile(player)
 
-        # sum rolls and move player based on roll
-        self.roll = sum(roll)
-        player.move(self.roll)
+            # A tile or card may have sent the player to jail, ending the turn.
+            # send_to_jail already advanced current_player, so just stop here.
+            if player.in_jail:
+                player.double_count = 0
+                return
 
-        # gets the tile the player is on and take action on tile
-        self.resolve_tile(player)
+            # A non-double ends the turn; doubles grant another roll.
+            if not is_double:
+                break
+
+        # reset player double count
+        player.double_count = 0
 
         # change action to next player
         self.current_player = (self.current_player + 1) % len(self.players)
