@@ -26,12 +26,12 @@ from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
 
 # Window / board geometry.
-WIDTH, HEIGHT = 1280, 800
-BOARD_X, BOARD_Y, BOARD_PX = 20, 20, 760
+WIDTH, HEIGHT = 1500, 950
+BOARD_X, BOARD_Y, BOARD_PX = 20, 20, 880
 CELL = BOARD_PX / 11
-SIDE_X = 800
+SIDE_X = 920
 SIDE_W = WIDTH - SIDE_X - 20
-TOKEN_PX = 38
+TOKEN_PX = 40
 
 # Palette.
 BG = (11, 76, 47)
@@ -40,6 +40,10 @@ PANEL_ALT = (236, 235, 228)
 EDGE = (206, 205, 196)
 INK = (34, 34, 34)
 MUTED = (122, 122, 122)
+# Light tones for text drawn directly on the dark green felt (with a shadow),
+# so headings, the log and inventory stay legible against the background.
+FELT_INK = (245, 243, 233)
+FELT_SUB = (197, 214, 197)
 ACCENT = (212, 175, 55)
 BTN = (58, 110, 165)
 BTN_HOVER = (78, 138, 197)
@@ -107,8 +111,12 @@ class MonopolyApp:
 
     # ----- small drawing helpers ----------------------------------------
 
-    def _text(self, text, pos, font=None, color=INK):
-        self.screen.blit((font or self.f_body).render(text, True, color), pos)
+    def _text(self, text, pos, font=None, color=INK, shadow=False):
+        font = font or self.f_body
+        if shadow:
+            sh = font.render(text, True, (0, 0, 0))
+            self.screen.blit(sh, (pos[0] + 1, pos[1] + 2))
+        self.screen.blit(font.render(text, True, color), pos)
 
     def _panel(self, rect, fill=PANEL):
         pygame.draw.rect(self.screen, fill, rect, border_radius=10)
@@ -201,7 +209,7 @@ class MonopolyApp:
     # ----- players & inventory ------------------------------------------
 
     def _draw_players(self, y):
-        self._text("Players", (SIDE_X, y), self.f_title)
+        self._text("Players", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         y += 42
         current = self.game.players[self.game.current_player]
         rects = []
@@ -246,52 +254,72 @@ class MonopolyApp:
         return "", ""
 
     def _draw_inventory(self, y, player):
-        self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head)
+        self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head,
+                   FELT_INK, shadow=True)
         self._text("(click the player again to close)", (SIDE_X, y + 28),
-                   self.f_small, MUTED)
+                   self.f_small, FELT_SUB, shadow=True)
         y += 56
         if not player.properties:
-            self._text("No properties owned.", (SIDE_X, y), self.f_body, MUTED)
+            self._text("No properties owned.", (SIDE_X, y), self.f_body,
+                       FELT_SUB, shadow=True)
             return
         for prop in player.properties:
             houses, rent = self._rent_line(prop)
-            self._text(prop.name, (SIDE_X, y), self.f_small, INK)
-            info = self.f_small.render(f"{houses}  ·  {rent}", True, MUTED)
-            self.screen.blit(info, (SIDE_X + SIDE_W - info.get_width(), y))
+            self._text(prop.name, (SIDE_X, y), self.f_small, FELT_INK,
+                       shadow=True)
+            info = f"{houses}  ·  {rent}"
+            w = self.f_small.size(info)[0]
+            self._text(info, (SIDE_X + SIDE_W - w, y), self.f_small, FELT_SUB,
+                       shadow=True)
             y += 30
             if y > HEIGHT - 30:
                 break
 
     def _draw_log(self, y):
-        self._text("Log", (SIDE_X, y), self.f_title)
+        self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         y += 40
         for line in self.log[-((HEIGHT - y) // 24):]:
-            self._text(line, (SIDE_X, y), self.f_small, INK)
+            self._text(line, (SIDE_X, y), self.f_small, FELT_INK, shadow=True)
             y += 24
 
     # ----- prompt --------------------------------------------------------
 
     def _draw_prompt(self, question, options, mouse):
-        height = 64 + len(options) * 52
-        box = pygame.Rect(SIDE_X, HEIGHT - height - 8, SIDE_W, height)
+        # Size the box from the actual wrapped question height so the buttons
+        # always fit inside it (a multi-line question used to push them out the
+        # bottom), and clamp it to the screen so it never runs off the top.
+        lines = self._wrap(question, self.f_body, SIDE_W - 28)
+        height = 14 + len(lines) * 26 + 10 + len(options) * 52 + 6
+        top = max(8, HEIGHT - height - 8)
+        box = pygame.Rect(SIDE_X, top, SIDE_W, height)
         self._panel(box)
         y = box.y + 14
-        for line in self._wrap(question, self.f_body, SIDE_W - 28):
+        for line in lines:
             self._text(line, (box.x + 14, y), self.f_body)
             y += 26
-        y += 6
+        y += 10
         buttons = []
         for i, (label, value) in enumerate(options):
             rect = pygame.Rect(box.x + 14, y, SIDE_W - 28, 44)
             hover = rect.collidepoint(mouse) if mouse else False
             pygame.draw.rect(self.screen, BTN_HOVER if hover else BTN, rect,
                              border_radius=8)
-            surf = self.f_body.render(f"{i + 1}.  {label}", True, BTN_INK)
+            label = self._truncate(f"{i + 1}.  {label}", self.f_body,
+                                   rect.width - 32)
+            surf = self.f_body.render(label, True, BTN_INK)
             self.screen.blit(surf, surf.get_rect(
                 midleft=(rect.x + 16, rect.centery)))
             buttons.append((rect, value))
             y += 52
         return buttons
+
+    def _truncate(self, text, font, max_width):
+        """Shortens text with an ellipsis so it fits within a button's width."""
+        if font.size(text)[0] <= max_width:
+            return text
+        while text and font.size(text + "…")[0] > max_width:
+            text = text[:-1]
+        return text + "…"
 
     def _wrap(self, text, font, max_width):
         words, lines, line = text.split(), [], ""
@@ -311,7 +339,7 @@ class MonopolyApp:
     def _draw_scene(self, question=None, options=None, mouse=None):
         self.screen.fill(BG)
         self._draw_board()
-        self._text("Monopoly", (SIDE_X, 16), self.f_title, PANEL)
+        self._text("Monopoly", (SIDE_X, 16), self.f_title, PANEL, shadow=True)
         y = self._draw_dice_panel(54)
         y, player_rects = self._draw_players(y + 14)
         y += 8
