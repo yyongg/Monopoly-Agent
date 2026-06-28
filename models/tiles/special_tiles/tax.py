@@ -6,7 +6,7 @@ class Tax(Tile):
     """Tax tile for board. Inherits from Tile class."""
 
     def __init__(self, name, pos, amount):
-        super().__init__("name", pos)
+        super().__init__(name, pos)
         self.amount = amount
 
     def on_land(self, game, player):
