@@ -12,7 +12,6 @@ class Player:
 
         # inventory
         self.properties = []
-        self.cards = []
 
         # jail properties
         self.in_jail = False
