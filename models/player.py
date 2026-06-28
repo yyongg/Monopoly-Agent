@@ -21,6 +21,22 @@ class Player:
         # number of doubles on a turn
         self.double_count = 0
 
+    def decide_purchase(self, prop):
+        """
+        Decides whether to buy an unowned property offered to this player.
+
+        This is the natural hook for an RL policy: the default baseline buys any
+        property the player can afford, and an agent overrides it to make its
+        own choice.
+
+        Args:
+            prop (type[Property]): The property being offered.
+
+        Returns:
+            bool: True to buy, False to decline.
+        """
+        return self.balance >= prop.price
+
     def move(self, steps):
         """
         Method to move player on the board.
