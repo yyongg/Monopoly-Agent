@@ -52,23 +52,32 @@ BTN = (58, 110, 165)
 BTN_HOVER = (78, 138, 197)
 BTN_INK = (255, 255, 255)
 
-# Glyph shown beside each prompt choice so options can be told apart by
-# scanning rather than reading. Keyed by the option's stable value id. These
-# are all monochrome glyphs DejaVu Sans (the UI font) actually has; color
-# emoji are avoided because the font can't render them.
+# Icon drawn beside each prompt choice so options can be told apart by
+# scanning rather than reading. Keyed by the option's stable value id; the
+# value names a shape drawn with pygame primitives (see _draw_icon) so it
+# renders identically on every system — unlike font glyphs/emoji, which show
+# up as empty boxes when the resolved system font lacks them.
 CHOICE_ICONS = {
-    "build": "▲",       # add a house
-    "sell": "▼",        # sell a house
-    "mortgage": "$",    # take cash from the bank
-    "unmortgage": "♻",  # buy the property back
-    "trade": "⇄",       # swap with another player
-    "manage": "⚙",      # open the manage menu
-    "roll": "⚄",        # roll the dice
-    "end": "✓",         # end the turn
-    "done": "✓",        # finish managing
-    "pay": "$",         # pay to leave jail
-    "card": "★",        # use a Get Out of Jail card
-    "give_up": "⚠",     # declare bankruptcy
+    "build": "up",        # add a house
+    "sell": "down",       # sell a house
+    "mortgage": "coin",   # take cash from the bank
+    "unmortgage": "ring", # buy the property back
+    "trade": "swap",      # swap with another player
+    "manage": "menu",     # open the manage menu
+    "roll": "die",        # roll the dice
+    "end": "check",       # end the turn
+    "done": "check",      # finish managing
+    "pay": "coin",        # pay to leave jail
+    "card": "star",       # use a Get Out of Jail card
+    "give_up": "warn",    # declare bankruptcy
+}
+# Tints that aid scanning while staying legible on the blue choice buttons.
+ICON_COLORS = {
+    "up": (120, 230, 140),
+    "down": (255, 150, 150),
+    "coin": (255, 210, 90),
+    "ring": (255, 210, 90),
+    "warn": (255, 184, 92),
 }
 HOUSE_GREEN = (38, 158, 70)
 HOTEL_RED = (200, 62, 55)
@@ -430,17 +439,81 @@ class MonopolyApp:
         return DEFAULT_COLOR
 
     def _choice_icon(self, value):
-        """Returns (glyph, color) to draw beside a prompt choice. Property
-        choices (value is a board position) get a swatch in their group's
-        color — the sentinel glyph ``"swatch"`` tells the caller to draw a
-        filled square instead of rendering text."""
+        """Returns (shape, color) for the icon drawn beside a prompt choice.
+        Property choices (value is a board position) get a ``"swatch"`` in
+        their group's color; action choices map to a named shape (see
+        _draw_icon). A ``None`` color means use the default button ink."""
         if isinstance(value, int):
             tile = self.game.board.tiles[value]
             if isinstance(tile, Property):
                 return "swatch", self._property_color(tile)
         if value is None:
-            return "✕", None  # Cancel / back out
-        return CHOICE_ICONS.get(value, "•"), None
+            return "x", None  # Cancel / back out
+        shape = CHOICE_ICONS.get(value, "dot")
+        return shape, ICON_COLORS.get(shape)
+
+    def _draw_icon(self, shape, color, cx, cy, s=20):
+        """Draws a small vector icon centered at (cx, cy) within an s-pixel
+        box. Uses only pygame primitives so icons never depend on font glyph
+        coverage (which is what made the emoji show up as boxes)."""
+        scr = self.screen
+        h = s // 2
+        if shape == "swatch":
+            r = pygame.Rect(0, 0, s, s)
+            r.center = (cx, cy)
+            pygame.draw.rect(scr, color, r, border_radius=4)
+            pygame.draw.rect(scr, (0, 0, 0), r, 1, border_radius=4)
+        elif shape == "up":          # build a house
+            pygame.draw.polygon(scr, color,
+                                [(cx, cy - h), (cx + h, cy + h), (cx - h, cy + h)])
+        elif shape == "down":        # sell a house
+            pygame.draw.polygon(scr, color,
+                                [(cx, cy + h), (cx + h, cy - h), (cx - h, cy - h)])
+        elif shape == "coin":        # take/pay cash
+            pygame.draw.circle(scr, color, (cx, cy), h)
+            pygame.draw.circle(scr, (0, 0, 0), (cx, cy), h, 1)
+            pygame.draw.line(scr, (0, 0, 0), (cx, cy - 5), (cx, cy + 5), 2)
+        elif shape == "ring":        # buy property back
+            pygame.draw.circle(scr, color, (cx, cy), h, 2)
+            pygame.draw.line(scr, color, (cx, cy - 4), (cx, cy + 4), 2)
+        elif shape == "swap":        # trade with another player
+            pygame.draw.line(scr, color, (cx - h, cy - 4), (cx + h - 3, cy - 4), 2)
+            pygame.draw.polygon(scr, color, [(cx + h, cy - 4),
+                                (cx + h - 6, cy - 8), (cx + h - 6, cy)])
+            pygame.draw.line(scr, color, (cx - h + 3, cy + 4), (cx + h, cy + 4), 2)
+            pygame.draw.polygon(scr, color, [(cx - h, cy + 4),
+                                (cx - h + 6, cy), (cx - h + 6, cy + 8)])
+        elif shape == "menu":        # open manage menu (list)
+            for dy in (-6, 0, 6):
+                pygame.draw.line(scr, color, (cx - h, cy + dy), (cx + h, cy + dy), 2)
+        elif shape == "die":         # roll dice
+            r = pygame.Rect(0, 0, s, s)
+            r.center = (cx, cy)
+            pygame.draw.rect(scr, color, r, 2, border_radius=4)
+            for px, py in [(cx - 5, cy - 5), (cx + 5, cy - 5), (cx, cy),
+                           (cx - 5, cy + 5), (cx + 5, cy + 5)]:
+                pygame.draw.circle(scr, color, (px, py), 2)
+        elif shape == "check":       # confirm / end turn
+            pygame.draw.lines(scr, color, False,
+                              [(cx - h + 1, cy + 1), (cx - 2, cy + h - 2),
+                               (cx + h, cy - h + 1)], 3)
+        elif shape == "star":        # Get Out of Jail card
+            pts = []
+            for k in range(10):
+                ang = -math.pi / 2 + k * math.pi / 5
+                rad = h if k % 2 == 0 else h * 0.45
+                pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+            pygame.draw.polygon(scr, color, pts)
+        elif shape == "warn":        # declare bankruptcy
+            pygame.draw.polygon(scr, color,
+                                [(cx, cy - h), (cx + h, cy + h), (cx - h, cy + h)], 2)
+            pygame.draw.line(scr, color, (cx, cy - 3), (cx, cy + 4), 2)
+            pygame.draw.circle(scr, color, (cx, cy + 8), 1)
+        elif shape == "x":           # cancel
+            pygame.draw.line(scr, color, (cx - h, cy - h), (cx + h, cy + h), 3)
+            pygame.draw.line(scr, color, (cx + h, cy - h), (cx - h, cy + h), 3)
+        else:                        # dot (fallback)
+            pygame.draw.circle(scr, color, (cx, cy), 4)
 
     def _draw_property_chip(self, prop, x, y):
         """Draws the property name on a highlight chip in its group's color."""
@@ -489,16 +562,8 @@ class MonopolyApp:
             num = self.f_small.render(f"{i + 1}", True, BTN_INK)
             self.screen.blit(num, num.get_rect(midleft=(x, rect.centery)))
             x += 24
-            glyph, color = self._choice_icon(value)
-            if glyph == "swatch":
-                sw = pygame.Rect(0, 0, 20, 20)
-                sw.center = (x + 10, rect.centery)
-                pygame.draw.rect(self.screen, color, sw, border_radius=4)
-                pygame.draw.rect(self.screen, (0, 0, 0), sw, 1, border_radius=4)
-            else:
-                icon = self.f_head.render(glyph, True, color or BTN_INK)
-                self.screen.blit(icon, icon.get_rect(
-                    center=(x + 10, rect.centery)))
+            shape, color = self._choice_icon(value)
+            self._draw_icon(shape, color or BTN_INK, x + 10, rect.centery)
             x += 32
             text = self._truncate(label, self.f_body, rect.right - 14 - x)
             surf = self.f_body.render(text, True, BTN_INK)
