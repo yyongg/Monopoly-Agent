@@ -98,6 +98,9 @@ class MonopolyApp:
             player.decide_purchase = (
                 lambda prop, _p=player: self._prompt_purchase(_p, prop))
 
+        # Show drawn Chance / Community Chest cards to the player.
+        game.on_card = self._show_card
+
     @staticmethod
     def _font(size, bold=False):
         return pygame.font.SysFont("dejavusans,arial,helvetica", size, bold=bold)
@@ -397,6 +400,11 @@ class MonopolyApp:
         self.add_log(f"{player.name} {'bought' if bought else 'declined'} "
                      f"{prop.name}.")
         return bought
+
+    def _show_card(self, pile, card):
+        """Shows a drawn Chance / Community Chest card before its effect runs."""
+        self.add_log(f"{pile}: {card.text}")
+        self.ask(f"{pile} card — {card.text}", [("Continue", "ok")])
 
     def _buildable(self, player):
         return [t for t in self.game.board.tiles

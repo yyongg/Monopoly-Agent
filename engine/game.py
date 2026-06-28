@@ -19,6 +19,11 @@ class Game:
         self.chance_deck = chance_deck
         self.community_deck = community_deck
 
+        # Optional UI hook: called as on_card(pile_name, card) when a card is
+        # drawn, before its effect is applied, so the UI can show the player
+        # what they drew. Left as None for headless play.
+        self.on_card = None
+
     def roll_dice(self):
         """
         Rolls two 6-sided dice, records them on ``last_dice`` (so the UI can
@@ -32,22 +37,29 @@ class Game:
 
     def draw_chance(self, player):
         """Draws and resolves a card from the Chance pile."""
-        self._draw_card(self.chance_deck, player)
+        self._draw_card(self.chance_deck, player, "Chance")
 
     def draw_community(self, player):
         """Draws and resolves a card from the Community Chest pile."""
-        self._draw_card(self.community_deck, player)
+        self._draw_card(self.community_deck, player, "Community Chest")
 
-    def _draw_card(self, deck, player):
+    def _draw_card(self, deck, player, pile):
         """
         Draws a card from `deck`, applies its effect, and returns it to `deck`
         unless it is a Get Out of Jail Free card.
+
+        The `on_card` hook (if set) is called with the pile name and card before
+        the effect is applied, so the UI can show the drawn card to the player.
 
         Get Out of Jail Free cards are kept out of the deck and held by the
         player until used; the source deck is recorded on the card so it can be
         returned to the correct pile (Chance or Community Chest) at that point.
         """
         card = deck.draw()
+
+        if self.on_card is not None:
+            self.on_card(pile, card)
+
         card.execute(self, player)
 
         if card.escape_jail:
