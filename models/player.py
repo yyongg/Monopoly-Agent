@@ -8,9 +8,19 @@ class Player:
         self.name = name
         self.balance = 1500
         self.pos = 0
+        self.bankrupt = False
+
+        # inventory
         self.properties = []
+        self.cards = []
+
+        # jail properties
         self.in_jail = False
-        self.remaining_jail = 0
+        self.jail_turns = 0
+        self.get_out_of_jail_cards = 0
+
+        # number of doubles on a turn
+        self.double_count = 0
 
     def move(self, steps):
         """
