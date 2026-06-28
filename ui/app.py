@@ -42,6 +42,7 @@ PANEL_ALT = (236, 235, 228)
 EDGE = (206, 205, 196)
 INK = (34, 34, 34)
 MUTED = (122, 122, 122)
+
 # Light tones for text drawn directly on the dark green felt (with a shadow),
 # so headings, the log and inventory stay legible against the background.
 FELT_INK = (245, 243, 233)
@@ -50,6 +51,25 @@ ACCENT = (212, 175, 55)
 BTN = (58, 110, 165)
 BTN_HOVER = (78, 138, 197)
 BTN_INK = (255, 255, 255)
+
+# Glyph shown beside each prompt choice so options can be told apart by
+# scanning rather than reading. Keyed by the option's stable value id. These
+# are all monochrome glyphs DejaVu Sans (the UI font) actually has; color
+# emoji are avoided because the font can't render them.
+CHOICE_ICONS = {
+    "build": "▲",       # add a house
+    "sell": "▼",        # sell a house
+    "mortgage": "$",    # take cash from the bank
+    "unmortgage": "♻",  # buy the property back
+    "trade": "⇄",       # swap with another player
+    "manage": "⚙",      # open the manage menu
+    "roll": "⚄",        # roll the dice
+    "end": "✓",         # end the turn
+    "done": "✓",        # finish managing
+    "pay": "$",         # pay to leave jail
+    "card": "★",        # use a Get Out of Jail card
+    "give_up": "⚠",     # declare bankruptcy
+}
 HOUSE_GREEN = (38, 158, 70)
 HOTEL_RED = (200, 62, 55)
 DIE_FACE = (250, 250, 248)
@@ -409,6 +429,19 @@ class MonopolyApp:
             return UTILITY_COLOR
         return DEFAULT_COLOR
 
+    def _choice_icon(self, value):
+        """Returns (glyph, color) to draw beside a prompt choice. Property
+        choices (value is a board position) get a swatch in their group's
+        color — the sentinel glyph ``"swatch"`` tells the caller to draw a
+        filled square instead of rendering text."""
+        if isinstance(value, int):
+            tile = self.game.board.tiles[value]
+            if isinstance(tile, Property):
+                return "swatch", self._property_color(tile)
+        if value is None:
+            return "✕", None  # Cancel / back out
+        return CHOICE_ICONS.get(value, "•"), None
+
     def _draw_property_chip(self, prop, x, y):
         """Draws the property name on a highlight chip in its group's color."""
         color = self._property_color(prop)
@@ -452,11 +485,24 @@ class MonopolyApp:
             hover = rect.collidepoint(mouse) if mouse else False
             pygame.draw.rect(self.screen, BTN_HOVER if hover else BTN, rect,
                              border_radius=8)
-            label = self._truncate(f"{i + 1}.  {label}", self.f_body,
-                                   rect.width - 32)
-            surf = self.f_body.render(label, True, BTN_INK)
-            self.screen.blit(surf, surf.get_rect(
-                midleft=(rect.x + 16, rect.centery)))
+            x = rect.x + 14
+            num = self.f_small.render(f"{i + 1}", True, BTN_INK)
+            self.screen.blit(num, num.get_rect(midleft=(x, rect.centery)))
+            x += 24
+            glyph, color = self._choice_icon(value)
+            if glyph == "swatch":
+                sw = pygame.Rect(0, 0, 20, 20)
+                sw.center = (x + 10, rect.centery)
+                pygame.draw.rect(self.screen, color, sw, border_radius=4)
+                pygame.draw.rect(self.screen, (0, 0, 0), sw, 1, border_radius=4)
+            else:
+                icon = self.f_head.render(glyph, True, color or BTN_INK)
+                self.screen.blit(icon, icon.get_rect(
+                    center=(x + 10, rect.centery)))
+            x += 32
+            text = self._truncate(label, self.f_body, rect.right - 14 - x)
+            surf = self.f_body.render(text, True, BTN_INK)
+            self.screen.blit(surf, surf.get_rect(midleft=(x, rect.centery)))
             buttons.append((rect, value))
             y += 52
         return buttons
