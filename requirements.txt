@@ -1,0 +1,8 @@
+# Runtime dependencies for the Monopoly game.
+# Install with:  pip install -r requirements.txt
+#
+# The web UI (play_web.py) uses only the Python standard library, so the
+# single dependency below is needed only for the desktop pygame UI
+# (play_gui.py). The game engine itself is pure standard library.
+
+pygame==2.6.1

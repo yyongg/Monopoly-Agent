@@ -50,6 +50,25 @@ def tile_center(pos, board_x, board_y, board_px):
     return (int(cx), int(cy))
 
 
+def interior_offset(pos):
+    """
+    Returns a unit (dx, dy) pointing from a perimeter tile toward the board's
+    interior. Used to place house markers just inside the edge a tile sits on.
+    Streets never occupy the four corners, so only the four edges are handled.
+
+    Args:
+        pos (int): Board position 0-39.
+    """
+    pos %= 40
+    if pos < 10:
+        return (0, -1)   # bottom edge -> up
+    if pos < 20:
+        return (1, 0)    # left edge -> right
+    if pos < 30:
+        return (0, 1)    # top edge -> down
+    return (-1, 0)       # right edge -> left
+
+
 def token_offset(index, board_px):
     """
     Returns a small (dx, dy) so up to four tokens on one tile don't fully

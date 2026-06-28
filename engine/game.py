@@ -8,6 +8,7 @@ class Game:
         self.players = players
         self.board = board
         self.roll = 0
+        self.last_dice = (0, 0)
         self.current_player = 0
 
         # Positions
@@ -20,12 +21,14 @@ class Game:
 
     def roll_dice(self):
         """
-        Rolls two 6-sided die and returns the results.
-        
+        Rolls two 6-sided dice, records them on ``last_dice`` (so the UI can
+        show the result of any roll) and returns them.
+
         Returns:
-            tuple: Results from the two rolls
+            tuple: The two die values.
         """
-        return (random.randint(1,6), random.randint(1,6))
+        self.last_dice = (random.randint(1, 6), random.randint(1, 6))
+        return self.last_dice
 
     def draw_chance(self, player):
         """Draws and resolves a card from the Chance pile."""
@@ -116,12 +119,42 @@ class Game:
         self.resolve_tile(player)
 
     def send_to_jail(self, player):
-        """Sends player to jail."""
-
+        """
+        Sends a player to jail. Does not advance the turn; the caller (``step``
+        for the headless sim, or the UI) is responsible for ending the turn.
+        """
         player.pos = self.jail_position
         player.in_jail = True
         player.jail_turns = 0
-        self.advance_turn()
+        player.double_count = 0
+
+    def roll_once(self, player):
+        """
+        Plays a single dice roll for a non-jailed player: applies the
+        three-doubles-to-jail rule and moves the player, but does NOT resolve
+        the destination tile or advance the turn. This lets the UI animate the
+        move and stop between rolls (so doubles are re-rolled on demand rather
+        than automatically).
+
+        Args:
+            player (type[Player]): The player rolling.
+
+        Returns:
+            tuple: ``(die1, die2, is_double, sent_to_jail)``. When sent_to_jail
+                is True (a third double) the player did not move forward.
+        """
+        die1, die2 = self.roll_dice()
+        is_double = die1 == die2
+
+        if is_double:
+            player.double_count += 1
+            if player.double_count >= 3:
+                self.send_to_jail(player)  # resets double_count
+                return die1, die2, True, True
+
+        self.roll = die1 + die2
+        player.move(self.roll)
+        return die1, die2, is_double, False
 
     def pay(self, payer, amount, payee=None):
         """
@@ -283,26 +316,20 @@ class Game:
 
         # Keep rolling while doubles are rolled.
         while True:
-            roll = self.roll_dice()
-            is_double = len(set(roll)) <= 1
+            _, _, is_double, sent_to_jail = self.roll_once(player)
 
             # Three doubles in one turn sends the player straight to jail.
-            if is_double:
-                player.double_count += 1
-                if player.double_count >= 3:
-                    player.double_count = 0
-                    self.send_to_jail(player)  # advances current_player
-                    return
+            if sent_to_jail:
+                self.advance_turn()
+                return
 
-            # Move and resolve the tile landed on.
-            self.roll = sum(roll)
-            player.move(self.roll)
+            # Resolve the tile landed on.
             self.resolve_tile(player)
 
             # A tile or card may have sent the player to jail, ending the turn.
-            # send_to_jail already advanced current_player, so just stop here.
             if player.in_jail:
                 player.double_count = 0
+                self.advance_turn()
                 return
 
             # Going bankrupt this turn ends it immediately.
@@ -315,8 +342,6 @@ class Game:
             if not is_double:
                 break
 
-        # reset player double count
+        # reset double count and pass to the next player
         player.double_count = 0
-
-        # change action to next player
         self.advance_turn()
