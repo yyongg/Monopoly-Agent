@@ -10,4 +10,4 @@ class Tax(Tile):
         self.amount = amount
 
     def on_land(self, game, player):
-        player.balance -= self.amount
+        game.pay(player, self.amount)

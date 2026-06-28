@@ -50,8 +50,7 @@ class Property(Tile):
         """
 
         rent = self.get_rent(game,player)
-        player.balance -= rent
-        self.owner.balance += rent
+        game.pay(player, rent, self.owner)
 
     def transfer_ownership(self, new_owner):
         """

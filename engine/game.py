@@ -121,7 +121,67 @@ class Game:
         player.pos = self.jail_position
         player.in_jail = True
         player.jail_turns = 0
-        self.current_player = (self.current_player + 1) % len(self.players)
+        self.advance_turn()
+
+    def pay(self, payer, amount, payee=None):
+        """
+        Transfers `amount` from `payer`. If `payee` is given the money goes to
+        them, otherwise it goes to the bank. A payer who cannot cover the amount
+        goes bankrupt.
+
+        Args:
+            payer (type[Player]): Player making the payment.
+            amount (int): Amount owed.
+            payee (type[Player]): Recipient, or None to pay the bank.
+        """
+        payer.balance -= amount
+        if payee is not None:
+            payee.balance += amount
+
+        if payer.balance < 0:
+            self.declare_bankrupt(payer)
+
+    def declare_bankrupt(self, player):
+        """
+        Removes a player from play: returns their properties (and any houses) to
+        the bank and their held Get Out of Jail Free cards to their decks.
+
+        Note: this simplifies the real rule (assets to the creditor) by always
+        returning assets to the bank, which is enough for a complete game.
+        """
+        player.bankrupt = True
+
+        for prop in list(player.properties):
+            prop.owner = None
+            if hasattr(prop, "houses"):
+                prop.houses = 0
+        player.properties.clear()
+
+        for card in list(player.jail_cards):
+            card.source_deck.return_card(card)
+        player.jail_cards.clear()
+
+        player.balance = 0
+
+    def active_players(self):
+        """Returns the players still in the game (not bankrupt)."""
+        return [p for p in self.players if not p.bankrupt]
+
+    def is_over(self):
+        """Returns whether the game has ended (one or zero players left)."""
+        return len(self.active_players()) <= 1
+
+    def winner(self):
+        """Returns the sole surviving player, or None if the game is not over."""
+        survivors = self.active_players()
+        return survivors[0] if len(survivors) == 1 else None
+
+    def advance_turn(self):
+        """Passes play to the next player who is still in the game."""
+        for _ in range(len(self.players)):
+            self.current_player = (self.current_player + 1) % len(self.players)
+            if not self.players[self.current_player].bankrupt:
+                return
 
     def handle_jail_turn(self, player, choice="roll"):
         """
@@ -210,13 +270,13 @@ class Game:
 
             # Stuck in jail, or released without moving: turn is over.
             if result in ("jailed", "freed"):
-                self.current_player = (self.current_player + 1) % len(self.players)
+                self.advance_turn()
                 return
 
             # Escaped via the roll: already moved, resolve the tile, no bonus.
             if result == "moved":
                 self.resolve_tile(player)
-                self.current_player = (self.current_player + 1) % len(self.players)
+                self.advance_turn()
                 return
 
             # result == "released": paid or used a card, now take a normal turn.
@@ -245,6 +305,12 @@ class Game:
                 player.double_count = 0
                 return
 
+            # Going bankrupt this turn ends it immediately.
+            if player.bankrupt:
+                player.double_count = 0
+                self.advance_turn()
+                return
+
             # A non-double ends the turn; doubles grant another roll.
             if not is_double:
                 break
@@ -253,4 +319,4 @@ class Game:
         player.double_count = 0
 
         # change action to next player
-        self.current_player = (self.current_player + 1) % len(self.players)
+        self.advance_turn()

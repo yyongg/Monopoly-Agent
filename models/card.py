@@ -27,7 +27,11 @@ class MoneyCard(Card):
         self.amount = amount
 
     def execute(self, game, player):
-        player.balance += self.amount
+        # Collecting is a plain credit; paying may bankrupt the player.
+        if self.amount >= 0:
+            player.balance += self.amount
+        else:
+            game.pay(player, -self.amount)
 
 
 class PerPlayerCard(Card):
@@ -44,10 +48,14 @@ class PerPlayerCard(Card):
 
     def execute(self, game, player):
         for other in game.players:
-            if other is player:
+            if other is player or other.bankrupt:
                 continue
-            other.balance -= self.amount
-            player.balance += self.amount
+            if self.amount >= 0:
+                # Collect from each opponent; an opponent may go bankrupt.
+                game.pay(other, self.amount, player)
+            else:
+                # Pay each opponent; the card holder may go bankrupt.
+                game.pay(player, -self.amount, other)
 
 
 class GoToJailCard(Card):
