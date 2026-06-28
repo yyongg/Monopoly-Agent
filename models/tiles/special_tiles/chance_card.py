@@ -9,4 +9,4 @@ class ChanceCard(Tile):
         super().__init__("Chance", pos)
 
     def on_land(self, game, player):
-        game.chance_deck.draw(game, player)
+        game.draw_chance(player)

@@ -9,4 +9,4 @@ class CommunityChest(Tile):
         super().__init__("Community Chest", pos)
 
     def on_land(self, game, player):
-        game.chance_deck.draw(game, player)
+        game.draw_community(player)
