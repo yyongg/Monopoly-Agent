@@ -143,6 +143,7 @@ class MonopolyApp:
         self.log = []
         self.selected = None          # index of player whose inventory is open
         self.roll_display = None      # {"name", "dice"} for the dice panel
+        self.board_dice = None        # (d1, d2) shown in the board center while rolling
         self.vpos = {p.name: float(p.pos) for p in game.players}
         self.hop = {p.name: 0.0 for p in game.players}  # token landing bounce
 
@@ -156,8 +157,10 @@ class MonopolyApp:
         self.f_body = self._font(22)
         self.f_small = self._font(19)
 
+        # Minimalist, name-free board (see tools/generate_board.py). Swap to
+        # "board.jpg" here for the classic illustrated board.
         self.board_img = pygame.transform.smoothscale(
-            pygame.image.load(os.path.join(ASSETS, "board.jpg")).convert(),
+            pygame.image.load(os.path.join(ASSETS, "board_minimal.png")).convert(),
             (BOARD_PX, BOARD_PX),
         )
         self.tokens = {}
@@ -307,6 +310,30 @@ class MonopolyApp:
                                    TOKEN_PX // 2 + 4, 3)
             token = self.tokens[player.name]
             self.screen.blit(token, token.get_rect(center=(tx, ty)))
+        self._draw_board_dice()
+
+    def _draw_board_dice(self):
+        """Draws the rolling dice in the center of the board (on a soft
+        backdrop so they stay readable over the board art). Only shown while a
+        roll is animating; ``board_dice`` is cleared once it settles."""
+        if not self.board_dice:
+            return
+        d1, d2 = self.board_dice
+        size, gap = 88, 26
+        cx = BOARD_X + BOARD_PX // 2
+        cy = BOARD_Y + BOARD_PX // 2
+        total_w = size * 2 + gap
+        pad = 24
+        back = pygame.Rect(0, 0, total_w + pad * 2, size + pad * 2)
+        back.center = (cx, cy)
+        backdrop = pygame.Surface(back.size, pygame.SRCALPHA)
+        pygame.draw.rect(backdrop, (10, 38, 24, 180), backdrop.get_rect(),
+                         border_radius=20)
+        self.screen.blit(backdrop, back.topleft)
+        left = cx - total_w // 2
+        top = cy - size // 2
+        self._draw_die(left, top, size, d1)
+        self._draw_die(left + size + gap, top, size, d2)
 
     # ----- dice ----------------------------------------------------------
 
@@ -718,13 +745,23 @@ class MonopolyApp:
         if self._auto is not None:
             self._set_roll(player, final)
             return
+        skipped = False
         for _ in range(11):
-            self._set_roll(
-                player, (random.randint(1, 6), random.randint(1, 6)))
+            dice = (random.randint(1, 6), random.randint(1, 6))
+            self._set_roll(player, dice)
+            self.board_dice = dice
             if self._frame():
+                skipped = True
                 break
             pygame.time.wait(38)
         self._set_roll(player, final)
+        self.board_dice = final
+        # Let the settled roll sit in the center for a beat (skippable).
+        for _ in range(0 if skipped else 14):
+            if self._frame():
+                break
+            pygame.time.wait(28)
+        self.board_dice = None
         self._frame()
 
     # ----- decisions -----------------------------------------------------
