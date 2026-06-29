@@ -876,14 +876,27 @@ class MonopolyApp:
                 self.add_log(f"{player.name} lifted the mortgage on "
                              f"{tile.name} for ${cost}.")
 
-    def _manage_menu(self, player):
+    def _manage_menu(self, player, jail_exit=False):
         """Property-management submenu: build/sell houses, mortgage/unmortgage.
 
         Reachable both before and after rolling, and loops until the player is
         done so they can make several changes in one visit.
+
+        When ``jail_exit`` is True (the pre-roll menu of a jailed player), the
+        escape actions are also offered here so a player who raises the bail
+        mid-management — e.g. by selling, mortgaging or trading — can pay right
+        away instead of having to back out to the turn menu first. If one is
+        chosen it is returned ("pay" or "card") for the caller to act on;
+        otherwise the menu returns None when the player is done.
         """
         while True:
             options = []
+            # Surface jail escape here too, so it appears the instant the
+            # player can afford it (right after the fund-raising action).
+            if jail_exit and player.balance >= 50:
+                options.append(("Pay $50 to leave jail", "pay"))
+            if jail_exit and player.jail_cards:
+                options.append(("Use Get Out of Jail Free card", "card"))
             if self._buildable(player):
                 options.append(("Build a house", "build"))
             if self._sellable(player):
@@ -897,6 +910,8 @@ class MonopolyApp:
             options.append(("Done managing", "done"))
             choice = self.ask(
                 f"{player.name}: manage properties (${player.balance})", options)
+            if choice in ("pay", "card"):
+                return choice  # leave jail now; the turn menu acts on this
             if choice == "build":
                 self._build_flow(player)
             elif choice == "sell":
@@ -908,7 +923,7 @@ class MonopolyApp:
             elif choice == "trade":
                 self._trade_flow(player)
             else:
-                return
+                return None
 
     # ----- trading -------------------------------------------------------
 
@@ -1184,7 +1199,11 @@ class MonopolyApp:
             choice = self.ask(
                 f"{player.name}'s turn — {where} (${player.balance})", options)
             if choice == "manage":
-                self._manage_menu(player)
+                # A jailed player may raise the bail in here and choose to pay
+                # or use a card; that decision flows back as the turn choice.
+                jail_action = self._manage_menu(player, jail_exit=player.in_jail)
+                if jail_action is not None:
+                    return jail_action
             else:
                 return choice
 
