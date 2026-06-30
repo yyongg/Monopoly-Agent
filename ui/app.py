@@ -259,6 +259,37 @@ def _run_setup(screen, clock, model_available):
         clock.tick(60)
 
 
+def _show_error(screen, clock, lines):
+    """Shows a blocking error panel until the user clicks or presses a key."""
+    font_head = pygame.font.SysFont("dejavusans,arial,helvetica", 28, bold=True)
+    font_body = pygame.font.SysFont("dejavusans,arial,helvetica", 20)
+    while True:
+        screen.fill(BG)
+        pw, ph = 640, 60 + len(lines) * 30 + 70
+        px = WIDTH // 2 - pw // 2
+        py = HEIGHT // 2 - ph // 2
+        panel = pygame.Rect(px, py, pw, ph)
+        pygame.draw.rect(screen, PANEL, panel, border_radius=14)
+        pygame.draw.rect(screen, (180, 90, 40), panel, 2, border_radius=14)
+        surf = font_head.render("Heads up", True, (180, 90, 40))
+        screen.blit(surf, surf.get_rect(midtop=(px + pw // 2, py + 18)))
+        y = py + 62
+        for line in lines:
+            screen.blit(font_body.render(line, True, INK), (px + 30, y))
+            y += 30
+        btn = pygame.Rect(px + pw // 2 - 90, py + ph - 56, 180, 40)
+        pygame.draw.rect(screen, BTN, btn, border_radius=8)
+        surf = font_body.render("Continue", True, BTN_INK)
+        screen.blit(surf, surf.get_rect(center=btn.center))
+        pygame.display.flip()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN):
+                return
+        clock.tick(60)
+
+
 # ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
@@ -334,6 +365,18 @@ class MonopolyApp:
 
     def _is_ai(self, player):
         return player.name in self._ai_deciders
+
+    def _current_is_ai(self):
+        return self._is_ai(self.game.players[self.game.current_player])
+
+    def _ai_pause(self, seconds):
+        """A short, skippable pause so AI events are watchable (no blocking)."""
+        if self._auto is not None:
+            return
+        start = time.time()
+        while time.time() - start < seconds:
+            if self._frame():  # a click / key press skips the wait
+                return
 
     @staticmethod
     def _font(size, bold=False):
@@ -891,10 +934,17 @@ class MonopolyApp:
 
     def _show_card(self, pile, card):
         self.add_log(f"{pile}: {card.text}")
+        # AI turns don't block: log the card and pause briefly so it's watchable.
+        if self._current_is_ai():
+            self._ai_pause(0.9)
+            return
         self.ask(f"{pile} card — {card.text}", [("Continue", "ok")])
 
     def _inform(self, message):
         self.add_log(message)
+        # AI turns don't block on event acknowledgements; the log records them.
+        if self._current_is_ai():
+            return
         self.ask(message, [("Continue", "ok")])
 
     def _buildable(self, player):
@@ -1451,7 +1501,16 @@ def main():
             print(f"Loading model from {model_path} …")
             model = MaskablePPO.load(model_path, device="cpu")
         except Exception as exc:
-            print(f"Warning: could not load model ({exc}). AI seats will use baseline.")
+            print(f"ERROR: could not load model ({exc}).")
+            _show_error(screen, clock, [
+                "Could not load the AI model.",
+                str(exc)[:60],
+                "",
+                "Make sure you run inside the project venv:",
+                "  source .venv/bin/activate && python play_gui.py",
+                "",
+                "Starting a human-only game instead.",
+            ])
             ai_names = set()
 
     # Build players and (optionally) shuffle turn order.
