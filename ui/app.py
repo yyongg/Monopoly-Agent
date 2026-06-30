@@ -1,19 +1,16 @@
-"""Pygame hot-seat UI for the Monopoly game.
+"""Pygame UI for the Monopoly game — supports human and AI players.
 
-All players are controlled from this computer. On each turn the game pauses and
-asks the human for every decision (build/sell, jail action, roll, and whether to
-buy a property). Dice results are shown, movement slides tile by tile, and
-doubles stop the turn to ask the player to roll again rather than re-rolling
-automatically.
+All decision hooks route through ``ask()`` for human players. AI players bypass
+the prompt entirely: their trained model is queried synchronously and the result
+applied directly. Animations (dice roll, token slide) play for all players so
+human observers can follow AI turns.
 
-The engine is driven through the hooks it exposes:
-    - per-player ``decide_purchase`` (overridden here to prompt the user),
-    - ``Game.handle_jail_turn`` for a single jail attempt,
-    - ``Game.roll_once`` for one dice roll at a time (so the UI controls
-      re-rolls and animation),
-    - ``Game.build_house`` / ``Game.sell_house`` for the management phase.
+The ``main()`` entry point shows a setup screen where each of the four players
+can be toggled between Human and AI before the game starts. Pass ``--model
+<path.zip>`` to load a specific model (defaults to ``runs/monopoly_ppo.zip``).
 """
 
+import argparse
 import math
 import os
 import random
@@ -22,7 +19,7 @@ import time
 import pygame
 
 from ui.board_layout import (tile_center, tile_rect, interior_offset,
-                             TILE_FRAC)
+                              TILE_FRAC)
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
@@ -43,35 +40,28 @@ EDGE = (206, 205, 196)
 INK = (34, 34, 34)
 MUTED = (122, 122, 122)
 
-# Light tones for text drawn directly on the dark green felt (with a shadow),
-# so headings, the log and inventory stay legible against the background.
 FELT_INK = (245, 243, 233)
 FELT_SUB = (197, 214, 197)
 ACCENT = (212, 175, 55)
 BTN = (58, 110, 165)
 BTN_HOVER = (78, 138, 197)
 BTN_INK = (255, 255, 255)
+BTN_DIM = (90, 90, 90)
 
-# Icon drawn beside each prompt choice so options can be told apart by
-# scanning rather than reading. Keyed by the option's stable value id; the
-# value names a shape drawn with pygame primitives (see _draw_icon) so it
-# renders identically on every system — unlike font glyphs/emoji, which show
-# up as empty boxes when the resolved system font lacks them.
 CHOICE_ICONS = {
-    "build": "up",        # add a house
-    "sell": "down",       # sell a house
-    "mortgage": "coin",   # take cash from the bank
-    "unmortgage": "ring", # buy the property back
-    "trade": "swap",      # swap with another player
-    "manage": "menu",     # open the manage menu
-    "roll": "die",        # roll the dice
-    "end": "check",       # end the turn
-    "done": "check",      # finish managing
-    "pay": "coin",        # pay to leave jail
-    "card": "star",       # use a Get Out of Jail card
-    "give_up": "warn",    # declare bankruptcy
+    "build": "up",
+    "sell": "down",
+    "mortgage": "coin",
+    "unmortgage": "ring",
+    "trade": "swap",
+    "manage": "menu",
+    "roll": "die",
+    "end": "check",
+    "done": "check",
+    "pay": "coin",
+    "card": "star",
+    "give_up": "warn",
 }
-# Tints that aid scanning while staying legible on the blue choice buttons.
 ICON_COLORS = {
     "up": (120, 230, 140),
     "down": (255, 150, 150),
@@ -84,7 +74,6 @@ HOTEL_RED = (200, 62, 55)
 DIE_FACE = (250, 250, 248)
 PIP = (32, 32, 32)
 
-# Per-player token / marker colors, keyed by player name.
 PLAYER_COLORS = {
     "Red": (211, 47, 47),
     "Blue": (33, 99, 199),
@@ -95,11 +84,9 @@ DEFAULT_COLOR = (120, 120, 120)
 
 
 def player_color(name):
-    """Returns the marker color for a player name (gray if unknown)."""
     return PLAYER_COLORS.get(name, DEFAULT_COLOR)
 
 
-# Swatch colors for each street color group, plus the non-street property types.
 GROUP_COLORS = {
     "brown": (124, 78, 51),
     "light_blue": (170, 224, 250),
@@ -115,52 +102,205 @@ UTILITY_COLOR = (200, 200, 200)
 
 
 def contrast_text(color):
-    """Returns black or white, whichever reads better on `color`."""
     r, g, b = color
     luminance = 0.299 * r + 0.587 * g + 0.114 * b
     return INK if luminance > 140 else (255, 255, 255)
+
 
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 
 
 class QuitGame(Exception):
-    """Raised when the player closes the window, to unwind cleanly."""
+    pass
 
+
+# ---------------------------------------------------------------------------
+# Setup screen
+# ---------------------------------------------------------------------------
+
+def _run_setup(screen, clock, model_available):
+    """Shows the player-setup dialog before the game starts.
+
+    Returns ``{"types": {name: "human"|"ai"}, "randomize": bool}`` or ``None``
+    if the user closed the window.
+    """
+    font_title = pygame.font.SysFont("dejavusans,arial,helvetica", 44, bold=True)
+    font_head  = pygame.font.SysFont("dejavusans,arial,helvetica", 28, bold=True)
+    font_body  = pygame.font.SysFont("dejavusans,arial,helvetica", 24)
+    font_small = pygame.font.SysFont("dejavusans,arial,helvetica", 20)
+
+    names = ["Red", "Blue", "Green", "Yellow"]
+    types = {n: "human" for n in names}
+    randomize = True
+
+    # Panel geometry — centered on the screen.
+    pw, ph = 560, 530
+    px = WIDTH // 2 - pw // 2
+    py = HEIGHT // 2 - ph // 2 - 20
+
+    while True:
+        mouse = pygame.mouse.get_pos()
+        screen.fill(BG)
+
+        # Panel card.
+        panel_rect = pygame.Rect(px, py, pw, ph)
+        pygame.draw.rect(screen, PANEL, panel_rect, border_radius=14)
+        pygame.draw.rect(screen, EDGE, panel_rect, 1, border_radius=14)
+
+        # Title.
+        surf = font_title.render("MONOPOLY", True, ACCENT)
+        screen.blit(surf, surf.get_rect(midtop=(px + pw // 2, py + 18)))
+        surf = font_head.render("Player Setup", True, INK)
+        screen.blit(surf, surf.get_rect(midtop=(px + pw // 2, py + 70)))
+
+        hot = []  # list of (rect, callback)
+
+        # Player rows.
+        row_top = py + 116
+        row_h = 60
+        for i, name in enumerate(names):
+            ry = row_top + i * row_h
+            # Separator line above each row except the first.
+            if i > 0:
+                pygame.draw.line(screen, EDGE,
+                                 (px + 16, ry), (px + pw - 16, ry))
+
+            # Color dot.
+            pygame.draw.circle(screen, player_color(name),
+                               (px + 32, ry + row_h // 2), 13)
+
+            # Name label.
+            surf = font_body.render(name, True, INK)
+            screen.blit(surf, surf.get_rect(midleft=(px + 58, ry + row_h // 2)))
+
+            # Human / AI toggle buttons (right side of row).
+            for j, (label, ptype) in enumerate([("Human", "human"), ("AI", "ai")]):
+                bw, bh = 86, 34
+                bx = px + pw - 24 - (2 - j) * (bw + 8)
+                by = ry + (row_h - bh) // 2
+                btn = pygame.Rect(bx, by, bw, bh)
+                is_selected = types[name] == ptype
+                is_disabled = ptype == "ai" and not model_available
+                if is_disabled:
+                    fill = (160, 160, 160)
+                    ink = (110, 110, 110)
+                elif is_selected:
+                    fill = BTN_HOVER if btn.collidepoint(mouse) else BTN
+                    ink = BTN_INK
+                else:
+                    fill = PANEL_ALT if not btn.collidepoint(mouse) else (210, 210, 205)
+                    ink = MUTED
+                pygame.draw.rect(screen, fill, btn, border_radius=7)
+                pygame.draw.rect(screen, EDGE, btn, 1, border_radius=7)
+                surf = font_small.render(label, True, ink)
+                screen.blit(surf, surf.get_rect(center=btn.center))
+                if not is_disabled:
+                    _name, _ptype = name, ptype
+                    hot.append((btn, (_name, _ptype)))
+
+        # Separator before extras.
+        sep_y = row_top + len(names) * row_h + 8
+        pygame.draw.line(screen, EDGE, (px + 16, sep_y), (px + pw - 16, sep_y))
+
+        # Randomize order toggle.
+        rand_y = sep_y + 16
+        box = pygame.Rect(px + 22, rand_y + 5, 22, 22)
+        pygame.draw.rect(screen, PANEL_ALT, box, border_radius=4)
+        pygame.draw.rect(screen, EDGE, box, 1, border_radius=4)
+        if randomize:
+            pygame.draw.lines(screen, BTN, False,
+                              [(box.x + 3, box.y + 11),
+                               (box.x + 9, box.y + 17),
+                               (box.x + 19, box.y + 4)], 3)
+        surf = font_body.render("Randomize turn order", True, INK)
+        screen.blit(surf, surf.get_rect(midleft=(px + 54, rand_y + 16)))
+        rand_hitbox = pygame.Rect(px + 16, rand_y, pw - 32, 32)
+        hot.append((rand_hitbox, ("randomize", None)))
+
+        # Warning when no model is available.
+        warn_y = rand_y + 42
+        if not model_available:
+            surf = font_small.render(
+                "No model found — AI players unavailable.", True, (180, 90, 40))
+            screen.blit(surf, surf.get_rect(midtop=(px + pw // 2, warn_y)))
+            surf = font_small.render(
+                "Train a model first: python train.py", True, MUTED)
+            screen.blit(surf, surf.get_rect(midtop=(px + pw // 2, warn_y + 24)))
+
+        # Start Game button.
+        start_bw, start_bh = 200, 48
+        start_btn = pygame.Rect(px + pw // 2 - start_bw // 2,
+                                py + ph - start_bh - 20,
+                                start_bw, start_bh)
+        hover_start = start_btn.collidepoint(mouse)
+        pygame.draw.rect(screen, BTN_HOVER if hover_start else BTN,
+                         start_btn, border_radius=10)
+        surf = font_body.render("Start Game", True, BTN_INK)
+        screen.blit(surf, surf.get_rect(center=start_btn.center))
+        hot.append((start_btn, ("start", None)))
+
+        pygame.display.flip()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return None
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+                return {"types": dict(types), "randomize": randomize}
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for rect, payload in hot:
+                    if rect.collidepoint(event.pos):
+                        key, val = payload
+                        if key == "start":
+                            return {"types": dict(types), "randomize": randomize}
+                        elif key == "randomize":
+                            randomize = not randomize
+                        else:
+                            types[key] = val
+        clock.tick(60)
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
 
 class MonopolyApp:
-    """Renders the board and drives a hot-seat game loop."""
+    """Renders the board and drives a hot-seat / AI game loop."""
 
-    def __init__(self, game, auto=None):
+    def __init__(self, game, auto=None, ai_deciders=None, screen=None):
         """
         Args:
-            game (Game): A constructed game (players, board and decks set up).
-            auto (callable): Optional headless responder ``(question, options)
-                -> value`` for testing; when set, prompts return its value and
-                animations are skipped.
+            game: A constructed game (players, board, decks).
+            auto: Optional headless responder ``(question, options) -> value``.
+            ai_deciders: dict of ``player_name -> GUIAIDecider`` for AI seats.
+            screen: An existing pygame surface to reuse (skips display init).
         """
         self.game = game
         self._auto = auto
+        self._ai_deciders = ai_deciders or {}
         self.log = []
-        self.selected = None          # index of player whose inventory is open
-        self.roll_display = None      # {"name", "dice"} for the dice panel
-        self.board_dice = None        # (d1, d2) shown in the board center while rolling
+        self.selected = None
+        self.roll_display = None
+        self.board_dice = None
         self.vpos = {p.name: float(p.pos) for p in game.players}
-        self.hop = {p.name: 0.0 for p in game.players}  # token landing bounce
+        self.hop = {p.name: 0.0 for p in game.players}
 
-        pygame.init()
-        pygame.key.set_repeat(300, 40)  # smooth backspace/typing in text inputs
+        if screen is None:
+            pygame.init()
+            pygame.key.set_repeat(300, 40)
+            self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        else:
+            self.screen = screen
+
         pygame.display.set_caption("Monopoly")
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
         self.f_title = self._font(30, bold=True)
-        self.f_head = self._font(24, bold=True)
-        self.f_body = self._font(22)
+        self.f_head  = self._font(24, bold=True)
+        self.f_body  = self._font(22)
         self.f_small = self._font(19)
 
-        # Minimalist, name-free board (see tools/generate_board.py). Swap to
-        # "board.jpg" here for the classic illustrated board.
         self.board_img = pygame.transform.smoothscale(
-            pygame.image.load(os.path.join(ASSETS, "board_minimal.png")).convert(),
+            pygame.image.load(
+                os.path.join(ASSETS, "board_minimal.png")).convert(),
             (BOARD_PX, BOARD_PX),
         )
         self.tokens = {}
@@ -170,16 +310,30 @@ class MonopolyApp:
             self.tokens[player.name] = pygame.transform.smoothscale(
                 img, (TOKEN_PX, TOKEN_PX))
 
-        for player in game.players:
-            player.decide_purchase = (
-                lambda prop, _p=player: self._prompt_purchase(_p, prop))
+        # Bind AI deciders to the live game board.
+        ownable = [t for t in game.board.tiles
+                   if isinstance(t, (StreetProperty, Railroad, Utility))]
+        for ai in self._ai_deciders.values():
+            ai.bind(game, ownable)
 
-        # Show drawn Chance / Community Chest cards to the player.
+        # Wire per-player purchase hooks.
+        for player in game.players:
+            if player.name in self._ai_deciders:
+                ai = self._ai_deciders[player.name]
+                player.decide_purchase = (
+                    lambda prop, _ai=ai, _p=player: _ai.purchase_decision(_p, prop))
+            else:
+                player.decide_purchase = (
+                    lambda prop, _p=player: self._prompt_purchase(_p, prop))
+
         game.on_card = self._show_card
-        # Inform the player of automatic events (rent, tax, GO salary, ...).
         game.notify = self._inform
-        # Let a short player raise cash before being forced into bankruptcy.
-        game.on_shortfall = self._raise_funds
+        game.on_shortfall = self._on_shortfall
+
+    # -- Helpers ----------------------------------------------------------
+
+    def _is_ai(self, player):
+        return player.name in self._ai_deciders
 
     @staticmethod
     def _font(size, bold=False):
@@ -219,9 +373,9 @@ class MonopolyApp:
             cx, cy = tile_center(tile.pos, BOARD_X, BOARD_Y, BOARD_PX)
             ox, oy = interior_offset(tile.pos)
             bx, by = cx + ox * tsize * 0.32, cy + oy * tsize * 0.32
-            px, py = -oy, ox  # unit vector along the tile edge
+            px, py = -oy, ox
 
-            if tile.houses >= 5:  # hotel
+            if tile.houses >= 5:
                 rect = pygame.Rect(0, 0, 18, 13)
                 rect.center = (bx, by)
                 pygame.draw.rect(self.screen, HOTEL_RED, rect, border_radius=2)
@@ -237,58 +391,45 @@ class MonopolyApp:
                     pygame.draw.rect(self.screen, (0, 0, 0), rect, 1, border_radius=2)
 
     def _draw_ownership(self):
-        """Draws a small colored dot on each owned property in its owner's
-        color, set toward the outer edge so it doesn't sit under the tokens.
-        Mortgaged properties show as a hollow dot."""
         tsize = TILE_FRAC * BOARD_PX
         for tile in self.game.board.tiles:
             if not isinstance(tile, Property) or tile.owner is None:
                 continue
             cx, cy = tile_center(tile.pos, BOARD_X, BOARD_Y, BOARD_PX)
-            ox, oy = interior_offset(tile.pos)        # toward interior
+            ox, oy = interior_offset(tile.pos)
             mx, my = int(cx - ox * tsize * 0.34), int(cy - oy * tsize * 0.34)
             color = player_color(tile.owner.name)
             pygame.draw.circle(self.screen, (255, 255, 255), (mx, my), 7)
             if tile.mortgaged:
-                # Hollow ring marks a mortgaged property.
                 pygame.draw.circle(self.screen, color, (mx, my), 6, 2)
             else:
                 pygame.draw.circle(self.screen, color, (mx, my), 6)
             pygame.draw.circle(self.screen, (0, 0, 0), (mx, my), 7, 1)
 
     def _draw_current_highlight(self):
-        """Pulsing gold outline snug against the current player's tile."""
         player = self.game.players[self.game.current_player]
         if player.bankrupt:
             return
         x, y, w, h = tile_rect(player.pos, BOARD_X, BOARD_Y, BOARD_PX)
         pulse = 0.5 + 0.5 * math.sin(time.time() * 5.0)
         thick = 2 + int(round(pulse * 2))
-        # Draw just inside the tile border so the stroke sits on the tile.
         rect = pygame.Rect(x + thick // 2, y + thick // 2,
                            w - thick, h - thick)
         pygame.draw.rect(self.screen, ACCENT, rect, thick)
 
     def _cluster_offset(self, slot, count):
-        """Returns the (dx, dy) for token `slot` of `count` sharing one tile.
-
-        A lone token is centered; multiple tokens spread out in a centered
-        grid so they all stay over the tile.
-        """
         if count <= 1:
             return (0.0, 0.0)
         step = BOARD_PX * TILE_FRAC * 0.30
         cols = 2
         rows = (count + 1) // 2
         row, col = slot // cols, slot % cols
-        # Tokens in this row (a trailing odd token sits alone, centered).
         in_row = cols if (row < rows - 1 or count % cols == 0) else count % cols
         dx = (col - (in_row - 1) / 2) * step
         dy = (row - (rows - 1) / 2) * step
         return (dx, dy)
 
     def _draw_board(self):
-        # Soft drop shadow behind the board for a bit of depth.
         shadow = pygame.Rect(BOARD_X + 6, BOARD_Y + 8, BOARD_PX, BOARD_PX)
         pygame.draw.rect(self.screen, (6, 48, 30), shadow, border_radius=6)
         self.screen.blit(self.board_img, (BOARD_X, BOARD_Y))
@@ -299,12 +440,10 @@ class MonopolyApp:
         active = [p for p in self.game.players if not p.bankrupt]
         for player in active:
             cx, cy = self._token_center(self.vpos[player.name])
-            # Offset only when others share this tile; otherwise stay centered.
             sharers = [p for p in active if p.pos == player.pos]
             dx, dy = self._cluster_offset(sharers.index(player), len(sharers))
             tx = int(cx + dx)
             ty = int(cy + dy - self.hop.get(player.name, 0.0))
-            # Glow ring under the active player's token so it's easy to find.
             if player is current:
                 pygame.draw.circle(self.screen, ACCENT, (tx, ty),
                                    TOKEN_PX // 2 + 4, 3)
@@ -313,9 +452,6 @@ class MonopolyApp:
         self._draw_board_dice()
 
     def _draw_board_dice(self):
-        """Draws the rolling dice in the center of the board (on a soft
-        backdrop so they stay readable over the board art). Only shown while a
-        roll is animating; ``board_dice`` is cleared once it settles."""
         if not self.board_dice:
             return
         d1, d2 = self.board_dice
@@ -374,7 +510,6 @@ class MonopolyApp:
     # ----- players & inventory ------------------------------------------
 
     def _net_worth(self, player):
-        """Cash plus the value of every property and house the player holds."""
         total = player.balance
         for prop in player.properties:
             total += prop.mortgage_value if prop.mortgaged else prop.price
@@ -393,7 +528,6 @@ class MonopolyApp:
             fill = ACCENT if player is current and not player.bankrupt else (
                 PANEL_ALT if selected else PANEL)
             self._panel(box, fill)
-            # Colored stripe down the left edge in the player's token color.
             stripe = pygame.Rect(box.x, box.y, 7, box.height)
             pygame.draw.rect(self.screen, player_color(player.name), stripe,
                              border_top_left_radius=10, border_bottom_left_radius=10)
@@ -404,8 +538,9 @@ class MonopolyApp:
                            self.f_body, MUTED)
             else:
                 jail = "  (in jail)" if player.in_jail else ""
-                self._text(f"{player.name}{jail}", (box.x + 56, box.y + 8),
-                           self.f_body, INK)
+                ai_badge = " [AI]" if self._is_ai(player) else ""
+                self._text(f"{player.name}{ai_badge}{jail}",
+                           (box.x + 56, box.y + 8), self.f_body, INK)
                 meta = (f"${player.balance}   ·   {len(player.properties)} props"
                         f"   ·   net ${self._net_worth(player)}")
                 self._text(meta, (box.x + 56, box.y + 31), self.f_small, MUTED)
@@ -414,7 +549,6 @@ class MonopolyApp:
         return y, rects
 
     def _rent_line(self, prop):
-        """Returns (status_label, rent_label) for a property in an inventory."""
         if prop.mortgaged:
             return "Mortgaged", "No rent"
         if isinstance(prop, StreetProperty):
@@ -456,7 +590,6 @@ class MonopolyApp:
             y += 30
 
     def _property_color(self, prop):
-        """Returns the color-group swatch color for a property."""
         if isinstance(prop, StreetProperty):
             return GROUP_COLORS.get(prop.color, DEFAULT_COLOR)
         if isinstance(prop, Railroad):
@@ -466,23 +599,16 @@ class MonopolyApp:
         return DEFAULT_COLOR
 
     def _choice_icon(self, value):
-        """Returns (shape, color) for the icon drawn beside a prompt choice.
-        Property choices (value is a board position) get a ``"swatch"`` in
-        their group's color; action choices map to a named shape (see
-        _draw_icon). A ``None`` color means use the default button ink."""
         if isinstance(value, int):
             tile = self.game.board.tiles[value]
             if isinstance(tile, Property):
                 return "swatch", self._property_color(tile)
         if value is None:
-            return "x", None  # Cancel / back out
+            return "x", None
         shape = CHOICE_ICONS.get(value, "dot")
         return shape, ICON_COLORS.get(shape)
 
     def _draw_icon(self, shape, color, cx, cy, s=20):
-        """Draws a small vector icon centered at (cx, cy) within an s-pixel
-        box. Uses only pygame primitives so icons never depend on font glyph
-        coverage (which is what made the emoji show up as boxes)."""
         scr = self.screen
         h = s // 2
         if shape == "swatch":
@@ -490,60 +616,59 @@ class MonopolyApp:
             r.center = (cx, cy)
             pygame.draw.rect(scr, color, r, border_radius=4)
             pygame.draw.rect(scr, (0, 0, 0), r, 1, border_radius=4)
-        elif shape == "up":          # build a house
+        elif shape == "up":
             pygame.draw.polygon(scr, color,
                                 [(cx, cy - h), (cx + h, cy + h), (cx - h, cy + h)])
-        elif shape == "down":        # sell a house
+        elif shape == "down":
             pygame.draw.polygon(scr, color,
                                 [(cx, cy + h), (cx + h, cy - h), (cx - h, cy - h)])
-        elif shape == "coin":        # take/pay cash
+        elif shape == "coin":
             pygame.draw.circle(scr, color, (cx, cy), h)
             pygame.draw.circle(scr, (0, 0, 0), (cx, cy), h, 1)
             pygame.draw.line(scr, (0, 0, 0), (cx, cy - 5), (cx, cy + 5), 2)
-        elif shape == "ring":        # buy property back
+        elif shape == "ring":
             pygame.draw.circle(scr, color, (cx, cy), h, 2)
             pygame.draw.line(scr, color, (cx, cy - 4), (cx, cy + 4), 2)
-        elif shape == "swap":        # trade with another player
+        elif shape == "swap":
             pygame.draw.line(scr, color, (cx - h, cy - 4), (cx + h - 3, cy - 4), 2)
             pygame.draw.polygon(scr, color, [(cx + h, cy - 4),
                                 (cx + h - 6, cy - 8), (cx + h - 6, cy)])
             pygame.draw.line(scr, color, (cx - h + 3, cy + 4), (cx + h, cy + 4), 2)
             pygame.draw.polygon(scr, color, [(cx - h, cy + 4),
                                 (cx - h + 6, cy), (cx - h + 6, cy + 8)])
-        elif shape == "menu":        # open manage menu (list)
+        elif shape == "menu":
             for dy in (-6, 0, 6):
                 pygame.draw.line(scr, color, (cx - h, cy + dy), (cx + h, cy + dy), 2)
-        elif shape == "die":         # roll dice
+        elif shape == "die":
             r = pygame.Rect(0, 0, s, s)
             r.center = (cx, cy)
             pygame.draw.rect(scr, color, r, 2, border_radius=4)
             for px, py in [(cx - 5, cy - 5), (cx + 5, cy - 5), (cx, cy),
                            (cx - 5, cy + 5), (cx + 5, cy + 5)]:
                 pygame.draw.circle(scr, color, (px, py), 2)
-        elif shape == "check":       # confirm / end turn
+        elif shape == "check":
             pygame.draw.lines(scr, color, False,
                               [(cx - h + 1, cy + 1), (cx - 2, cy + h - 2),
                                (cx + h, cy - h + 1)], 3)
-        elif shape == "star":        # Get Out of Jail card
+        elif shape == "star":
             pts = []
             for k in range(10):
                 ang = -math.pi / 2 + k * math.pi / 5
                 rad = h if k % 2 == 0 else h * 0.45
                 pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
             pygame.draw.polygon(scr, color, pts)
-        elif shape == "warn":        # declare bankruptcy
+        elif shape == "warn":
             pygame.draw.polygon(scr, color,
                                 [(cx, cy - h), (cx + h, cy + h), (cx - h, cy + h)], 2)
             pygame.draw.line(scr, color, (cx, cy - 3), (cx, cy + 4), 2)
             pygame.draw.circle(scr, color, (cx, cy + 8), 1)
-        elif shape == "x":           # cancel
+        elif shape == "x":
             pygame.draw.line(scr, color, (cx - h, cy - h), (cx + h, cy + h), 3)
             pygame.draw.line(scr, color, (cx + h, cy - h), (cx - h, cy + h), 3)
-        else:                        # dot (fallback)
+        else:
             pygame.draw.circle(scr, color, (cx, cy), 4)
 
     def _draw_property_chip(self, prop, x, y):
-        """Draws the property name on a highlight chip in its group's color."""
         color = self._property_color(prop)
         tw = self.f_small.size(prop.name)[0]
         chip = pygame.Rect(x - 4, y - 2, tw + 12, self.f_small.get_height() + 4)
@@ -556,7 +681,6 @@ class MonopolyApp:
     def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         y += 40
-        # Show only as many recent lines as fit above `bottom`.
         rows = max(0, (bottom - y) // 24)
         for line in self.log[-rows:] if rows else []:
             self._text(line, (SIDE_X, y), self.f_small, FELT_INK, shadow=True)
@@ -565,8 +689,6 @@ class MonopolyApp:
     # ----- prompt --------------------------------------------------------
 
     def _prompt_geometry(self, question, options):
-        """Returns (box, wrapped_lines) for a prompt, sized from the wrapped
-        question so the buttons always fit and clamped to the screen."""
         lines = self._wrap(question, self.f_body, SIDE_W - 28)
         height = 14 + len(lines) * 26 + 10 + len(options) * 52 + 6
         top = max(8, HEIGHT - height - 8)
@@ -600,7 +722,6 @@ class MonopolyApp:
         return buttons
 
     def _truncate(self, text, font, max_width):
-        """Shortens text with an ellipsis so it fits within a button's width."""
         if font.size(text)[0] <= max_width:
             return text
         while text and font.size(text + "…")[0] > max_width:
@@ -629,15 +750,11 @@ class MonopolyApp:
         y = self._draw_dice_panel(54)
         y, player_rects = self._draw_players(y + 14)
         y += 8
-        # Reserve the prompt's space first so the log/inventory stop above it
-        # instead of being hidden behind it.
         box, lines = (None, None)
         content_bottom = HEIGHT - 10
         if question:
             box, lines = self._prompt_geometry(question, options)
             content_bottom = box.top - 10
-        # Inventory/log always render so a player can be clicked open even while
-        # a decision is pending.
         if self.selected is not None:
             self._draw_inventory(y, self.game.players[self.selected],
                                  content_bottom)
@@ -649,7 +766,6 @@ class MonopolyApp:
         return buttons, player_rects
 
     def render(self):
-        """Draws a single frame (no prompt). Used for smoke tests."""
         self._draw_scene()
         pygame.display.flip()
 
@@ -682,8 +798,6 @@ class MonopolyApp:
     # ----- animation -----------------------------------------------------
 
     def _frame(self):
-        """Renders one animation frame. Returns True if the user clicked or
-        pressed a key, which means: skip the rest of this animation."""
         skip = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -714,7 +828,6 @@ class MonopolyApp:
             ease = t * t * (3 - 2 * t)
             v = from_pos + steps * ease
             self.vpos[name] = v
-            # A little hop as the token crosses each tile.
             self.hop[name] = math.sin((v % 1.0) * math.pi) * hop_h
             if self._frame():
                 skipped = True
@@ -725,7 +838,6 @@ class MonopolyApp:
             self._animate_land(player)
 
     def _animate_land(self, player):
-        """A small settling bounce once the token reaches its tile."""
         if self._auto is not None:
             return
         name = player.name
@@ -741,7 +853,6 @@ class MonopolyApp:
         self.hop[name] = 0.0
 
     def _animate_dice(self, player, final):
-        """Tumbles the dice faces for a moment, then settles on the result."""
         if self._auto is not None:
             self._set_roll(player, final)
             return
@@ -756,7 +867,6 @@ class MonopolyApp:
             pygame.time.wait(38)
         self._set_roll(player, final)
         self.board_dice = final
-        # Let the settled roll sit in the center for a beat (skippable).
         for _ in range(0 if skipped else 14):
             if self._frame():
                 break
@@ -780,16 +890,10 @@ class MonopolyApp:
         return bought
 
     def _show_card(self, pile, card):
-        """Shows a drawn Chance / Community Chest card before its effect runs."""
         self.add_log(f"{pile}: {card.text}")
         self.ask(f"{pile} card — {card.text}", [("Continue", "ok")])
 
     def _inform(self, message):
-        """Logs an automatic game event and makes the player acknowledge it.
-
-        Bound to ``Game.notify``. In auto / RL mode ``ask`` returns immediately,
-        so the event is still logged but no prompt blocks play.
-        """
         self.add_log(message)
         self.ask(message, [("Continue", "ok")])
 
@@ -816,15 +920,12 @@ class MonopolyApp:
                 if self.game.can_trade_property(t)]
 
     def _can_trade(self, player):
-        """Whether a trade is possible: another player is in the game and
-        someone involved has a property that can change hands."""
         others = [p for p in self.game.active_players() if p is not player]
         if not others:
             return False
         return any(self._tradeable(p) for p in [player, *others])
 
     def _can_manage(self, player):
-        """Whether the player has any property action available right now."""
         return bool(self._buildable(player) or self._sellable(player)
                     or self._mortgageable(player)
                     or self._unmortgageable(player)
@@ -877,22 +978,8 @@ class MonopolyApp:
                              f"{tile.name} for ${cost}.")
 
     def _manage_menu(self, player, jail_exit=False):
-        """Property-management submenu: build/sell houses, mortgage/unmortgage.
-
-        Reachable both before and after rolling, and loops until the player is
-        done so they can make several changes in one visit.
-
-        When ``jail_exit`` is True (the pre-roll menu of a jailed player), the
-        escape actions are also offered here so a player who raises the bail
-        mid-management — e.g. by selling, mortgaging or trading — can pay right
-        away instead of having to back out to the turn menu first. If one is
-        chosen it is returned ("pay" or "card") for the caller to act on;
-        otherwise the menu returns None when the player is done.
-        """
         while True:
             options = []
-            # Surface jail escape here too, so it appears the instant the
-            # player can afford it (right after the fund-raising action).
             if jail_exit and player.balance >= 50:
                 options.append(("Pay $50 to leave jail", "pay"))
             if jail_exit and player.jail_cards:
@@ -911,7 +998,7 @@ class MonopolyApp:
             choice = self.ask(
                 f"{player.name}: manage properties (${player.balance})", options)
             if choice in ("pay", "card"):
-                return choice  # leave jail now; the turn menu acts on this
+                return choice
             if choice == "build":
                 self._build_flow(player)
             elif choice == "sell":
@@ -928,7 +1015,6 @@ class MonopolyApp:
     # ----- trading -------------------------------------------------------
 
     def _cash_label(self, initiator, partner, cash):
-        """Describes the net cash term of a trade from a neutral viewpoint."""
         if cash > 0:
             return f"{initiator.name} pays ${cash}"
         if cash < 0:
@@ -936,17 +1022,16 @@ class MonopolyApp:
         return "no cash"
 
     def _trade_flow(self, player):
-        """Opens the graphical trade dialog over the board."""
         partners = [p for p in self.game.active_players() if p is not player]
         if not partners or self._auto is not None:
             return
         state = {
             "partner": partners[0],
-            "give": set(),       # the player's tiles being offered
-            "receive": set(),    # the partner's tiles being requested
-            "cash_you": "",      # cash the player adds (digit string)
-            "cash_them": "",     # cash the partner adds (digit string)
-            "active": None,      # which cash box is being typed into
+            "give": set(),
+            "receive": set(),
+            "cash_you": "",
+            "cash_them": "",
+            "active": None,
         }
         while True:
             mouse = pygame.mouse.get_pos()
@@ -965,7 +1050,6 @@ class MonopolyApp:
             self.clock.tick(60)
 
     def _handle_trade_click(self, player, state, hot, pos):
-        """Applies a click in the trade dialog. Returns True to close it."""
         for rect, partner in hot["partners"]:
             if rect.collidepoint(pos) and state["partner"] is not partner:
                 state["partner"] = partner
@@ -991,7 +1075,6 @@ class MonopolyApp:
         return False
 
     def _handle_trade_key(self, state, event):
-        """Edits the active cash text box."""
         if state["active"] is None:
             return
         key = "cash_you" if state["active"] == "you" else "cash_them"
@@ -1003,14 +1086,12 @@ class MonopolyApp:
             state[key] = (state[key] + event.unicode).lstrip("0") or ""
 
     def _finalize_trade(self, player, state):
-        """Confirms with the partner and carries out the trade. Returns True to
-        close the dialog, False to keep editing."""
         partner = state["partner"]
         give = [t for t in player.properties if t in state["give"]]
         receive = [t for t in partner.properties if t in state["receive"]]
         cash = int(state["cash_you"] or 0) - int(state["cash_them"] or 0)
         if not give and not receive and cash == 0:
-            return False  # empty offer; keep editing
+            return False
 
         gnames = ", ".join(t.name for t in give) or "nothing"
         rnames = ", ".join(t.name for t in receive) or "nothing"
@@ -1027,12 +1108,11 @@ class MonopolyApp:
             return True
         self.ask("Trade couldn't be completed (the cash payer can't afford it).",
                  [("OK", "ok")])
-        return False  # let them adjust and try again
+        return False
 
     # ----- trade dialog rendering ----------------------------------------
 
     def _draw_trade_dialog(self, player, partners, state, mouse):
-        """Renders the trade pop-up over the board and returns its hot regions."""
         self._draw_scene()
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         overlay.fill((8, 40, 26, 190))
@@ -1046,7 +1126,6 @@ class MonopolyApp:
         title = self.f_title.render("Propose a Trade", True, INK)
         self.screen.blit(title, title.get_rect(midtop=(dlg.centerx, dlg.y + 14)))
 
-        # Partner selector buttons.
         hot = {"partners": [], "give": [], "receive": []}
         px = dlg.x + pad
         py = dlg.y + 58
@@ -1063,7 +1142,6 @@ class MonopolyApp:
             hot["partners"].append((rect, p))
             px += rect.width + 10
 
-        # Two columns: the player's inventory (give) and the partner's (receive).
         colw = (dlg.w - 3 * pad) // 2
         col_top = dlg.y + 112
         cash_y = dlg.bottom - 132
@@ -1085,7 +1163,6 @@ class MonopolyApp:
             f"{partner.name}'s cash to add", state["cash_them"], right_x, cash_y,
             colw, state["active"] == "them")
 
-        # Bottom bar: net cash summary + Propose / Cancel.
         net = int(state["cash_you"] or 0) - int(state["cash_them"] or 0)
         summary = "Net: " + self._cash_label(player, partner, net)
         self._text(summary, (dlg.x + pad, dlg.bottom - 50), self.f_body, INK)
@@ -1097,7 +1174,6 @@ class MonopolyApp:
         return hot
 
     def _draw_trade_column(self, owner, selected, x, y, w, bottom, header, bal):
-        """Draws one player's tradeable inventory as toggle chips."""
         self._text(header, (x, y), self.f_head, INK)
         self._text(f"Balance ${bal}", (x, y + 28), self.f_small, MUTED)
         cy = y + 56
@@ -1146,11 +1222,16 @@ class MonopolyApp:
         self.screen.blit(surf, surf.get_rect(center=rect.center))
         return rect
 
+    # ----- shortfall / fund-raising --------------------------------------
+
+    def _on_shortfall(self, player, amount):
+        """Dispatches a shortfall to the AI liquidator or the human raise-funds UI."""
+        if self._is_ai(player):
+            self._ai_deciders[player.name].liquidate_loop(player, amount)
+        else:
+            self._raise_funds(player, amount)
+
     def _raise_funds(self, player, amount):
-        """Bound to ``Game.on_shortfall``: when `player` owes `amount` they
-        can't cover, let them sell houses / mortgage to try to raise it before
-        a forced bankruptcy. Loops until they can pay, run out of assets, or
-        choose to give up."""
         while player.balance < amount:
             options = []
             if self._sellable(player):
@@ -1172,7 +1253,7 @@ class MonopolyApp:
             elif choice == "mortgage":
                 self._mortgage_flow(player)
             else:
-                return  # gave up; the caller will force bankruptcy
+                return
 
     def _set_roll(self, player, dice):
         self.roll_display = {"name": player.name, "dice": dice}
@@ -1180,7 +1261,10 @@ class MonopolyApp:
     # ----- turn flow -----------------------------------------------------
 
     def _turn_menu(self, player):
-        """Pre-roll menu: manage properties, then choose the jail/roll action."""
+        """Returns the jail/roll choice. AI players skip the UI prompt."""
+        if self._is_ai(player):
+            return self._ai_turn_start(player)
+
         while True:
             options = []
             if player.in_jail:
@@ -1199,17 +1283,25 @@ class MonopolyApp:
             choice = self.ask(
                 f"{player.name}'s turn — {where} (${player.balance})", options)
             if choice == "manage":
-                # A jailed player may raise the bail in here and choose to pay
-                # or use a card; that decision flows back as the turn choice.
                 jail_action = self._manage_menu(player, jail_exit=player.in_jail)
                 if jail_action is not None:
                     return jail_action
             else:
                 return choice
 
+    def _ai_turn_start(self, player):
+        """Runs an AI player's pre-roll phase and returns their jail/roll choice."""
+        ai = self._ai_deciders[player.name]
+        if player.in_jail:
+            return ai.jail_choice(player)
+        ai.manage_loop(player)
+        return "roll"
+
     def _post_roll_manage(self, player):
-        """After the roll resolves, offer one more management pass before the
-        turn ends."""
+        """After the roll, offer one more management pass before ending the turn."""
+        if self._is_ai(player):
+            self._ai_deciders[player.name].manage_loop(player)
+            return
         if not self._can_manage(player):
             return
         choice = self.ask(
@@ -1221,10 +1313,9 @@ class MonopolyApp:
 
     def _resolve_and_sync(self, player):
         self.game.resolve_tile(player)
-        self._snap(player)  # cards/jail teleport: land instantly, no slide
+        self._snap(player)
 
     def _play_rolls(self, player):
-        """Rolls one die at a time, stopping to ask before re-rolling doubles."""
         while True:
             from_pos = player.pos
             die1, die2, is_double, to_jail = self.game.roll_once(player)
@@ -1246,8 +1337,9 @@ class MonopolyApp:
             if player.bankrupt:
                 break
             if is_double:
-                self.ask(f"{player.name} rolled doubles — roll again!",
-                         [("Roll again", "roll")])
+                if not self._is_ai(player):
+                    self.ask(f"{player.name} rolled doubles — roll again!",
+                             [("Roll again", "roll")])
                 continue
             break
 
@@ -1261,10 +1353,10 @@ class MonopolyApp:
             else:
                 msg = f"{player.name} used a Get Out of Jail Free card."
             self.add_log(msg)
-            # Let the player roll for their normal turn rather than auto-rolling.
-            self.ask(f"{msg} Roll the dice to take your turn.",
-                     [("Roll dice", "roll")])
-            self._play_rolls(player)  # takes a normal turn
+            if not self._is_ai(player):
+                self.ask(f"{msg} Roll the dice to take your turn.",
+                         [("Roll dice", "roll")])
+            self._play_rolls(player)
             return
 
         if result == "moved":
@@ -1276,7 +1368,7 @@ class MonopolyApp:
         elif result == "freed":
             self._animate_dice(player, dice)
             self.add_log(f"{player.name} failed to roll doubles and was released.")
-        else:  # jailed
+        else:
             self._animate_dice(player, dice)
             self.add_log(f"{player.name} rolled {dice[0]} + {dice[1]} — "
                          f"no doubles, still in jail.")
@@ -1294,7 +1386,6 @@ class MonopolyApp:
     # ----- main loop -----------------------------------------------------
 
     def run(self, max_turns=10000):
-        """Plays the game to completion, then shows the result screen."""
         try:
             turns = 0
             while not self.game.is_over() and turns < max_turns:
@@ -1304,11 +1395,10 @@ class MonopolyApp:
                     self._handle_jail(player, choice)
                 else:
                     self._play_rolls(player)
-                # Let the player manage properties after rolling, then end turn.
                 if not player.bankrupt:
                     self._post_roll_manage(player)
                 self._end_turn(player)
-                self.selected = None  # close any open inventory for the next turn
+                self.selected = None
                 turns += 1
             self._show_result()
         except QuitGame:
@@ -1317,18 +1407,75 @@ class MonopolyApp:
             pygame.quit()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    """Builds a fresh game and launches the UI."""
+    """Shows the setup screen, then launches the game."""
+    parser = argparse.ArgumentParser(description="Monopoly — pygame UI")
+    parser.add_argument(
+        "--model", default=None,
+        help="path to a trained MaskablePPO model .zip "
+             "(default: runs/monopoly_ppo.zip if it exists)")
+    args, _ = parser.parse_known_args()
+
+    # Find a model to offer AI players.
+    model_path = args.model
+    if model_path is None:
+        for candidate in ("runs/monopoly_ppo.zip",
+                          "runs/sp_checkpoints/monopoly_selfplay_400000_steps.zip"):
+            if os.path.exists(candidate):
+                model_path = candidate
+                break
+    model_available = model_path is not None
+
+    pygame.init()
+    pygame.key.set_repeat(300, 40)
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    clock = pygame.time.Clock()
+
+    config = _run_setup(screen, clock, model_available)
+    if config is None:
+        pygame.quit()
+        return
+
+    # Determine which players are AI.
+    ai_names = {name for name, t in config["types"].items() if t == "ai"}
+
+    # Load the model once if any AI player was chosen.
+    model = None
+    if ai_names and model_path:
+        try:
+            from sb3_contrib import MaskablePPO
+            print(f"Loading model from {model_path} …")
+            model = MaskablePPO.load(model_path, device="cpu")
+        except Exception as exc:
+            print(f"Warning: could not load model ({exc}). AI seats will use baseline.")
+            ai_names = set()
+
+    # Build players and (optionally) shuffle turn order.
     from engine.game import Game
     from models.board import Board
     from models.player import Player
     from data.decks import build_chance_deck, build_community_deck
     from data.board_tiles import build_board_tiles
 
-    players = [Player("Red"), Player("Blue"), Player("Green"), Player("Yellow")]
+    players = [Player(n) for n in ("Red", "Blue", "Green", "Yellow")]
+    if config["randomize"]:
+        random.shuffle(players)
+
     game = Game(players, Board(build_board_tiles()),
                 build_chance_deck(), build_community_deck())
-    MonopolyApp(game).run()
+
+    # Create one GUIAIDecider per AI seat (all share the same model).
+    ai_deciders = {}
+    if model is not None:
+        from ui.ai_player import GUIAIDecider
+        for name in ai_names:
+            ai_deciders[name] = GUIAIDecider(num_players=4, model=model)
+
+    MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
 
 
 if __name__ == "__main__":
