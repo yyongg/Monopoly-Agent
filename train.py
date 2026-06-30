@@ -14,16 +14,32 @@ The agent controls one seat (``--seat``); the other players use the engine's
 built-in baseline policy.
 """
 
+import os
+
+# Keep each process single-threaded for the math libraries. With many
+# SubprocVecEnv workers on a many-core machine, the default (one BLAS/OpenMP
+# thread per core, per process) massively oversubscribes the CPU and tanks
+# throughput. Set before importing numpy/torch so it takes effect; ``setdefault``
+# lets an explicit environment variable still override these.
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+             "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import importlib.util
 
 import numpy as np
+import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from engine.rl_env import MonopolyEnv
+
+# Torch's own intra-op thread pool (defaults to the core count) collides with
+# the env worker processes; one thread for the small policy net is faster here.
+torch.set_num_threads(1)
 
 
 def make_env(rank, seed, seat, reward_mode, max_turns):

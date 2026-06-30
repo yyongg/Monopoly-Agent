@@ -13,9 +13,19 @@ Final evaluation is reported against the fixed baseline opponents, which is a
 stationary yardstick for tracking progress across runs.
 """
 
+import os
+
+# Keep each process single-threaded for the math libraries (see train.py for
+# why). Set before importing numpy/torch; ``setdefault`` lets an explicit
+# environment variable override.
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+             "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import importlib.util
 
+import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.callbacks import CheckpointCallback
@@ -24,6 +34,8 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from engine.rl_env import MonopolyEnv
 from selfplay import SelfPlayCallback, make_selfplay_env
 from train import WinRateCallback
+
+torch.set_num_threads(1)
 
 
 def main():
