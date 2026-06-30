@@ -36,6 +36,11 @@ class GUIAIDecider:
         # a no-op so the decider also works headless; ``MonopolyApp`` sets it to
         # ``add_log`` so the player can see what the AI did.
         self.log = log or (lambda message: None)
+        # Callback ``(seller, buyer, prop) -> bool`` asked before an AI-initiated
+        # trade completes, so the counterparty can refuse. Defaults to always
+        # accepting (headless / training-mirror behaviour); ``MonopolyApp`` sets
+        # it so a human buyer is prompted to accept or decline.
+        self.confirm_trade = lambda seller, buyer, prop: True
         self.game = None
         self.ownable = []
         self._prop_index = {}
@@ -202,8 +207,13 @@ class GUIAIDecider:
 
     def _do_trade(self, seller, prop):
         buyer = self._find_trade_buyer(seller, prop)
-        if buyer is not None and self.game.execute_trade(
-                seller, buyer, [prop], [], -prop.price):
+        if buyer is None:
+            return
+        if not self.confirm_trade(seller, buyer, prop):
+            self.log(f"{buyer.name} declined {seller.name}'s offer to sell "
+                     f"{prop.name}.")
+            return
+        if self.game.execute_trade(seller, buyer, [prop], [], -prop.price):
             self.log(f"{seller.name} [AI] sold {prop.name} to "
                      f"{buyer.name} for ${prop.price}.")
 

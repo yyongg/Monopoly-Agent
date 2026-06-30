@@ -347,6 +347,7 @@ class MonopolyApp:
         for ai in self._ai_deciders.values():
             ai.bind(game, ownable)
             ai.log = self.add_log  # so AI moves show up in the game log
+            ai.confirm_trade = self._ai_trade_offer  # let the buyer accept/deny
 
         # Wire per-player purchase hooks.
         for player in game.players:
@@ -369,6 +370,21 @@ class MonopolyApp:
 
     def _current_is_ai(self):
         return self._is_ai(self.game.players[self.game.current_player])
+
+    def _ai_trade_offer(self, seller, buyer, prop):
+        """Response to an AI's trade offer to sell ``prop`` to ``buyer``.
+
+        A human buyer is prompted to accept or decline (the trade has them pay
+        the seller the property's list price). Another AI buyer accepts via the
+        same heuristic that selected it, matching headless / training behaviour.
+        """
+        if self._is_ai(buyer):
+            return True
+        choice = self.ask(
+            f"{seller.name} [AI] offers to sell {prop.name} to {buyer.name} "
+            f"for ${prop.price}. You pay ${prop.price}. Accept?",
+            [("Accept", "yes"), ("Decline", "no")])
+        return choice == "yes"
 
     def _ai_pause(self, seconds):
         """A short, skippable pause so AI events are watchable (no blocking)."""
