@@ -1,13 +1,19 @@
 """Gym-style reinforcement-learning environment for the Monopoly engine.
 
 ``MonopolyEnv`` wraps :class:`engine.game.Game` and exposes the standard
-Gymnasium API (``reset`` / ``step``) so an RL agent can play one seat against
-baseline opponents. It is a *decision-point* environment: each call to ``step``
-supplies a single action for the one decision the controlled player currently
-faces (escape jail, buy a property, a property-management action, or raising
-cash under a shortfall). Between the controlled player's decisions the
-environment plays out everything that needs no choice from them -- dice, rent,
-cards, and the opponents' entire turns -- automatically.
+Gymnasium API (``reset`` / ``step``) so an RL agent can play one seat. It is a
+*decision-point* environment: each call to ``step`` supplies a single action for
+the one decision the controlled player currently faces (escape jail, buy a
+property, a property-management action, or raising cash under a shortfall).
+Between the controlled player's decisions the environment plays out everything
+that needs no choice from them -- dice, rent, cards, and the opponents' entire
+turns -- automatically.
+
+Opponents play the engine baseline by default, but can be driven by a policy
+(``opponent_policy`` / ``opponent_provider``) so the same network plays every
+seat -- the basis for self-play. Observations are perspective-relative (the
+acting seat is always relative player 0), which is what lets one policy control
+any seat.
 
 Why a worker thread
 -------------------
@@ -48,6 +54,7 @@ than raising, and reported via ``info["illegal"]``.
 """
 
 import queue
+import random
 import threading
 
 import numpy as np
@@ -64,7 +71,9 @@ from data.decks import build_chance_deck, build_community_deck
 try:  # Gymnasium is optional; the env works standalone without it.
     from gymnasium import Env as _GymEnv
     from gymnasium.spaces import Box, Discrete
+    _HAS_GYM = True
 except ImportError:  # pragma: no cover - exercised only without gymnasium
+    _HAS_GYM = False
     _GymEnv = object
 
     class Discrete:
@@ -127,12 +136,23 @@ class MonopolyEnv(_GymEnv):
         reward_mode (str): ``"shaped"`` (net-worth change each decision plus a
             terminal win/loss bonus) or ``"sparse"`` (only the terminal +1/-1).
         seed (int | None): Seed for the dice RNG (also settable via ``reset``).
+        opponent_policy (callable | None): A fixed opponent policy
+            ``(observation, action_mask_bool) -> action_index`` used to drive
+            *every* opponent seat. ``None`` keeps the engine baseline (opponents
+            play their whole turn via ``Game.step``). Observations handed to the
+            policy are from that opponent's own perspective (it always sees
+            itself as relative player 0), so a single policy can play any seat.
+        opponent_provider (callable | None): A zero-arg callable sampled at each
+            ``reset`` that returns an opponent policy (or ``None`` for baseline).
+            Used for self-play, where opponents are sampled from a snapshot pool
+            each episode. Takes precedence over ``opponent_policy``.
     """
 
     metadata = {"render_modes": []}
 
     def __init__(self, seat=0, num_players=4, names=None, max_turns=1000,
-                 reward_mode="shaped", seed=None):
+                 reward_mode="shaped", seed=None, opponent_policy=None,
+                 opponent_provider=None):
         if not 0 <= seat < num_players:
             raise ValueError("seat must be in range(num_players)")
         self.seat = seat
@@ -143,6 +163,15 @@ class MonopolyEnv(_GymEnv):
         self.max_turns = max_turns
         self.reward_mode = reward_mode
         self._seed = seed
+
+        # Opponent control: a fixed policy, a per-episode provider, and the
+        # policy chosen for the current episode (None == engine baseline). The
+        # decider map routes each seat's decisions to the agent (queue) or to an
+        # opponent policy (synchronous), and is rebuilt each reset.
+        self._opponent_policy_fixed = opponent_policy
+        self._opponent_provider = opponent_provider
+        self._opponent_policy = None
+        self._deciders = {}
 
         # The 28 ownable tiles, fixed by board order, give every property a
         # stable action/observation index for the agent.
@@ -165,6 +194,8 @@ class MonopolyEnv(_GymEnv):
         self._resp_q = queue.Queue()
         self._thread = None
         self._done = True
+        self._seeded = False       # whether the RNG has been seeded once
+        self._rng = random.Random()  # per-env RNG for dice and deck order
         self._cur_phase = PHASE_TERMINAL
         self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._cur_prop = None      # property offered (BUY) or being liquidated
@@ -177,16 +208,31 @@ class MonopolyEnv(_GymEnv):
     # -- Gymnasium API ------------------------------------------------------
     def reset(self, *, seed=None, options=None):
         """Starts a fresh episode and returns ``(observation, info)``."""
+        # Seed the RNG (Gymnasium's ``self.np_random``); on the very first reset
+        # fall back to the constructor seed so MonopolyEnv(seed=...) is
+        # reproducible without an explicit reset(seed=...).
+        if seed is None and not self._seeded:
+            seed = self._seed
+        if _HAS_GYM:
+            super().reset(seed=seed)
+        elif seed is not None or not self._seeded:
+            self.np_random = np.random.default_rng(seed)
+        self._seeded = True
+
         self._shutdown_worker()
-        if seed is not None:
-            self._seed = seed
         self._build_game()
 
+        # Pick this episode's opponent policy (a provider, if any, is sampled
+        # fresh each episode for self-play; otherwise the fixed policy).
+        if self._opponent_provider is not None:
+            self._opponent_policy = self._opponent_provider()
+        else:
+            self._opponent_policy = self._opponent_policy_fixed
+        self._wire_deciders()
+
         controlled = self.game.players[self.seat]
-        # Only the controlled player's decisions are routed to the agent; the
-        # opponents keep the engine's baseline policy (buy-if-affordable, roll
-        # in jail, no liquidation), exactly as in headless play.
-        controlled.decide_purchase = self._on_decide_purchase
+        # Shortfalls are dispatched by payer: the agent and any policy-driven
+        # opponents may liquidate; baseline opponents fall through to bankruptcy.
         self.game.on_shortfall = self._on_shortfall
 
         self._done = False
@@ -221,15 +267,68 @@ class MonopolyEnv(_GymEnv):
         """The current 0/1 legal-action mask (length ``NUM_ACTIONS``)."""
         return self._cur_mask.copy()
 
+    def action_masks(self):
+        """Boolean legal-action mask for the current decision.
+
+        This is the method name sb3-contrib's maskable utilities look for
+        (``MaskablePPO``); it mirrors :attr:`action_mask` as a bool array.
+        """
+        return self._cur_mask.astype(bool)
+
+    def set_opponent_policy(self, policy):
+        """Sets a fixed opponent policy used from the next ``reset`` onward.
+
+        ``policy`` is a callable ``(observation, action_mask_bool) -> action``
+        or ``None`` to restore baseline opponents. Clears any provider.
+        """
+        self._opponent_policy_fixed = policy
+        self._opponent_provider = None
+
+    # -- Per-seat decision routing ------------------------------------------
+    def _wire_deciders(self):
+        """Builds the seat -> decider map for the current episode.
+
+        The agent seat is always routed to :meth:`_agent_decide` (which blocks
+        for an external action via the queue). When an opponent policy is set,
+        every other seat is routed to :meth:`_policy_decide` (synchronous, no
+        queue). Each routed seat also gets its ``decide_purchase`` hook wired so
+        nested purchase offers (e.g. from a Chance "Advance to" card) reach the
+        same decider. Seats with no decider keep the engine baseline.
+        """
+        self._deciders = {self.seat: self._agent_decide}
+        if self._opponent_policy is not None:
+            for s in range(self.num_players):
+                if s != self.seat:
+                    self._deciders[s] = self._make_policy_decider(s)
+        for s, decide in self._deciders.items():
+            self.game.players[s].decide_purchase = self._make_buy_hook(decide)
+
+    def _make_policy_decider(self, seat):
+        """Returns a decider bound to ``seat`` that calls the opponent policy."""
+        return lambda phase, prop=None, amount=0: self._policy_decide(
+            seat, phase, prop, amount)
+
+    def _make_buy_hook(self, decide):
+        """Returns a ``decide_purchase(prop)`` hook routed through ``decide``."""
+        return lambda prop: decide(PHASE_BUY, prop) == A_BUY
+
     # -- Game construction --------------------------------------------------
     def _build_game(self):
         players = [Player(name) for name in self._names]
         board = Board(build_board_tiles())
         game = Game(players, board, build_chance_deck(), build_community_deck())
-        if self._seed is not None:
-            # Game.roll_dice draws from the stdlib random module.
-            import random
-            random.seed(self._seed)
+
+        # Give this env a private RNG, seeded from the Gymnasium RNG, so each
+        # episode differs yet the whole run is reproducible from the seed, and
+        # parallel envs diverge. The engine otherwise draws dice and shuffles
+        # decks from the global ``random`` module, which would couple envs that
+        # share a process; route both through this generator instead.
+        episode_seed = int(self.np_random.integers(0, 2 ** 31 - 1))
+        self._rng = random.Random(episode_seed)
+        game.roll_dice = self._make_roll_dice(game)
+        self._rng.shuffle(game.chance_deck.cards)
+        self._rng.shuffle(game.community_deck.cards)
+
         self.game = game
         self.ownable = [
             t for t in board.tiles
@@ -237,14 +336,24 @@ class MonopolyEnv(_GymEnv):
         ]
         self._prop_index = {id(p): i for i, p in enumerate(self.ownable)}
 
+    def _make_roll_dice(self, game):
+        """Returns a ``roll_dice`` bound to this env's private RNG."""
+        rng = self._rng
+
+        def roll_dice():
+            game.last_dice = (rng.randint(1, 6), rng.randint(1, 6))
+            return game.last_dice
+
+        return roll_dice
+
     # -- Worker thread: the real game loop ----------------------------------
     def _run_game(self):
         """Runs the full game on the worker thread until the episode ends.
 
-        Opponent turns use the engine's own ``step`` (baseline policy); the
-        controlled player's turn is driven here so the agent can be consulted at
-        each decision point. Exits when the controlled player is out, the game
-        is over, or the turn cap is hit, then signals the env.
+        Each seat is played by :meth:`_play_turn` when it has a decider (the
+        agent, or a policy-driven opponent); seats with no decider use the
+        engine's own ``Game.step`` baseline. Exits when the agent is out, the
+        game is over, or the turn cap is hit, then signals the env.
         """
         g = self.game
         controlled = g.players[self.seat]
@@ -252,8 +361,9 @@ class MonopolyEnv(_GymEnv):
         try:
             while (not g.is_over() and not controlled.bankrupt
                    and turns < self.max_turns):
-                if g.current_player == self.seat:
-                    self._controlled_turn(controlled)
+                seat = g.current_player
+                if seat in self._deciders:
+                    self._play_turn(g.players[seat], self._deciders[seat])
                 else:
                     g.step()  # baseline opponent, whole turn
                 turns += 1
@@ -263,17 +373,19 @@ class MonopolyEnv(_GymEnv):
         # Signal the end of the episode to whoever is waiting in step().
         self._req_q.put(_TERMINAL)
 
-    def _controlled_turn(self, player):
-        """Plays one turn for the controlled player, mirroring ``Game.step``.
+    def _play_turn(self, player, decide):
+        """Plays one turn for ``player``, mirroring ``Game.step``.
 
-        Decision points (jail action, pre/post-roll management, and the nested
-        purchase / shortfall hooks) block for an agent action. The turn is
-        advanced exactly once on every exit path, matching the engine.
+        ``decide(phase, prop, amount) -> action`` supplies every choice (jail
+        action, pre/post-roll management, and the nested purchase / shortfall
+        hooks). For the agent it blocks on the queue; for an opponent policy it
+        runs synchronously. The turn is advanced exactly once on every exit
+        path, matching the engine.
         """
         g = self.game
 
         if player.in_jail:
-            choice = self._jail_choice(player)
+            choice = self._jail_choice(decide)
             result = g.handle_jail_turn(player, choice)
             if result in ("jailed", "freed"):
                 g.advance_turn()
@@ -284,7 +396,7 @@ class MonopolyEnv(_GymEnv):
                 return
             # "released": paid / used a card, now take a normal turn.
 
-        self._manage_phase(player)  # pre-roll
+        self._manage_phase(player, decide)  # pre-roll
 
         while True:
             _, _, is_double, sent_to_jail = g.roll_once(player)
@@ -303,68 +415,79 @@ class MonopolyEnv(_GymEnv):
             if not is_double:
                 break
 
-        self._manage_phase(player)  # post-roll
+        self._manage_phase(player, decide)  # post-roll
         player.double_count = 0
         g.advance_turn()
 
-    def _manage_phase(self, player):
-        """Lets the agent issue management actions until it chooses to stop."""
+    def _manage_phase(self, player, decide):
+        """Lets ``player`` issue management actions until it chooses to stop."""
         while True:
-            action = self._ask(PHASE_MANAGE)
+            action = decide(PHASE_MANAGE)
             if action == A_END_MANAGE:
                 return
             self._apply_manage_action(player, action)
             if player.bankrupt:
                 return
 
-    # -- Decision hooks (called on the worker thread) -----------------------
-    def _jail_choice(self, player):
-        action = self._ask(PHASE_JAIL)
+    def _jail_choice(self, decide):
+        action = decide(PHASE_JAIL)
         if action == A_PAY_JAIL:
             return "pay"
         if action == A_USE_CARD:
             return "card"
         return "roll"
 
-    def _on_decide_purchase(self, prop):
-        """``Player.decide_purchase`` override for the controlled player."""
-        action = self._ask(PHASE_BUY, prop=prop)
-        return action == A_BUY
-
     def _on_shortfall(self, payer, amount):
-        """``Game.on_shortfall`` hook: only the agent gets to liquidate.
+        """``Game.on_shortfall`` hook, dispatched by payer.
 
-        Opponents have no shortfall hook behaviour (they fall through to
-        bankruptcy as in headless play). The agent may sell houses, mortgage,
-        or trade until it covers the debt or gives up.
+        The agent and policy-driven opponents may sell houses, mortgage, or
+        trade until they cover the debt or give up; baseline opponents (no
+        decider) fall through to bankruptcy as in headless play.
         """
-        if payer is not self.game.players[self.seat]:
+        seat = self.game.players.index(payer)
+        decide = self._deciders.get(seat)
+        if decide is None:
             return
         while payer.balance < amount:
             if not self._has_liquidation_options(payer):
                 return  # nothing left to raise; bankruptcy will follow
-            action = self._ask(PHASE_LIQUIDATE, prop=None, amount=amount)
+            action = decide(PHASE_LIQUIDATE, None, amount)
             if action == A_END_MANAGE:
-                return  # agent chose to stop; bankruptcy will follow
+                return  # chose to stop; bankruptcy will follow
             self._apply_manage_action(payer, action)
 
-    def _ask(self, phase, prop=None, amount=0):
-        """Hands a decision to the env and blocks for the agent's action.
+    # -- Deciders: agent (queue) vs opponent policy (synchronous) -----------
+    def _agent_decide(self, phase, prop=None, amount=0):
+        """The agent's decider: posts a request and blocks for ``step``.
 
-        Posts the request, waits for ``step`` to push a response, then validates
-        it against the legal mask -- clamping an illegal action to a safe
-        default (decline / roll / stop) rather than letting it corrupt state.
+        Records the current decision (phase/property/mask, all from the agent's
+        own perspective) so ``step`` can build the observation, then validates
+        the returned action against the mask -- clamping an illegal action to a
+        safe default rather than letting it corrupt state.
         """
         self._cur_phase = phase
         self._cur_prop = prop
         self._cur_amount = amount
-        self._cur_mask = self._legal_mask(phase, prop)
+        self._cur_mask = self._legal_mask(phase, prop, self.seat)
         self._req_q.put((phase, prop, amount))
         action = self._resp_q.get()
         if action == _ABORT:
             raise _Abort()
         self._illegal = not (0 <= action < NUM_ACTIONS and self._cur_mask[action])
         if self._illegal:
+            action = self._safe_default(phase)
+        return action
+
+    def _policy_decide(self, seat, phase, prop=None, amount=0):
+        """An opponent's decider: queries the opponent policy synchronously.
+
+        Builds the mask and observation from ``seat``'s own perspective and
+        clamps an illegal/invalid policy action to a safe default.
+        """
+        mask = self._legal_mask(phase, prop, seat)
+        obs = self._encode_obs(seat, phase, prop)
+        action = int(self._opponent_policy(obs, mask.astype(bool)))
+        if not (0 <= action < NUM_ACTIONS and mask[action]):
             action = self._safe_default(phase)
         return action
 
@@ -451,10 +574,10 @@ class MonopolyEnv(_GymEnv):
         return False
 
     # -- Legal-action masks -------------------------------------------------
-    def _legal_mask(self, phase, prop):
+    def _legal_mask(self, phase, prop, seat):
         mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
         g = self.game
-        player = g.players[self.seat]
+        player = g.players[seat]
 
         if phase == PHASE_JAIL:
             mask[A_ROLL_JAIL] = 1
@@ -499,24 +622,32 @@ class MonopolyEnv(_GymEnv):
             self._cur_phase = PHASE_TERMINAL
             self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
             self._cur_prop = None
-            obs = self._encode_obs()
+            obs = self._encode_obs(self.seat, PHASE_TERMINAL, None)
             reward = self._reward(terminal=True)
             return obs, reward, True, self._truncated, self._info(terminal=True)
 
         phase, prop, amount = item
         self._cur_phase, self._cur_prop, self._cur_amount = phase, prop, amount
-        obs = self._encode_obs()
+        obs = self._encode_obs(self.seat, phase, prop)
         reward = self._reward(terminal=False)
         return obs, reward, False, False, self._info()
 
-    def _encode_obs(self):
-        """Builds the flat float32 observation for the current state."""
+    def _encode_obs(self, perspective, phase, prop):
+        """Builds the flat float32 observation from ``perspective``'s view.
+
+        Players are ordered starting at ``perspective`` (so the acting seat is
+        always relative player 0) and property owners are encoded by relative
+        seat. This makes the observation perspective-invariant, so one policy
+        can play any seat -- the basis for self-play.
+        """
         g = self.game
         n = self.num_players
         parts = []
 
-        # Per-player block: balance, position, jail flag, #cards, bankrupt.
-        for p in g.players:
+        # Per-player block (acting seat first): balance, position, jail flag,
+        # #cards, bankrupt.
+        for k in range(n):
+            p = g.players[(perspective + k) % n]
             parts.extend([
                 p.balance / 1500.0,
                 p.pos / 39.0,
@@ -525,23 +656,25 @@ class MonopolyEnv(_GymEnv):
                 1.0 if p.bankrupt else 0.0,
             ])
 
-        # Per-property block: owner one-hot (incl. unowned), mortgaged, houses.
+        # Per-property block: owner one-hot relative to perspective (slot 0 ==
+        # "mine", slot n == unowned), mortgaged, houses.
         for p in self.ownable:
             owner_onehot = [0.0] * (n + 1)
             if p.owner is None:
                 owner_onehot[n] = 1.0
             else:
-                owner_onehot[g.players.index(p.owner)] = 1.0
+                rel = (g.players.index(p.owner) - perspective) % n
+                owner_onehot[rel] = 1.0
             parts.extend(owner_onehot)
             parts.append(1.0 if p.mortgaged else 0.0)
             parts.append(getattr(p, "houses", 0) / 5.0)
 
         # Phase one-hot and the context property index (BUY/LIQUIDATE), or -1.
         phase_onehot = [0.0] * NUM_PHASES
-        phase_onehot[self._cur_phase] = 1.0
+        phase_onehot[phase] = 1.0
         parts.extend(phase_onehot)
-        if self._cur_prop is not None:
-            parts.append(self._prop_index[id(self._cur_prop)] / NUM_OWNABLE)
+        if prop is not None:
+            parts.append(self._prop_index[id(prop)] / NUM_OWNABLE)
         else:
             parts.append(-1.0)
 

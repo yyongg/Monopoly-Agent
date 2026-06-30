@@ -1,0 +1,19 @@
+# Reinforcement-learning dependencies for training an agent (train.py /
+# evaluate.py) on the Gym-style engine/rl_env.py environment.
+# Install with:  pip install -r requirements-rl.txt
+#
+# These are NOT needed to run the game itself (engine is pure standard library)
+# or the pygame UI. Pinned to the versions verified with this project.
+#
+# Note: torch wheels are platform/CUDA-specific. If the pinned build does not
+# match your machine, install torch per https://pytorch.org/get-started/ first,
+# then `pip install -r requirements-rl.txt` for the rest.
+
+gymnasium==1.3.0
+stable_baselines3==2.9.0
+sb3_contrib==2.9.0
+torch==2.12.1
+numpy==2.5.0
+
+# Optional: enables TensorBoard logging in train.py (training works without it).
+# tensorboard
