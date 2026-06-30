@@ -150,12 +150,13 @@ class MonopolyEnv(_GymEnv):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, seat=0, num_players=4, names=None, max_turns=1000,
+    def __init__(self, seat=None, num_players=4, names=None, max_turns=1000,
                  reward_mode="shaped", seed=None, opponent_policy=None,
                  opponent_provider=None):
-        if not 0 <= seat < num_players:
+        if seat is not None and not 0 <= seat < num_players:
             raise ValueError("seat must be in range(num_players)")
-        self.seat = seat
+        self._seat_fixed = seat  # None means pick a random seat each episode
+        self.seat = seat if seat is not None else 0  # overwritten at reset
         self.num_players = num_players
         self._names = names or ["Red", "Blue", "Green", "Yellow"][:num_players]
         if len(self._names) != num_players:
@@ -218,6 +219,8 @@ class MonopolyEnv(_GymEnv):
         elif seed is not None or not self._seeded:
             self.np_random = np.random.default_rng(seed)
         self._seeded = True
+        if self._seat_fixed is None:
+            self.seat = int(self.np_random.integers(0, self.num_players))
 
         self._shutdown_worker()
         self._build_game()

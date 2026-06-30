@@ -30,7 +30,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--n-envs", type=int, default=8)
-    parser.add_argument("--seat", type=int, default=0)
+    parser.add_argument("--seat", type=int, default=None,
+                        help="seat the agent controls (default: random each episode)")
     parser.add_argument("--reward-mode", choices=["shaped", "sparse"],
                         default="shaped")
     parser.add_argument("--max-turns", type=int, default=1000)
@@ -108,7 +109,7 @@ def main():
     # Final evaluation against the fixed baseline (a stationary yardstick).
     from evaluate import run_evaluation
 
-    eval_env = MonopolyEnv(seat=args.seat, reward_mode=args.reward_mode,
+    eval_env = MonopolyEnv(seat=0, reward_mode=args.reward_mode,
                            seed=args.seed + 10_000)
     stats = run_evaluation(model, eval_env, episodes=args.eval_episodes)
     eval_env.close()
