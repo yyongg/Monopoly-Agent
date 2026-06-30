@@ -41,6 +41,11 @@ class GUIAIDecider:
         # accepting (headless / training-mirror behaviour); ``MonopolyApp`` sets
         # it so a human buyer is prompted to accept or decline.
         self.confirm_trade = lambda seller, buyer, prop: True
+        # ``(id(prop), id(buyer))`` pairs a buyer has already refused this game,
+        # so the AI never re-offers an identical trade after a rejection. Both
+        # ``_find_trade_buyer`` and the legal mask consult this set, so a
+        # rejected trade is removed from the action space entirely.
+        self._rejected_trades = set()
         self.game = None
         self.ownable = []
         self._prop_index = {}
@@ -210,6 +215,7 @@ class GUIAIDecider:
         if buyer is None:
             return
         if not self.confirm_trade(seller, buyer, prop):
+            self._rejected_trades.add((id(prop), id(buyer)))
             self.log(f"{buyer.name} declined {seller.name}'s offer to sell "
                      f"{prop.name}.")
             return
@@ -225,6 +231,8 @@ class GUIAIDecider:
         for other in g.players:
             if other is seller or other.bankrupt or other.balance < prop.price:
                 continue
+            if (id(prop), id(other)) in self._rejected_trades:
+                continue  # this buyer already refused this property
             score = self._trade_appeal(prop, other)
             if score > best_score:
                 best, best_score = other, score

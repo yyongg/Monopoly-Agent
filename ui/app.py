@@ -1544,7 +1544,13 @@ def main():
     # the AI's policy sampling (torch). A fresh entropy-based seed each game
     # gives variety; ``--seed`` makes a game reproducible. We print it so any
     # game can be replayed.
-    seed = args.seed if args.seed is not None else random.randrange(2 ** 31)
+    #
+    # The seed is drawn from ``SystemRandom`` (OS entropy), NOT ``random``,
+    # because loading the MaskablePPO model reseeds the global ``random`` module
+    # to its training seed -- so ``random.randrange`` here would return the same
+    # value on every launch and every AI game would play out identically.
+    seed = args.seed if args.seed is not None \
+        else random.SystemRandom().randrange(2 ** 31)
     random.seed(seed)
     try:
         import torch
