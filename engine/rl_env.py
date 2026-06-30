@@ -47,7 +47,11 @@ indexed by the 28 ownable tiles in board order::
     34 +i  SELL i        sell a house/hotel from tile i
     62 +i  MORTGAGE i    mortgage tile i
     90 +i  UNMORTGAGE i  lift the mortgage on tile i
-    118+i  TRADE i       sell tile i to a willing opponent at list price
+    118+i  TRADE i       (disabled) the agent does not trade -- these actions
+                         are never legal, so the agent never initiates a trade.
+                         The slots are retained only to keep the action-space
+                         size (and thus the policy head) stable; trade decisions
+                         in the GUI are handled by a separate valuation formula.
 
 Illegal actions (those not set in the mask) are clamped to a safe default rather
 than raising, and reported via ``info["illegal"]``.
@@ -517,54 +521,8 @@ class MonopolyEnv(_GymEnv):
             g.mortgage_property(self.ownable[action - A_MORTGAGE], player)
         elif A_UNMORTGAGE <= action < A_UNMORTGAGE + NUM_OWNABLE:
             g.unmortgage_property(self.ownable[action - A_UNMORTGAGE], player)
-        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
-            self._do_trade(player, self.ownable[action - A_TRADE])
-
-    def _do_trade(self, seller, prop):
-        """Sells ``prop`` to a willing opponent at its list price.
-
-        A simplified trade primitive: the agent puts one property on the market
-        and the engine finds an opponent who benefits and can pay list price.
-        Cash flows to the seller (``cash = -price`` in ``execute_trade``'s
-        initiator-pays-partner convention). Acquiring properties or negotiating
-        price is left as a future extension.
-        """
-        buyer = self._find_trade_buyer(seller, prop)
-        if buyer is not None:
-            self.game.execute_trade(seller, buyer, [prop], [], -prop.price)
-
-    def _find_trade_buyer(self, seller, prop):
-        """Returns the opponent most likely to buy ``prop``, or ``None``.
-
-        A buyer must be solvent enough to pay list price and gain something:
-        completing a colour group / set is preferred over merely extending one.
-        Returns ``None`` when no opponent benefits, which also masks the trade
-        action out.
-        """
-        g = self.game
-        if not g.can_trade_property(prop):
-            return None
-        best, best_score = None, 0
-        for other in g.players:
-            if other is seller or other.bankrupt or other.balance < prop.price:
-                continue
-            score = self._trade_appeal(prop, other)
-            if score > best_score:
-                best, best_score = other, score
-        return best
-
-    def _trade_appeal(self, prop, buyer):
-        """Heuristic appeal of ``prop`` to ``buyer`` (0 = no interest)."""
-        if isinstance(prop, StreetProperty):
-            group = prop.color_group(self.game)
-            owned = sum(1 for t in group if t.owner is buyer)
-            if owned == 0:
-                return 0
-            # Completing the set is worth far more than extending it.
-            return 10 if owned == len(group) - 1 else owned
-        same_type = sum(
-            1 for p in buyer.properties if isinstance(p, type(prop)))
-        return same_type + 1  # railroads/utilities: always some scale value
+        # A_TRADE actions are never legal (the agent does not trade), so they
+        # never reach here.
 
     def _has_liquidation_options(self, player):
         """Whether ``player`` has any house to sell or property to mortgage."""
@@ -610,8 +568,7 @@ class MonopolyEnv(_GymEnv):
             if phase == PHASE_MANAGE:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
-                if self._find_trade_buyer(player, p) is not None:
-                    mask[A_TRADE + i] = 1
+                # No A_TRADE bit: the agent never initiates trades.
 
         mask[A_END_MANAGE] = 1  # always allowed to stop
         return mask

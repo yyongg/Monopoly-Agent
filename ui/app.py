@@ -347,7 +347,6 @@ class MonopolyApp:
         for ai in self._ai_deciders.values():
             ai.bind(game, ownable)
             ai.log = self.add_log  # so AI moves show up in the game log
-            ai.confirm_trade = self._ai_trade_offer  # let the buyer accept/deny
 
         # Wire per-player purchase hooks.
         for player in game.players:
@@ -370,21 +369,6 @@ class MonopolyApp:
 
     def _current_is_ai(self):
         return self._is_ai(self.game.players[self.game.current_player])
-
-    def _ai_trade_offer(self, seller, buyer, prop):
-        """Response to an AI's trade offer to sell ``prop`` to ``buyer``.
-
-        A human buyer is prompted to accept or decline (the trade has them pay
-        the seller the property's list price). Another AI buyer accepts via the
-        same heuristic that selected it, matching headless / training behaviour.
-        """
-        if self._is_ai(buyer):
-            return True
-        choice = self.ask(
-            f"{seller.name} [AI] offers to sell {prop.name} to {buyer.name} "
-            f"for ${prop.price}. You pay ${prop.price}. Accept?",
-            [("Accept", "yes"), ("Decline", "no")])
-        return choice == "yes"
 
     def _ai_pause(self, seconds):
         """A short, skippable pause so AI events are watchable (no blocking)."""
@@ -1162,6 +1146,27 @@ class MonopolyApp:
 
         gnames = ", ".join(t.name for t in give) or "nothing"
         rnames = ", ".join(t.name for t in receive) or "nothing"
+
+        if self._is_ai(partner):
+            # The AI evaluates the offer with its valuation formula rather than
+            # being asked. From the AI's perspective it gains the properties the
+            # proposer gives up, loses the ones it gives away, and its cash
+            # changes by +cash (the proposer pays it ``cash``).
+            decider = self._ai_deciders[partner.name]
+            accepted, value = decider.evaluate_trade(
+                partner, player, give, receive, cash)
+            if not accepted:
+                self.add_log(f"{partner.name} [AI] declined {player.name}'s "
+                             f"trade (value {value:+.0f}).")
+                return True
+            if self.game.execute_trade(player, partner, give, receive, cash):
+                self.add_log(f"{partner.name} [AI] accepted {player.name}'s "
+                             f"trade (value {value:+.0f}).")
+                return True
+            self.ask("Trade couldn't be completed (the cash payer can't "
+                     "afford it).", [("OK", "ok")])
+            return False
+
         accept = self.ask(
             f"{partner.name}: {player.name} proposes a trade. You give "
             f"{rnames}; you get {gnames}; "

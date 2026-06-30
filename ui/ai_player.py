@@ -5,6 +5,11 @@
 that the GUI can call instead of showing a human prompt. The obs encoding and
 legal-mask logic mirror ``MonopolyEnv`` exactly so the model sees the same
 inputs it was trained on.
+
+The AI never *initiates* trades (trade actions are masked out, matching the
+trained policy). When a human proposes a trade to the AI, ``evaluate_trade``
+scores the offer with a dollar-valued formula and accepts only if it comes out
+ahead -- see that method for the formula.
 """
 
 import numpy as np
@@ -14,7 +19,7 @@ from engine.rl_env import (
     NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
-    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
+    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
 )
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
@@ -36,16 +41,6 @@ class GUIAIDecider:
         # a no-op so the decider also works headless; ``MonopolyApp`` sets it to
         # ``add_log`` so the player can see what the AI did.
         self.log = log or (lambda message: None)
-        # Callback ``(seller, buyer, prop) -> bool`` asked before an AI-initiated
-        # trade completes, so the counterparty can refuse. Defaults to always
-        # accepting (headless / training-mirror behaviour); ``MonopolyApp`` sets
-        # it so a human buyer is prompted to accept or decline.
-        self.confirm_trade = lambda seller, buyer, prop: True
-        # ``(id(prop), id(buyer))`` pairs a buyer has already refused this game,
-        # so the AI never re-offers an identical trade after a rejection. Both
-        # ``_find_trade_buyer`` and the legal mask consult this set, so a
-        # rejected trade is removed from the action space entirely.
-        self._rejected_trades = set()
         self.game = None
         self.ownable = []
         self._prop_index = {}
@@ -179,8 +174,7 @@ class GUIAIDecider:
             if phase == PHASE_MANAGE:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
-                if self._find_trade_buyer(player, p) is not None:
-                    mask[A_TRADE + i] = 1
+                # No A_TRADE bit: the AI never initiates trades.
 
         mask[A_END_MANAGE] = 1
         return mask
@@ -207,45 +201,94 @@ class GUIAIDecider:
             if g.unmortgage_property(prop, player):
                 self.log(f"{player.name} [AI] lifted the mortgage on "
                          f"{prop.name} for ${cost}.")
-        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
-            self._do_trade(player, self.ownable[action - A_TRADE])
+        # A_TRADE is never legal: the AI does not initiate trades.
 
-    def _do_trade(self, seller, prop):
-        buyer = self._find_trade_buyer(seller, prop)
-        if buyer is None:
-            return
-        if not self.confirm_trade(seller, buyer, prop):
-            self._rejected_trades.add((id(prop), id(buyer)))
-            self.log(f"{buyer.name} declined {seller.name}'s offer to sell "
-                     f"{prop.name}.")
-            return
-        if self.game.execute_trade(seller, buyer, [prop], [], -prop.price):
-            self.log(f"{seller.name} [AI] sold {prop.name} to "
-                     f"{buyer.name} for ${prop.price}.")
+    # --- Trade evaluation (responding to a human's proposal) ---------------
 
-    def _find_trade_buyer(self, seller, prop):
-        g = self.game
-        if not g.can_trade_property(prop):
-            return None
-        best, best_score = None, 0
-        for other in g.players:
-            if other is seller or other.bankrupt or other.balance < prop.price:
-                continue
-            if (id(prop), id(other)) in self._rejected_trades:
-                continue  # this buyer already refused this property
-            score = self._trade_appeal(prop, other)
-            if score > best_score:
-                best, best_score = other, score
-        return best
+    # How much a freshly completed monopoly is worth beyond the raw price of its
+    # tiles, as a multiple of the group's total list price. A full set roughly
+    # doubles a group's value (it unlocks houses and multiplied rent), so a
+    # gained set adds ~1x its price on top of the tiles themselves, and handing
+    # one to the opponent costs the same.
+    SET_BONUS = 1.0
 
-    def _trade_appeal(self, prop, buyer):
-        if isinstance(prop, StreetProperty):
-            group = prop.color_group(self.game)
-            owned = sum(1 for t in group if t.owner is buyer)
-            if owned == 0:
-                return 0
-            return 10 if owned == len(group) - 1 else owned
-        return sum(1 for p in buyer.properties if isinstance(p, type(prop))) + 1
+    def evaluate_trade(self, me, other, gain, lose, cash_delta):
+        """Estimates the dollar value to ``me`` of a trade and decides on it.
+
+        From ``me``'s perspective the trade hands ``me`` the properties in
+        ``gain`` and ``cash_delta`` dollars, and takes away the properties in
+        ``lose`` (which go to ``other``). The value is::
+
+            value =  cash_delta
+                   + sum(property_value(p) for p in gain)
+                   - sum(property_value(p) for p in lose)
+                   + SET_BONUS * (group price of any monopoly this completes
+                                  for ``me``, minus any it breaks for ``me``)
+                   - SET_BONUS * (group price of any monopoly this hands to
+                                  ``other``, minus any it strips from ``other``)
+
+        where a property is valued at its list price, less the outstanding
+        unmortgage cost if it is mortgaged. ``me`` accepts only when the value
+        is strictly positive (and it can afford any cash it owes).
+
+        Returns ``(accepted: bool, value: float)``.
+        """
+        # Can't accept a trade whose cash ``me`` cannot cover.
+        if cash_delta < 0 and me.balance < -cash_delta:
+            return False, float("-inf")
+
+        value = float(cash_delta)
+        value += sum(self._property_value(p) for p in gain)
+        value -= sum(self._property_value(p) for p in lose)
+
+        # Strategic set synergy. Only ``me`` and ``other`` change holdings.
+        value += self.SET_BONUS * self._set_swing(me, gain, lose)
+        value -= self.SET_BONUS * self._set_swing(other, lose, gain)
+
+        return value > 0, value
+
+    def _property_value(self, prop):
+        """List-price value of a property, discounted for an unpaid mortgage."""
+        if prop.mortgaged:
+            return float(prop.price - prop.unmortgage_cost)
+        return float(prop.price)
+
+    def _ownable_groups(self):
+        """Groups the ownable tiles into sets: each street colour, all
+        railroads, all utilities -- the units that form a monopoly."""
+        groups = {}
+        for t in self.ownable:
+            if isinstance(t, StreetProperty):
+                key = ("street", t.color)
+            elif isinstance(t, Railroad):
+                key = ("railroad", None)
+            else:
+                key = ("utility", None)
+            groups.setdefault(key, []).append(t)
+        return groups
+
+    def _set_swing(self, player, gained, lost):
+        """Net group-price value of the monopolies ``player`` gains minus those
+        it loses, if it were to receive ``gained`` and give up ``lost``."""
+        gained_ids = {id(t) for t in gained}
+        lost_ids = {id(t) for t in lost}
+
+        def owns_after(tile):
+            if id(tile) in gained_ids:
+                return True
+            if id(tile) in lost_ids:
+                return False
+            return tile.owner is player
+
+        swing = 0.0
+        for tiles in self._ownable_groups().values():
+            before = all(t.owner is player for t in tiles)
+            after = all(owns_after(t) for t in tiles)
+            if after and not before:
+                swing += sum(t.price for t in tiles)   # completed a monopoly
+            elif before and not after:
+                swing -= sum(t.price for t in tiles)   # broke a monopoly
+        return swing
 
     def _has_liquidation_options(self, player):
         g = self.game
