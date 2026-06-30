@@ -843,10 +843,17 @@ class MonopolyApp:
 
     def _frame(self):
         skip = False
+        board_rect = pygame.Rect(BOARD_X, BOARD_Y, BOARD_PX, BOARD_PX)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 raise QuitGame
-            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN):
+            # Only a click *on the board* skips animations -- clicks elsewhere
+            # (e.g. on player inventory panels) must not, so they stay usable
+            # while AI turns animate. Any key press still skips.
+            if event.type == pygame.KEYDOWN:
+                skip = True
+            elif (event.type == pygame.MOUSEBUTTONDOWN
+                  and board_rect.collidepoint(event.pos)):
                 skip = True
         self._draw_scene()
         pygame.display.flip()

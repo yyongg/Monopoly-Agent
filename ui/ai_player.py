@@ -169,7 +169,11 @@ class GUIAIDecider:
                     mask[A_BUILD + i] = 1
                 if p.can_sell_house(g, player):
                     mask[A_SELL + i] = 1
-            if p.can_mortgage(g, player):
+            # Mortgaging is only offered during forced LIQUIDATE (raising cash
+            # the player actually needs). Allowing it during voluntary MANAGE
+            # let the AI mortgage-flip a property it just bought (and oscillate
+            # mortgage<->unmortgage), so it is masked out there.
+            if phase == PHASE_LIQUIDATE and p.can_mortgage(g, player):
                 mask[A_MORTGAGE + i] = 1
             if phase == PHASE_MANAGE:
                 if p.can_unmortgage(g, player):
