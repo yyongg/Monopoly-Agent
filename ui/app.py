@@ -346,6 +346,7 @@ class MonopolyApp:
                    if isinstance(t, (StreetProperty, Railroad, Utility))]
         for ai in self._ai_deciders.values():
             ai.bind(game, ownable)
+            ai.log = self.add_log  # so AI moves show up in the game log
 
         # Wire per-player purchase hooks.
         for player in game.players:
@@ -1468,6 +1469,15 @@ def main():
         "--model", default=None,
         help="path to a trained MaskablePPO model .zip "
              "(default: runs/monopoly_ppo.zip if it exists)")
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="seed for dice, card shuffles, turn order, and AI sampling "
+             "(default: a fresh random seed each game; printed so you can "
+             "replay a game with --seed)")
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="make AI players act greedily (same move for the same state). "
+             "By default the AI samples its policy so games vary.")
     args, _ = parser.parse_known_args()
 
     # Find a model to offer AI players.
@@ -1513,6 +1523,20 @@ def main():
             ])
             ai_names = set()
 
+    # Seed every source of randomness for this game: dice and card shuffles
+    # (both draw from the stdlib ``random`` module), the turn-order shuffle, and
+    # the AI's policy sampling (torch). A fresh entropy-based seed each game
+    # gives variety; ``--seed`` makes a game reproducible. We print it so any
+    # game can be replayed.
+    seed = args.seed if args.seed is not None else random.randrange(2 ** 31)
+    random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except Exception:
+        pass
+    print(f"Game seed: {seed}  (replay with --seed {seed})")
+
     # Build players and (optionally) shuffle turn order.
     from engine.game import Game
     from models.board import Board
@@ -1532,7 +1556,8 @@ def main():
     if model is not None:
         from ui.ai_player import GUIAIDecider
         for name in ai_names:
-            ai_deciders[name] = GUIAIDecider(num_players=4, model=model)
+            ai_deciders[name] = GUIAIDecider(
+                num_players=4, model=model, deterministic=args.deterministic)
 
     MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
 

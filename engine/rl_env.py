@@ -684,10 +684,20 @@ class MonopolyEnv(_GymEnv):
         return np.asarray(parts, dtype=np.float32)
 
     def _net_worth(self, player):
-        """Liquidation-style net worth used for reward shaping."""
+        """Liquidation-style net worth used for reward shaping.
+
+        A mortgaged property is valued at ``price - unmortgage_cost`` (its worth
+        once the outstanding mortgage debt is cleared) rather than at its
+        mortgage value. Because mortgaging also pays the owner ``mortgage_value``
+        in cash, this makes the round trip cost exactly the ~10% mortgage
+        interest -- so the agent sees a real (if small) net-worth penalty for
+        mortgage-flipping a property it just bought, instead of mortgaging being
+        net-worth-neutral and therefore "free".
+        """
         total = float(player.balance)
         for prop in player.properties:
-            total += prop.mortgage_value if prop.mortgaged else prop.price
+            total += (prop.price - prop.unmortgage_cost) if prop.mortgaged \
+                else prop.price
             if isinstance(prop, StreetProperty):
                 total += prop.houses * (prop.house_cost() // 2)
         return total
