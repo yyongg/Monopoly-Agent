@@ -681,12 +681,29 @@ class MonopolyApp:
             worth += prop.houses * prop.house_cost()
         return worth
 
-    ROW_H = 30  # pixel height of one inventory row
+    def _property_sort_key(self, prop):
+        """Sort key that groups properties by colour set (board order: browns
+        through dark blue, then railroads, then utilities) and orders within a
+        group by price -- used everywhere properties are listed."""
+        order = list(GROUP_COLORS)
+        if isinstance(prop, StreetProperty):
+            rank = order.index(prop.color) if prop.color in order else len(order)
+        elif isinstance(prop, Railroad):
+            rank = len(order)
+        else:  # Utility
+            rank = len(order) + 1
+        return (rank, prop.price, prop.name)
+
+    def _sorted_props(self, props):
+        """Properties grouped by colour then price (see ``_property_sort_key``)."""
+        return sorted(props, key=self._property_sort_key)
+
+    ROW_H = 34  # pixel height of one inventory row
 
     def _draw_inventory(self, y, player, bottom):
         self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head,
                    FELT_INK, shadow=True)
-        props = player.properties
+        props = self._sorted_props(player.properties)
 
         # How many rows fit, and how far we may scroll, given the space below
         # the header. Clamp the stored scroll here so the wheel handler can
@@ -718,9 +735,13 @@ class MonopolyApp:
         # nudge the row text left of it so they don't overlap.
         text_right = SIDE_X + SIDE_W - (12 if max_scroll else 0)
         for prop in props[scroll:scroll + visible]:
-            houses, rent = self._rent_line(prop)
             self._draw_property_chip(prop, SIDE_X, y)
-            info = f"${self._property_worth(prop)}  ·  {houses}  ·  {rent}"
+            # Houses/hotel/mortgage shown as icons just right of the name chip.
+            chip_w = self.f_small.size(prop.name)[0] + 8
+            cy = y + self.f_small.get_height() // 2 + 1
+            self._draw_buildings(prop, SIDE_X + chip_w + 6, cy)
+            _, rent = self._rent_line(prop)
+            info = f"${self._property_worth(prop)}  ·  {rent}"
             w = self.f_small.size(info)[0]
             self._text(info, (text_right - w, y), self.f_small, FELT_SUB,
                        shadow=True)
@@ -826,8 +847,44 @@ class MonopolyApp:
         elif shape == "x":
             pygame.draw.line(scr, color, (cx - h, cy - h), (cx + h, cy + h), 3)
             pygame.draw.line(scr, color, (cx + h, cy - h), (cx - h, cy + h), 3)
+        elif shape == "mortgage":
+            pygame.draw.circle(scr, color, (cx, cy), h, 2)
+            pygame.draw.line(scr, color, (cx - h + 2, cy + h - 2),
+                             (cx + h - 2, cy - h + 2), 2)
         else:
             pygame.draw.circle(scr, color, (cx, cy), 4)
+
+    def _draw_house(self, cx, cy, color, s=10):
+        """A small house glyph (roofed square) centred at ``(cx, cy)``."""
+        h = s // 2
+        body = pygame.Rect(cx - h, cy - h + 2, s, s - 2)
+        pygame.draw.polygon(self.screen, color,
+                            [(cx - h - 1, cy - h + 2),
+                             (cx + h + 1, cy - h + 2), (cx, cy - h - 3)])
+        pygame.draw.rect(self.screen, color, body)
+        pygame.draw.rect(self.screen, INK, body, 1)
+
+    HOUSE_GREEN = (46, 160, 80)
+    HOTEL_RED = (204, 58, 58)
+    MTG_TAN = (150, 120, 60)
+
+    def _draw_buildings(self, prop, x, cy):
+        """Draws status icons for ``prop`` at vertical centre ``cy`` starting at
+        ``x``: a mortgage badge, a red hotel, or up to four green houses.
+        Returns the x cursor after the icons (== ``x`` when there's nothing)."""
+        if getattr(prop, "mortgaged", False):
+            self._draw_icon("mortgage", self.MTG_TAN, x + 8, cy, s=15)
+            return x + 18
+        if not isinstance(prop, StreetProperty) or prop.houses == 0:
+            return x
+        if prop.houses >= 5:  # hotel
+            self._draw_house(x + 8, cy, self.HOTEL_RED, s=14)
+            return x + 18
+        cx = x + 6
+        for _ in range(prop.houses):
+            self._draw_house(cx, cy, self.HOUSE_GREEN, s=10)
+            cx += 11
+        return cx + 1
 
     def _draw_property_chip(self, prop, x, y):
         color = self._property_color(prop)
@@ -963,27 +1020,28 @@ class MonopolyApp:
         ps = pf.render(f"${prop.price}", True, INK)
         self.screen.blit(ps, ps.get_rect(topright=(x1, rect.bottom - 34)))
 
-    def _draw_mini_card(self, rect, prop):
-        """A compact property card (color stripe + name + status) for lists."""
+    def _draw_mini_card(self, rect, prop, selected=False):
+        """A compact property card for lists: colour stripe + name on top, and a
+        bottom row with building/mortgage icons (left) and the price (right), so
+        no text sits over the coloured stripe. A gold ring marks selection."""
         pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=6)
-        pygame.draw.rect(self.screen, INK, rect, 1, border_radius=6)
-        stripe = pygame.Rect(rect.x, rect.y, rect.w, 15)
+        stripe = pygame.Rect(rect.x, rect.y, rect.w, 12)
         color = self._property_color(prop)
         pygame.draw.rect(self.screen, color, stripe,
                          border_top_left_radius=6, border_top_right_radius=6)
-        name = self._truncate(prop.name, self.f_small, rect.w - 16)
-        self.screen.blit(self.f_small.render(name, True, INK),
-                         (rect.x + 8, rect.y + 20))
-        if prop.mortgaged:
-            tag = "mortgaged"
-        elif isinstance(prop, StreetProperty) and prop.houses:
-            tag = "HOTEL" if prop.houses >= 5 else f"{prop.houses} house" + (
-                "s" if prop.houses > 1 else "")
-        else:
-            tag = ""
-        if tag and rect.h >= 40:
-            self.screen.blit(self.f_small.render(tag, True, MUTED),
-                             (rect.x + 8, rect.y + 20 + self.f_small.get_height()))
+        namef = self._font(14)
+        name = self._truncate(prop.name, namef, rect.w - 14)
+        self.screen.blit(namef.render(name, True, INK), (rect.x + 7, rect.y + 14))
+        # Bottom row (only when the card is tall enough): icons + price, hugging
+        # the bottom edge so they never collide with the name.
+        if rect.h >= 40:
+            by = rect.bottom - 9
+            self._draw_buildings(prop, rect.x + 3, by)
+            pricef = self._font(13, bold=True)
+            ps = pricef.render(f"${prop.price}", True, MUTED)
+            self.screen.blit(ps, ps.get_rect(midright=(rect.right - 7, by)))
+        pygame.draw.rect(self.screen, ACCENT if selected else INK, rect,
+                         3 if selected else 1, border_radius=6)
 
     def _draw_money_card(self, rect, amount):
         """A green 'bill' chip showing a cash amount in a trade."""
@@ -1124,8 +1182,8 @@ class MonopolyApp:
         cash_h = 46 if cash > 0 else 0
         list_bottom = rect.bottom - 12 - (cash_h + 10 if cash_h else 0)
 
-        inventory = list(player.properties)
-        row_h = 52
+        inventory = self._sorted_props(player.properties)
+        row_h = 54
         slots = max(1, (list_bottom - list_top) // row_h)
         max_scroll = max(0, len(inventory) - slots)
         scroll = max(0, min(scroll, max_scroll))
@@ -1134,12 +1192,8 @@ class MonopolyApp:
             self._text("no properties", (x, list_top), self.f_small, MUTED)
         y = list_top
         for prop in inventory[scroll:scroll + slots]:
-            card = pygame.Rect(x, y, cw, 46)
-            self._draw_mini_card(card, prop)
-            if prop in offered:
-                pygame.draw.rect(self.screen, ACCENT, card, 3, border_radius=6)
-                pygame.draw.circle(self.screen, ACCENT,
-                                   (card.right - 11, card.y + 8), 5)
+            card = pygame.Rect(x, y, cw, 48)
+            self._draw_mini_card(card, prop, selected=prop in offered)
             y += row_h
         if max_scroll:
             lo, hi = scroll + 1, min(scroll + slots, len(inventory))
@@ -1843,7 +1897,7 @@ class MonopolyApp:
         bottom_bar = dlg.bottom - 60
         grid_top = content_top
         grid_bottom = bottom_bar - 12
-        props = player.properties
+        props = self._sorted_props(player.properties)
 
         cols = 3
         cell_pad = 14
@@ -2129,19 +2183,14 @@ class MonopolyApp:
             self._text("inventory button below.", (x, list_top + 20),
                        self.f_small, MUTED)
             return rows, 0
-        row_h = 52
+        tiles = self._sorted_props(tiles)
+        row_h = 54
         slots = max(1, (bottom - list_top) // row_h)
         max_scroll = max(0, len(tiles) - slots)
         scroll = max(0, min(scroll, max_scroll))
         for prop in tiles[scroll:scroll + slots]:
-            card = pygame.Rect(x, list_top, w, 46)
-            self._draw_mini_card(card, prop)
-            stripe_color = self._property_color(prop)
-            price = self.f_small.render(f"${prop.price}", True,
-                                        contrast_text(stripe_color))
-            self.screen.blit(price,
-                             price.get_rect(topright=(card.right - 6, card.y)))
-            pygame.draw.rect(self.screen, ACCENT, card, 3, border_radius=6)
+            card = pygame.Rect(x, list_top, w, 48)
+            self._draw_mini_card(card, prop, selected=True)
             rows.append((card, prop))
             list_top += row_h
         if max_scroll:
@@ -2203,11 +2252,11 @@ class MonopolyApp:
         bottom_bar = dlg.bottom - 60
         grid_top = dlg.y + 78
         grid_bottom = bottom_bar - 12
-        props = list(owner.properties)
+        props = self._sorted_props(owner.properties)
         cols = 3
         cell_pad = 14
         cell_w = (dlg.w - 2 * pad - (cols - 1) * cell_pad) // cols
-        cell_h = 74
+        cell_h = 66
         rows_fit = max(1, (grid_bottom - grid_top + cell_pad)
                        // (cell_h + cell_pad))
         total_rows = (len(props) + cols - 1) // cols
@@ -2223,20 +2272,7 @@ class MonopolyApp:
                 cx = dlg.x + pad + c * (cell_w + cell_pad)
                 cy = grid_top + r * (cell_h + cell_pad)
                 card = pygame.Rect(cx, cy, cell_w, cell_h)
-                self._draw_mini_card(card, prop)
-                stripe = self._property_color(prop)
-                price = self.f_small.render(f"${prop.price}", True,
-                                            contrast_text(stripe))
-                self.screen.blit(
-                    price, price.get_rect(topright=(card.right - 6, card.y)))
-                if prop in target_set:
-                    pygame.draw.rect(self.screen, ACCENT, card, 3,
-                                     border_radius=6)
-                    self._text("in trade", (card.x + 8, card.bottom - 20),
-                               self.f_small, ACCENT)
-                elif not self.game.can_trade_property(prop):
-                    self._text("has houses", (card.x + 8, card.bottom - 20),
-                               self.f_small, MUTED)
+                self._draw_mini_card(card, prop, selected=prop in target_set)
                 hot.append((card, prop))
             if max_scroll:
                 hint = f"scroll for more  ·  {scroll + 1}/{max_scroll + 1}"
