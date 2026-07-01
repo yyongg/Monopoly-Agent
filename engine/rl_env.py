@@ -162,6 +162,14 @@ class MonopolyEnv(_GymEnv):
     # encouraged while the terminal -1 still punishes reckless over-buying.
     ACQUISITION_PREMIUM = 0.5
 
+    # Extra shaped value for *completing a monopoly*, as a multiple of the
+    # group's total list price. A full set unlocks houses and multiplied rent,
+    # so it is worth far more than its individual tiles: completing one gives a
+    # large net-worth jump (bonus * group price / 1000 reward), which teaches
+    # the agent to finish sets -- and makes mortgaging a spare property to
+    # afford the set-completing tile clearly worth the ~10% mortgage interest.
+    MONOPOLY_BONUS = 1.0
+
     def __init__(self, seat=None, num_players=4, names=None, max_turns=1000,
                  reward_mode="shaped", seed=None, opponent_policy=None,
                  opponent_provider=None):
@@ -316,16 +324,36 @@ class MonopolyEnv(_GymEnv):
                 if s != self.seat:
                     self._deciders[s] = self._make_policy_decider(s)
         for s, decide in self._deciders.items():
-            self.game.players[s].decide_purchase = self._make_buy_hook(decide)
+            self.game.players[s].decide_purchase = self._make_buy_hook(s, decide)
 
     def _make_policy_decider(self, seat):
         """Returns a decider bound to ``seat`` that calls the opponent policy."""
         return lambda phase, prop=None, amount=0: self._policy_decide(
             seat, phase, prop, amount)
 
-    def _make_buy_hook(self, decide):
-        """Returns a ``decide_purchase(prop)`` hook routed through ``decide``."""
-        return lambda prop: decide(PHASE_BUY, prop) == A_BUY
+    def _make_buy_hook(self, seat, decide):
+        """Returns a ``decide_purchase(prop)`` hook routed through ``decide``.
+
+        If the decider chooses to buy but is short on cash, it runs a
+        liquidation sub-phase (mortgage / sell) to reach the price before the
+        engine finalizes the purchase -- this is how the agent affords a
+        set-completing tile. It declines if it cannot or will not cover it.
+        """
+        player = self.game.players[seat]
+
+        def hook(prop):
+            if decide(PHASE_BUY, prop) != A_BUY:
+                return False
+            while player.balance < prop.price:
+                if not self._has_liquidation_options(player):
+                    return False
+                action = decide(PHASE_LIQUIDATE, prop, prop.price)
+                if action == A_END_MANAGE:
+                    return False
+                self._apply_manage_action(player, action)
+            return True
+
+        return hook
 
     # -- Game construction --------------------------------------------------
     def _build_game(self):
@@ -350,6 +378,23 @@ class MonopolyEnv(_GymEnv):
             if isinstance(t, (StreetProperty, Railroad, Utility))
         ]
         self._prop_index = {id(p): i for i, p in enumerate(self.ownable)}
+        # Monopoly groups (each street colour, all railroads, all utilities),
+        # precomputed once for the completed-set reward bonus.
+        self._groups = self._build_groups(self.ownable)
+
+    @staticmethod
+    def _build_groups(ownable):
+        """Groups ownable tiles into the sets that form a monopoly."""
+        groups = {}
+        for t in ownable:
+            if isinstance(t, StreetProperty):
+                key = ("street", t.color)
+            elif isinstance(t, Railroad):
+                key = ("railroad", None)
+            else:
+                key = ("utility", None)
+            groups.setdefault(key, []).append(t)
+        return list(groups.values())
 
     def _make_roll_dice(self, game):
         """Returns a ``roll_dice`` bound to this env's private RNG."""
@@ -542,6 +587,24 @@ class MonopolyEnv(_GymEnv):
                 return True
         return False
 
+    def _raisable_cash(self, player):
+        """Cash ``player`` could raise beyond its balance by selling every
+        house and mortgaging every property -- an upper bound used to decide
+        whether a not-yet-affordable purchase is within reach."""
+        total = 0
+        for prop in player.properties:
+            if prop.mortgaged:
+                continue
+            total += prop.mortgage_value
+            if isinstance(prop, StreetProperty):
+                total += prop.houses * (prop.house_cost() // 2)
+        return total
+
+    def _can_afford(self, player, price):
+        """Whether ``player`` can pay ``price`` now or after liquidating."""
+        return (player.balance >= price
+                or player.balance + self._raisable_cash(player) >= price)
+
     # -- Legal-action masks -------------------------------------------------
     def _legal_mask(self, phase, prop, seat):
         mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
@@ -558,7 +621,10 @@ class MonopolyEnv(_GymEnv):
 
         if phase == PHASE_BUY:
             mask[A_DECLINE] = 1
-            if prop is not None and player.balance >= prop.price:
+            # Offer BUY whenever the price is reachable -- either in cash now or
+            # by mortgaging / selling first (the buy hook runs that liquidation
+            # before finalizing), so the agent can afford a set-completing tile.
+            if prop is not None and self._can_afford(player, prop.price):
                 mask[A_BUY] = 1
             return mask
 
@@ -569,7 +635,10 @@ class MonopolyEnv(_GymEnv):
             if isinstance(p, StreetProperty):
                 if phase == PHASE_MANAGE and p.can_build_house(g, player):
                     mask[A_BUILD + i] = 1
-                if p.can_sell_house(g, player):
+                # Selling houses is only offered during forced LIQUIDATE, for
+                # the same reason as mortgaging: allowing it during voluntary
+                # MANAGE let the agent sell<->rebuild houses on a monopoly.
+                if phase == PHASE_LIQUIDATE and p.can_sell_house(g, player):
                     mask[A_SELL + i] = 1
             # Mortgaging is only offered during forced LIQUIDATE (raising cash
             # the player actually needs). Allowing it during voluntary MANAGE
@@ -673,7 +742,23 @@ class MonopolyEnv(_GymEnv):
             total += (prop.price - prop.unmortgage_cost) if prop.mortgaged \
                 else prop.price * (1.0 + self.ACQUISITION_PREMIUM)
             if isinstance(prop, StreetProperty):
-                total += prop.houses * (prop.house_cost() // 2)
+                # Value houses above cost (same premium as properties): they
+                # multiply rent, so *building* should be a small net gain, not
+                # the net-worth loss that valuing them at half-cost produced --
+                # which would teach the agent never to build.
+                total += (prop.houses * prop.house_cost()
+                          * (1.0 + self.ACQUISITION_PREMIUM))
+        # Reward holding *complete* sets: each fully-owned group adds a bonus,
+        # so the tile that finishes a monopoly is a big net-worth jump.
+        total += self.MONOPOLY_BONUS * self._owned_monopoly_value(player)
+        return total
+
+    def _owned_monopoly_value(self, player):
+        """Total list price of the monopoly groups ``player`` fully owns."""
+        total = 0.0
+        for tiles in self._groups:
+            if all(t.owner is player for t in tiles):
+                total += sum(t.price for t in tiles)
         return total
 
     def _reward(self, terminal):

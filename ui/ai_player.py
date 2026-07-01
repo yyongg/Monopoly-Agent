@@ -64,15 +64,26 @@ class GUIAIDecider:
         return "roll"
 
     def purchase_decision(self, player, prop):
-        """Returns True to buy ``prop``, False to decline."""
+        """Returns True to buy ``prop``, False to decline.
+
+        If the model chooses to buy but is short on cash (e.g. to complete a
+        set), it first mortgages / sells to reach the price; it declines if it
+        can't raise enough.
+        """
         seat = self.game.players.index(player)
         action = self._decide(seat, PHASE_BUY, prop)
-        bought = action == A_BUY
-        if bought:
-            self.log(f"{player.name} [AI] bought {prop.name} for ${prop.price}.")
-        else:
+        if action != A_BUY:
             self.log(f"{player.name} [AI] declined {prop.name}.")
-        return bought
+            return False
+        if player.balance < prop.price:
+            self.log(f"{player.name} [AI] is raising cash to buy {prop.name}.")
+            self.liquidate_loop(player, prop.price)
+            if player.balance < prop.price:
+                self.log(f"{player.name} [AI] couldn't raise enough for "
+                         f"{prop.name}; declined.")
+                return False
+        self.log(f"{player.name} [AI] bought {prop.name} for ${prop.price}.")
+        return True
 
     def manage_loop(self, player):
         """Issues management actions until the model chooses END_MANAGE."""
@@ -157,7 +168,10 @@ class GUIAIDecider:
 
         if phase == PHASE_BUY:
             mask[A_DECLINE] = 1
-            if prop is not None and player.balance >= prop.price:
+            # Offer BUY whenever the price is reachable now or after mortgaging
+            # / selling (purchase_decision runs that liquidation first), so the
+            # AI can afford a set-completing tile.
+            if prop is not None and self._can_afford(player, prop.price):
                 mask[A_BUY] = 1
             return mask
 
@@ -305,6 +319,23 @@ class GUIAIDecider:
             if prop.can_mortgage(g, player):
                 return True
         return False
+
+    def _raisable_cash(self, player):
+        """Cash ``player`` could raise beyond its balance by selling every
+        house and mortgaging every property (an upper bound)."""
+        total = 0
+        for prop in player.properties:
+            if prop.mortgaged:
+                continue
+            total += prop.mortgage_value
+            if isinstance(prop, StreetProperty):
+                total += prop.houses * (prop.house_cost() // 2)
+        return total
+
+    def _can_afford(self, player, price):
+        """Whether ``player`` can pay ``price`` now or after liquidating."""
+        return (player.balance >= price
+                or player.balance + self._raisable_cash(player) >= price)
 
 
 def _safe_default(phase):
