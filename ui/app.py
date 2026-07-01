@@ -972,12 +972,26 @@ class MonopolyApp:
         self._draw_title_deed(card, prop)
         bw, gap = 168, 16
         by = card.bottom + 22
-        buy = self._draw_dialog_button(f"Buy  ${prop.price}",
-                                       board_cx - bw - gap // 2, by, bw, mouse,
-                                       POS_GREEN)
+        if player.balance >= prop.price:
+            buy = self._draw_dialog_button(f"Buy  ${prop.price}",
+                                           board_cx - bw - gap // 2, by, bw,
+                                           mouse, POS_GREEN)
+            auc = self._draw_dialog_button("Auction", board_cx + gap // 2, by,
+                                           bw, mouse, NEG_RED)
+            return [(buy, "buy"), (auc, "decline")]
+        # Short on cash: don't auto-auction -- offer to raise cash by
+        # mortgaging / selling houses, or send the property to auction.
+        short = prop.price - player.balance
+        note = self.f_small.render(f"Short ${short} — raise cash to buy", True,
+                                   NEG_RED)
+        self.screen.blit(note, note.get_rect(midtop=(board_cx, by)))
+        by += 26
+        raise_btn = self._draw_dialog_button("Raise Cash",
+                                             board_cx - bw - gap // 2, by, bw,
+                                             mouse, POS_GREEN)
         auc = self._draw_dialog_button("Auction", board_cx + gap // 2, by, bw,
                                        mouse, NEG_RED)
-        return [(buy, "buy"), (auc, "decline")]
+        return [(raise_btn, "raise"), (auc, "decline")]
 
     # ----- trade offer (accept / reject) ---------------------------------
 
@@ -1287,30 +1301,37 @@ class MonopolyApp:
     # ----- decisions -----------------------------------------------------
 
     def _prompt_purchase(self, player, prop):
-        if player.balance < prop.price:
-            self.add_log(f"{player.name} can't afford {prop.name}.")
-            return False
         if self._auto is not None:
+            if player.balance < prop.price:
+                return False
             choice = self._auto(f"{player.name}: buy {prop.name}?",
                                 [("Buy", "buy"), ("Auction", "decline")])
             return choice == "buy"
         # A Monopoly-style title-deed card over the board with green Buy / red
-        # Auction buttons; declining sends the property to auction (engine side).
-        choice = self._run_overlay_modal(
-            lambda mouse: self._draw_purchase_card(player, prop, mouse))
-        bought = choice == "buy"
-        self.add_log(f"{player.name} {'bought' if bought else 'sent to auction'}"
-                     f" {prop.name}.")
-        return bought
+        # Auction buttons. If the human can't afford the price we don't auto-
+        # auction: a "Raise Cash" button opens the manage panel so they can
+        # mortgage / sell houses and then buy. Declining sends it to auction.
+        while True:
+            choice = self._run_overlay_modal(
+                lambda mouse: self._draw_purchase_card(player, prop, mouse))
+            if choice == "raise":
+                self._manage_menu_cards(player)
+                continue
+            bought = choice == "buy" and player.balance >= prop.price
+            self.add_log(
+                f"{player.name} {'bought' if bought else 'sent to auction'}"
+                f" {prop.name}.")
+            return bought
 
     def _prompt_bid(self, player, prop, min_bid=0):
         """Asks a human for one round of an ascending auction on ``prop``.
 
         Called each round by ``Game.run_auction``: ``min_bid`` is the smallest
         bid that beats the current standing bid. Shows the property's title-deed
-        card with a green "Bid $min_bid" and a red "Pass"; returns ``min_bid`` to
-        raise or 0 to drop out. The engine keeps calling this as the price climbs
-        until the human passes or wins, so tied bids keep escalating.
+        card with several green bid amounts (the minimum, larger jumps, and an
+        all-in) plus a red "Pass"; returns the chosen amount to raise or 0 to
+        drop out. The engine keeps calling this as the price climbs until the
+        human passes or wins, so tied bids keep escalating.
         """
         if self._auto is not None:
             return 0
@@ -1318,14 +1339,29 @@ class MonopolyApp:
             min_bid = max(1, round(prop.price * 0.1))
         if player.balance < min_bid:
             return 0
+        options = self._bid_options(player, prop, min_bid)
         choice = self._run_overlay_modal(
-            lambda mouse: self._draw_auction_card(player, prop, min_bid, mouse))
-        bid = min_bid if choice == "bid" else 0
+            lambda mouse: self._draw_auction_card(player, prop, min_bid,
+                                                  options, mouse))
+        bid = int(choice) if isinstance(choice, int) else 0
         if bid > 0:
             self.add_log(f"{player.name} bids ${bid} for {prop.name}.")
         return bid
 
-    def _draw_auction_card(self, player, prop, min_bid, mouse):
+    def _bid_options(self, player, prop, min_bid):
+        """Distinct affordable bid amounts to offer the human this round:
+        the minimum raise, a couple of larger jumps, and an all-in. Always at
+        least ``[min_bid]`` (the caller guarantees it's affordable)."""
+        increment = max(1, round(prop.price * 0.1))
+        options = []
+        for amt in (min_bid, min_bid + increment, min_bid + 3 * increment):
+            if amt <= player.balance and amt not in options:
+                options.append(amt)
+        if player.balance > options[-1]:
+            options.append(player.balance)  # all-in
+        return options
+
+    def _draw_auction_card(self, player, prop, min_bid, options, mouse):
         self._dim_scene()
         board_cx = BOARD_X + BOARD_PX // 2
         board_cy = BOARD_Y + BOARD_PX // 2
@@ -1340,14 +1376,23 @@ class MonopolyApp:
             f"${player.balance}", True, FELT_SUB)
         self.screen.blit(sub, sub.get_rect(midbottom=(board_cx, card.y - 8)))
         self._draw_title_deed(card, prop)
-        bw, gap = 168, 16
+        # One button per bid amount plus Pass, laid out in a single row that
+        # spans the board width so 2-5 choices all fit.
+        buttons = []
+        nbtn = len(options) + 1
+        gap = 12
+        avail = min(BOARD_PX - 48, nbtn * 160)
+        bw = (avail - (nbtn - 1) * gap) // nbtn
+        x = board_cx - avail // 2
         by = card.bottom + 22
-        bid = self._draw_dialog_button(f"Bid  ${min_bid}",
-                                       board_cx - bw - gap // 2, by, bw, mouse,
-                                       POS_GREEN)
-        skip = self._draw_dialog_button("Pass", board_cx + gap // 2, by, bw,
-                                        mouse, NEG_RED)
-        return [(bid, "bid"), (skip, "pass")]
+        for amt in options:
+            label = f"All in ${amt}" if amt >= player.balance else f"Bid ${amt}"
+            r = self._draw_dialog_button(label, x, by, bw, mouse, POS_GREEN)
+            buttons.append((r, amt))
+            x += bw + gap
+        skip = self._draw_dialog_button("Pass", x, by, bw, mouse, NEG_RED)
+        buttons.append((skip, "pass"))
+        return buttons
 
     def _ai_trade_arbiter(self, initiator, partner, give, receive, cash):
         """Resolves a trade an AI seat proposes to ``partner``.
