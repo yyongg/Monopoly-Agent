@@ -167,7 +167,10 @@ class GUIAIDecider:
             if isinstance(p, StreetProperty):
                 if phase == PHASE_MANAGE and p.can_build_house(g, player):
                     mask[A_BUILD + i] = 1
-                if p.can_sell_house(g, player):
+                # Selling houses is only offered during forced LIQUIDATE, for
+                # the same reason as mortgaging: allowing it during voluntary
+                # MANAGE let the AI sell<->rebuild houses on a monopoly.
+                if phase == PHASE_LIQUIDATE and p.can_sell_house(g, player):
                     mask[A_SELL + i] = 1
             # Mortgaging is only offered during forced LIQUIDATE (raising cash
             # the player actually needs). Allowing it during voluntary MANAGE
