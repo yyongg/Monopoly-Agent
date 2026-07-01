@@ -1509,6 +1509,13 @@ class MonopolyApp:
         # AI turns don't block on event acknowledgements; the log records them.
         if self._current_is_ai():
             return
+        # Routine, high-frequency events the player is already watching -- the
+        # GO salary and live auction bids -- are logged but never force a
+        # "Continue" click.
+        m = message.lower()
+        if ("passed go" in m or "auction" in m or " bids $" in m
+                or "no one bid" in m):
+            return
         self.ask(message, [("Continue", "ok")])
 
     def _buildable(self, player):
