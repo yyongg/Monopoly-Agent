@@ -138,7 +138,9 @@ class MonopolyEnv(_GymEnv):
         max_turns (int): Turn cap after which an episode is truncated, so two
             survivors who never bankrupt each other still terminate.
         reward_mode (str): ``"shaped"`` (net-worth change each decision plus a
-            terminal win/loss bonus) or ``"sparse"`` (only the terminal +1/-1).
+            decisive terminal outcome) or ``"sparse"`` (only the terminal
+            outcome). The terminal outcome is win/loss by net-worth rank so that
+            turn-cap timeouts are still decisive -- see :meth:`_terminal_reward`.
         seed (int | None): Seed for the dice RNG (also settable via ``reset``).
         opponent_policy (callable | None): A fixed opponent policy
             ``(observation, action_mask_bool) -> action_index`` used to drive
@@ -761,6 +763,43 @@ class MonopolyEnv(_GymEnv):
                 total += sum(t.price for t in tiles)
         return total
 
+    def _decisive_winner(self):
+        """The winner even when no one was bankrupted (a turn-cap timeout).
+
+        A real end has a sole survivor; on a timeout with several survivors the
+        richest (by shaped net worth) is declared the winner. This makes every
+        episode conclusive -- without trading and with the GO salary, games
+        often reach the turn cap with everyone still solvent, which otherwise
+        leaves the agent with no win/loss signal on those games.
+        """
+        survivors = self.game.active_players()
+        if not survivors:
+            return None
+        if len(survivors) == 1:
+            return survivors[0]
+        return max(survivors, key=self._net_worth)
+
+    def _terminal_reward(self):
+        """Decisive end-of-game reward in ``[-1, +1]``.
+
+        Bankruptcy is the worst outcome (-1); a sole survivor wins outright
+        (+1). On a timeout the agent is ranked among the surviving players by
+        net worth and mapped linearly to ``[-1, +1]`` (leader +1, worst survivor
+        -1), so being ahead at the cap is rewarded and every game is decisive.
+        Ties in net worth count as neither ahead nor behind.
+        """
+        controlled = self.game.players[self.seat]
+        if controlled.bankrupt:
+            return -1.0
+        survivors = self.game.active_players()
+        if len(survivors) <= 1:
+            return 1.0  # sole survivor: outright win
+        my_nw = self._net_worth(controlled)
+        others = [p for p in survivors if p is not controlled]
+        beat = sum(self._net_worth(p) < my_nw for p in others)
+        lost = sum(self._net_worth(p) > my_nw for p in others)
+        return (beat - lost) / (len(survivors) - 1)
+
     def _reward(self, terminal):
         controlled = self.game.players[self.seat]
         reward = 0.0
@@ -769,10 +808,7 @@ class MonopolyEnv(_GymEnv):
             reward += (nw - self._prev_networth) / 1000.0
             self._prev_networth = nw
         if terminal:
-            if self.game.winner() is controlled:
-                reward += 1.0
-            elif controlled.bankrupt:
-                reward -= 1.0
+            reward += self._terminal_reward()
         return reward
 
     def _info(self, terminal=False):
@@ -783,9 +819,10 @@ class MonopolyEnv(_GymEnv):
             "illegal": getattr(self, "_illegal", False),
         }
         if terminal:
-            winner = self.game.winner()
+            winner = self._decisive_winner()
             info["winner"] = winner.name if winner is not None else None
             info["won"] = winner is self.game.players[self.seat]
+            info["timeout"] = self._truncated
         return info
 
     # -- Teardown -----------------------------------------------------------

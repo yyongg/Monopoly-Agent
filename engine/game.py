@@ -210,6 +210,12 @@ class Game:
             prop.transfer_ownership(initiator)
         return True
 
+    def award_go(self, player):
+        """Pays ``player`` the GO salary and announces it."""
+        player.balance += self.go_salary
+        self.announce(
+            f"{player.name} passed GO and collected ${self.go_salary}.")
+
     def advance_to(self, player, dest):
         """
         Moves the player forward to absolute position `dest`, paying the GO
@@ -217,9 +223,7 @@ class Game:
         """
         # A destination behind the current square means GO was passed.
         if dest < player.pos:
-            player.balance += self.go_salary
-            self.announce(
-                f"{player.name} passed GO and collected ${self.go_salary}.")
+            self.award_go(player)
         player.pos = dest
         self.resolve_tile(player)
 
@@ -258,7 +262,8 @@ class Game:
                 return die1, die2, True, True
 
         self.roll = die1 + die2
-        player.move(self.roll)
+        if player.move(self.roll):
+            self.award_go(player)
         return die1, die2, is_double, False
 
     def pay(self, payer, amount, payee=None):
@@ -379,7 +384,8 @@ class Game:
             player.in_jail = False
             player.jail_turns = 0
             self.roll = sum(roll)
-            player.move(self.roll)
+            if player.move(self.roll):
+                self.award_go(player)
             return "moved"
 
         player.jail_turns += 1

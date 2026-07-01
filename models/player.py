@@ -44,5 +44,11 @@ class Player:
         Args:
             steps (int): Number of steps forward the player will take. Take mod of
             board length to account for circular board.
+
+        Returns:
+            bool: True if the move passed (or landed on) GO, so the caller can
+            award the GO salary. Backward moves never count as passing GO.
         """
-        self.pos = (self.pos + steps) % 40
+        new_pos = self.pos + steps
+        self.pos = new_pos % 40
+        return steps > 0 and new_pos >= 40
