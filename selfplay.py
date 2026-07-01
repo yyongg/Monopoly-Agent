@@ -58,11 +58,15 @@ class OpponentPool:
     """
 
     def __init__(self, pool_dir, baseline_prob=0.2, cache_size=8,
-                 deterministic=False, seed=None):
+                 deterministic=False, seed=None, expected_obs_shape=None):
         self.pool_dir = pool_dir
         self.baseline_prob = baseline_prob
         self.cache_size = cache_size
         self.deterministic = deterministic
+        # Snapshots trained against an older obs/action space would crash at
+        # predict time; skip any whose observation space doesn't match.
+        self.expected_obs_shape = (tuple(expected_obs_shape)
+                                   if expected_obs_shape is not None else None)
         self._rng = random.Random(seed)
         self._cache = OrderedDict()
 
@@ -92,6 +96,13 @@ class OpponentPool:
             model = MaskablePPO.load(path, device="cpu")
         except Exception:
             return None
+        if (self.expected_obs_shape is not None
+                and tuple(model.observation_space.shape)
+                != self.expected_obs_shape):
+            # Stale snapshot from an older obs space: cache the rejection (as
+            # None) so we don't reload it every episode, and fall back to
+            # baseline this time.
+            model = None
         self._cache[path] = model
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
@@ -142,10 +153,17 @@ def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
     """Returns a picklable factory for one self-play ``MonopolyEnv`` worker."""
 
     def _init():
+        env = MonopolyEnv(seat=seat, reward_mode=reward_mode,
+                          max_turns=max_turns, seed=seed + rank)
+        # Small per-worker cache: with many parallel envs the opponent models
+        # are the dominant memory cost, so keep only a couple resident (they're
+        # cheap to reload from disk) to stay well under tight memory caps.
         pool = OpponentPool(pool_dir, baseline_prob=baseline_prob,
-                            deterministic=opp_deterministic, seed=seed + rank)
-        return MonopolyEnv(seat=seat, reward_mode=reward_mode,
-                           max_turns=max_turns, seed=seed + rank,
-                           opponent_provider=pool)
+                            deterministic=opp_deterministic, seed=seed + rank,
+                            cache_size=2,
+                            expected_obs_shape=env.observation_space.shape)
+        # Read at each reset (see MonopolyEnv.reset); safe to set post-init.
+        env._opponent_provider = pool
+        return env
 
     return _init

@@ -110,8 +110,51 @@ class Game:
             bool: True if the property was bought, False otherwise.
         """
         if player.decide_purchase(prop):
-            return prop.buy(player)
-        return False
+            if prop.buy(player):
+                return True
+        # Not bought (declined, or unaffordable): the property goes to auction
+        # among all remaining players, starting to the left of the one offered.
+        self.run_auction(prop, self.players.index(player))
+        return prop.owner is not None
+
+    def run_auction(self, prop, start_index):
+        """
+        Auctions an unbought property to the highest bidder.
+
+        Each still-in-game player (including the one who declined) submits a
+        sealed bid via their ``decide_bid`` hook; the highest bid wins and its
+        owner pays the bank that amount. Bids are clamped to the bidder's cash,
+        and the first bidder in turn order wins any tie. A property nobody bids
+        on simply stays with the bank.
+
+        Args:
+            prop (type[Property]): The unowned property being auctioned.
+            start_index (int): Seat to begin bidding from (bidding proceeds in
+                seat order from here, so this seat wins ties).
+
+        Returns:
+            Player | None: The winning bidder, or None if nobody bid.
+        """
+        n = len(self.players)
+        best_bid = 0
+        best_bidder = None
+        for offset in range(n):
+            player = self.players[(start_index + offset) % n]
+            if player.bankrupt:
+                continue
+            bid = max(0, min(int(player.decide_bid(prop)), player.balance))
+            if bid > best_bid:
+                best_bid = bid
+                best_bidder = player
+
+        if best_bidder is None:
+            return None
+
+        best_bidder.balance -= best_bid
+        prop.transfer_ownership(best_bidder)
+        self.announce(
+            f"{best_bidder.name} won the auction for {prop.name} at ${best_bid}.")
+        return best_bidder
 
     def build_house(self, prop, player):
         """

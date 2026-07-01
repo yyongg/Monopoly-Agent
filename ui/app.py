@@ -354,16 +354,21 @@ class MonopolyApp:
         for ai in self._ai_deciders.values():
             ai.bind(game, ownable)
             ai.log = self.add_log  # so AI moves show up in the game log
+            ai.trade_arbiter = self._ai_trade_arbiter  # resolve AI-proposed trades
 
-        # Wire per-player purchase hooks.
+        # Wire per-player purchase and auction-bid hooks.
         for player in game.players:
             if player.name in self._ai_deciders:
                 ai = self._ai_deciders[player.name]
                 player.decide_purchase = (
                     lambda prop, _ai=ai, _p=player: _ai.purchase_decision(_p, prop))
+                player.decide_bid = (
+                    lambda prop, _ai=ai, _p=player: _ai.bid_choice(_p, prop))
             else:
                 player.decide_purchase = (
                     lambda prop, _p=player: self._prompt_purchase(_p, prop))
+                player.decide_bid = (
+                    lambda prop, _p=player: self._prompt_bid(_p, prop))
 
         game.on_card = self._show_card
         game.notify = self._inform
@@ -1016,6 +1021,52 @@ class MonopolyApp:
         self.add_log(f"{player.name} {'bought' if bought else 'declined'} "
                      f"{prop.name}.")
         return bought
+
+    def _prompt_bid(self, player, prop):
+        """Asks a human for a sealed auction bid on ``prop`` (0 = pass).
+
+        Called by ``Game.run_auction`` for each human when a property is left
+        unbought. Offers a few price-multiple bid buttons (capped at the
+        player's cash) plus Pass, mirroring the discrete buckets the AI uses.
+        """
+        if self._auto is not None:
+            return 0
+        options, seen = [], set()
+        for frac in (0.5, 1.0, 1.5):
+            amount = int(round(frac * prop.price))
+            if 0 < amount <= player.balance and amount not in seen:
+                seen.add(amount)
+                options.append((f"Bid ${amount}", amount))
+        options.append(("Pass", 0))
+        choice = self.ask(
+            f"Auction — {prop.name} (list ${prop.price}). {player.name}, "
+            f"your sealed bid? (Balance ${player.balance})", options)
+        bid = int(choice)
+        if bid > 0:
+            self.add_log(f"{player.name} bid ${bid} for {prop.name}.")
+        return bid
+
+    def _ai_trade_arbiter(self, initiator, partner, give, receive, cash):
+        """Resolves a trade an AI seat proposes to ``partner``.
+
+        ``give`` / ``receive`` are from the initiator's view: it hands over
+        ``give`` (plus ``cash``) and receives ``receive``. A human partner is
+        asked with a modal; an AI partner judges with its valuation formula.
+        Returns True to accept.
+        """
+        if self._is_ai(partner):
+            accepted, _ = self._ai_deciders[partner.name].evaluate_trade(
+                partner, initiator, give, receive, cash)
+            return accepted
+        if self._auto is not None:
+            return False
+        gnames = ", ".join(t.name for t in give) or "nothing"
+        rnames = ", ".join(t.name for t in receive) or "nothing"
+        cash_txt = f" and ${cash}" if cash > 0 else ""
+        answer = self.ask(
+            f"{initiator.name} [AI] offers you {gnames}{cash_txt} for {rnames}. "
+            f"Accept?", [("Accept", "yes"), ("Decline", "no")])
+        return answer == "yes"
 
     def _show_card(self, pile, card):
         self.add_log(f"{pile}: {card.text}")

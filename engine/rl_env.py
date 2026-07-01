@@ -31,7 +31,7 @@ blocks; ``step`` consumes it, reads state while the worker is blocked, then
 unblocks the worker) means only one thread ever touches game state at a time, so
 no locking is required.
 
-Action space (``Discrete(146)``)
+Action space (``Discrete(154)``)
 --------------------------------
 A single flat action id, interpreted against the per-step ``action_mask`` in
 ``info`` (and :meth:`MonopolyEnv.legal_actions`). Property-targeted actions are
@@ -41,17 +41,20 @@ indexed by the 28 ownable tiles in board order::
     1  USE_JAIL_CARD     spend a Get Out of Jail Free card
     2  ROLL_JAIL         roll for doubles to leave jail
     3  BUY               buy the property just landed on
-    4  DECLINE           decline the offered property
+    4  DECLINE           decline the offered property (it then goes to auction)
     5  END_MANAGE        finish managing / stop liquidating
     6  +i  BUILD i       build a house/hotel on ownable tile i
     34 +i  SELL i        sell a house/hotel from tile i
     62 +i  MORTGAGE i    mortgage tile i
     90 +i  UNMORTGAGE i  lift the mortgage on tile i
-    118+i  TRADE i       (disabled) the agent does not trade -- these actions
-                         are never legal, so the agent never initiates a trade.
-                         The slots are retained only to keep the action-space
-                         size (and thus the policy head) stable; trade decisions
-                         in the GUI are handled by a separate valuation formula.
+    118+i  TRADE i       propose to acquire ownable tile i from its owner (only
+                         legal when acquiring i completes a monopoly for the
+                         agent); the engine builds the balancing give + cash
+                         offer and the partner accepts/rejects it.
+    146    TRADE_ACCEPT  accept a trade another player has offered me
+    147    TRADE_REJECT  reject a trade another player has offered me
+    148    AUCTION_PASS  bid nothing in the current auction
+    149+k  AUCTION_BID k bid BID_FRACTIONS[k] * price for the auctioned property
 
 Illegal actions (those not set in the mask) are clamped to a safe default rather
 than raising, and reported via ``info["illegal"]``.
@@ -102,7 +105,9 @@ PHASE_BUY = 1
 PHASE_MANAGE = 2
 PHASE_LIQUIDATE = 3
 PHASE_TERMINAL = 4
-NUM_PHASES = 5
+PHASE_AUCTION = 5        # submit a sealed bid for a property up for auction
+PHASE_TRADE_RESPOND = 6  # accept or reject a trade offered by another player
+NUM_PHASES = 7
 
 # --- Action layout ---------------------------------------------------------
 A_PAY_JAIL = 0
@@ -115,9 +120,19 @@ A_BUILD = 6          # A_BUILD + i, for ownable tile i (0..27)
 A_SELL = 34          # A_SELL + i
 A_MORTGAGE = 62      # A_MORTGAGE + i
 A_UNMORTGAGE = 90    # A_UNMORTGAGE + i
-A_TRADE = 118        # A_TRADE + i
+A_TRADE = 118        # A_TRADE + i: propose to acquire ownable tile i by trade
 NUM_OWNABLE = 28
-NUM_ACTIONS = A_TRADE + NUM_OWNABLE  # 146
+A_TRADE_ACCEPT = 146     # accept a trade offered to me (PHASE_TRADE_RESPOND)
+A_TRADE_REJECT = 147     # reject a trade offered to me
+A_AUCTION_PASS = 148     # bid nothing in the current auction
+A_AUCTION_BID = 149      # A_AUCTION_BID + k: bid BID_FRACTIONS[k] * price
+NUM_BID_LEVELS = 5
+# Sealed-bid buckets as a multiple of the property's list price. Capped at
+# 1.5x so that winning is never a net-worth loss under ACQUISITION_PREMIUM=0.5
+# (a property is booked at price * 1.5), while still letting the agent learn a
+# context-dependent valuation by choosing how high to bid.
+BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5]
+NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 154
 
 # Sentinels passed between the worker thread and the env.
 _TERMINAL = "__terminal__"
@@ -207,7 +222,8 @@ class MonopolyEnv(_GymEnv):
         self.action_space = Discrete(NUM_ACTIONS)
         obs_len = (5 * num_players
                    + NUM_OWNABLE * (num_players + 3)
-                   + NUM_PHASES + 1)
+                   + NUM_PHASES + 1
+                   + 3)  # trade context: received tile, given tile, net cash
         self.observation_space = Box(
             low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
@@ -221,8 +237,10 @@ class MonopolyEnv(_GymEnv):
         self._rng = random.Random()  # per-env RNG for dice and deck order
         self._cur_phase = PHASE_TERMINAL
         self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        self._cur_prop = None      # property offered (BUY) or being liquidated
+        self._cur_prop = None      # property offered (BUY/AUCTION) or liquidated
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
+        self._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
+        self._traded_this_manage = set()  # trade targets tried this MANAGE phase
         self._prev_networth = 0.0
         self._truncated = False
         self.game = None
@@ -327,6 +345,7 @@ class MonopolyEnv(_GymEnv):
                     self._deciders[s] = self._make_policy_decider(s)
         for s, decide in self._deciders.items():
             self.game.players[s].decide_purchase = self._make_buy_hook(s, decide)
+            self.game.players[s].decide_bid = self._make_bid_hook(s, decide)
 
     def _make_policy_decider(self, seat):
         """Returns a decider bound to ``seat`` that calls the opponent policy."""
@@ -357,6 +376,25 @@ class MonopolyEnv(_GymEnv):
 
         return hook
 
+    def _make_bid_hook(self, seat, decide):
+        """Returns a ``decide_bid(prop)`` hook routed through ``decide``.
+
+        The decider picks a sealed-bid bucket for ``prop``; the hook converts it
+        to a dollar amount (a fraction of the list price) and caps it at the
+        bidder's cash. ``A_AUCTION_PASS`` bids nothing.
+        """
+        player = self.game.players[seat]
+
+        def hook(prop):
+            action = decide(PHASE_AUCTION, prop)
+            k = action - A_AUCTION_BID
+            if 0 <= k < NUM_BID_LEVELS:
+                bid = int(round(BID_FRACTIONS[k] * prop.price))
+                return min(bid, player.balance)
+            return 0  # A_AUCTION_PASS or anything unexpected
+
+        return hook
+
     # -- Game construction --------------------------------------------------
     def _build_game(self):
         players = [Player(name) for name in self._names]
@@ -381,8 +419,9 @@ class MonopolyEnv(_GymEnv):
         ]
         self._prop_index = {id(p): i for i, p in enumerate(self.ownable)}
         # Monopoly groups (each street colour, all railroads, all utilities),
-        # precomputed once for the completed-set reward bonus.
+        # precomputed once for the completed-set reward bonus and trade logic.
         self._groups = self._build_groups(self.ownable)
+        self._group_of = {id(t): grp for grp in self._groups for t in grp}
 
     @staticmethod
     def _build_groups(ownable):
@@ -483,6 +522,10 @@ class MonopolyEnv(_GymEnv):
 
     def _manage_phase(self, player, decide):
         """Lets ``player`` issue management actions until it chooses to stop."""
+        # A trade target is offered at most once per MANAGE phase; re-proposing a
+        # rejected trade changes no state, so without this the phase could spin
+        # forever on a repeatedly-declined offer.
+        self._traded_this_manage = set()
         while True:
             action = decide(PHASE_MANAGE)
             if action == A_END_MANAGE:
@@ -558,6 +601,10 @@ class MonopolyEnv(_GymEnv):
             return A_ROLL_JAIL
         if phase == PHASE_BUY:
             return A_DECLINE
+        if phase == PHASE_AUCTION:
+            return A_AUCTION_PASS
+        if phase == PHASE_TRADE_RESPOND:
+            return A_TRADE_REJECT
         return A_END_MANAGE  # MANAGE / LIQUIDATE: do nothing further
 
     # -- Applying actions ---------------------------------------------------
@@ -576,8 +623,10 @@ class MonopolyEnv(_GymEnv):
             g.mortgage_property(self.ownable[action - A_MORTGAGE], player)
         elif A_UNMORTGAGE <= action < A_UNMORTGAGE + NUM_OWNABLE:
             g.unmortgage_property(self.ownable[action - A_UNMORTGAGE], player)
-        # A_TRADE actions are never legal (the agent does not trade), so they
-        # never reach here.
+        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
+            i = action - A_TRADE
+            self._traded_this_manage.add(i)
+            self._attempt_trade(player, self.ownable[i])
 
     def _has_liquidation_options(self, player):
         """Whether ``player`` has any house to sell or property to mortgage."""
@@ -607,6 +656,130 @@ class MonopolyEnv(_GymEnv):
         return (player.balance >= price
                 or player.balance + self._raisable_cash(player) >= price)
 
+    # -- Targeted trading ---------------------------------------------------
+    def _prop_value(self, prop):
+        """List-price value of a property, discounted for an unpaid mortgage.
+
+        Mirrors ``ui/ai_player.GUIAIDecider._property_value`` so headless trades
+        and GUI trades value tiles the same way.
+        """
+        if prop.mortgaged:
+            return float(prop.price - prop.unmortgage_cost)
+        return float(prop.price)
+
+    def _completes_monopoly_for(self, player, target):
+        """Whether acquiring ``target`` would complete a monopoly for ``player``
+        (they already own every other tile in ``target``'s group)."""
+        grp = self._group_of.get(id(target))
+        if grp is None:
+            return False
+        return all(t.owner is player for t in grp if t is not target)
+
+    def _can_propose_trade(self, initiator, target):
+        """Whether ``initiator`` may propose a trade to acquire ``target``.
+
+        Trades are restricted to set-completing acquisitions from a solvent
+        opponent: the tile must be tradeable (no buildings in its group),
+        acquiring it must finish a monopoly for the initiator, and the initiator
+        must have a tile it can hand over in return.
+        """
+        owner = target.owner
+        if owner is None or owner is initiator or owner.bankrupt:
+            return False
+        if not self.game.can_trade_property(target):
+            return False
+        if not self._completes_monopoly_for(initiator, target):
+            return False
+        return self._choose_give_tile(initiator, owner, target) is not None
+
+    def _choose_give_tile(self, initiator, partner, target):
+        """Picks the tile ``initiator`` offers ``partner`` in a trade for
+        ``target`` (or ``None`` if it has nothing suitable to give).
+
+        Prefers parting with a *spare* -- the only tile the initiator owns in its
+        group, so the trade breaks no progress -- and, among spares, one that
+        helps the partner complete a set (likelier to be accepted); otherwise the
+        cheapest tradeable tile outside the target's group.
+        """
+        g = self.game
+        target_group = self._group_of.get(id(target))
+
+        def count(owner, group):
+            return sum(1 for t in group if t.owner is owner)
+
+        tradeable = [p for p in initiator.properties
+                     if g.can_trade_property(p)
+                     and self._group_of.get(id(p)) is not target_group]
+        if not tradeable:
+            return None
+        spares = [p for p in tradeable
+                  if count(initiator, self._group_of[id(p)]) == 1]
+        pool = spares or tradeable
+        helpful = [p for p in pool
+                   if count(partner, self._group_of[id(p)])
+                   == len(self._group_of[id(p)]) - 1]
+        final = helpful or pool
+        return min(final, key=lambda p: p.price)
+
+    def _balancing_cash(self, initiator, partner, give, receive):
+        """Cash the initiator pays the partner to balance a trade.
+
+        The initiator covers the list-value gap (the received tile completes its
+        set, so it is usually worth more than the tile given up) plus a premium
+        for prying loose a set-completing tile. Never negative -- in the T1 model
+        only the initiator pays, so the partner is never asked for cash.
+        """
+        recv_val = sum(self._prop_value(t) for t in receive)
+        give_val = sum(self._prop_value(t) for t in give)
+        grp = self._group_of.get(id(receive[0])) if receive else None
+        set_price = sum(t.price for t in grp) if grp else 0
+        premium = int(round(0.25 * set_price))
+        return max(0, int(round(recv_val - give_val)) + premium)
+
+    def _formula_trade_ok(self, partner, gain, lose, cash):
+        """Baseline partner's accept rule: take the deal if it is non-negative by
+        list value (``cash`` received plus tiles gained minus tiles given up)."""
+        value = float(cash)
+        value += sum(self._prop_value(p) for p in gain)
+        value -= sum(self._prop_value(p) for p in lose)
+        return value >= 0
+
+    def _attempt_trade(self, initiator, target):
+        """Builds and offers a set-completing trade for ``target``.
+
+        The engine constructs the give-tile + balancing cash; the partner's
+        decider (agent via the queue, opponent policy synchronously, or a
+        baseline via :meth:`_formula_trade_ok`) accepts or rejects. On acceptance
+        the swap runs through :meth:`Game.execute_trade`.
+        """
+        g = self.game
+        partner = target.owner
+        if not self._can_propose_trade(initiator, target):
+            return
+        give = self._choose_give_tile(initiator, partner, target)
+        if give is None:
+            return
+        receive = [target]
+        cash = min(self._balancing_cash(initiator, partner, [give], receive),
+                   initiator.balance)
+        if cash < 0:
+            return
+
+        partner_seat = g.players.index(partner)
+        decide = self._deciders.get(partner_seat)
+        if decide is not None:
+            # From the partner's view they receive ``give`` plus ``cash`` and
+            # part with ``target``; expose that as the response observation.
+            self._cur_trade = {"recv": give, "give": target, "cash": cash}
+            action = decide(PHASE_TRADE_RESPOND, target, cash)
+            self._cur_trade = None
+            accept = action == A_TRADE_ACCEPT
+        else:
+            accept = self._formula_trade_ok(partner, [give], receive, cash)
+
+        if accept:
+            g.execute_trade(initiator, partner, [give], receive, cash)
+
     # -- Legal-action masks -------------------------------------------------
     def _legal_mask(self, phase, prop, seat):
         mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
@@ -630,6 +803,21 @@ class MonopolyEnv(_GymEnv):
                 mask[A_BUY] = 1
             return mask
 
+        if phase == PHASE_AUCTION:
+            # Pass is always allowed; a bid bucket is legal when its dollar
+            # amount is covered by cash (auctions are settled in cash only).
+            mask[A_AUCTION_PASS] = 1
+            if prop is not None:
+                for k, frac in enumerate(BID_FRACTIONS):
+                    if player.balance >= int(round(frac * prop.price)):
+                        mask[A_AUCTION_BID + k] = 1
+            return mask
+
+        if phase == PHASE_TRADE_RESPOND:
+            mask[A_TRADE_ACCEPT] = 1
+            mask[A_TRADE_REJECT] = 1
+            return mask
+
         # MANAGE and LIQUIDATE share the property-action masks.
         for i, p in enumerate(self.ownable):
             if p.owner is not player:
@@ -651,7 +839,15 @@ class MonopolyEnv(_GymEnv):
             if phase == PHASE_MANAGE:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
-                # No A_TRADE bit: the agent never initiates trades.
+
+        # Trade proposals target tiles owned by *other* players: offer A_TRADE+i
+        # for each opponent tile whose acquisition would complete a monopoly for
+        # this player (and hasn't already been tried this MANAGE phase).
+        if phase == PHASE_MANAGE:
+            for i, p in enumerate(self.ownable):
+                if i not in self._traded_this_manage \
+                        and self._can_propose_trade(player, p):
+                    mask[A_TRADE + i] = 1
 
         mask[A_END_MANAGE] = 1  # always allowed to stop
         return mask
@@ -712,7 +908,8 @@ class MonopolyEnv(_GymEnv):
             parts.append(1.0 if p.mortgaged else 0.0)
             parts.append(getattr(p, "houses", 0) / 5.0)
 
-        # Phase one-hot and the context property index (BUY/LIQUIDATE), or -1.
+        # Phase one-hot and the context property index (BUY/AUCTION/LIQUIDATE),
+        # or -1 when no single property is in play.
         phase_onehot = [0.0] * NUM_PHASES
         phase_onehot[phase] = 1.0
         parts.extend(phase_onehot)
@@ -720,6 +917,20 @@ class MonopolyEnv(_GymEnv):
             parts.append(self._prop_index[id(prop)] / NUM_OWNABLE)
         else:
             parts.append(-1.0)
+
+        # Trade context (PHASE_TRADE_RESPOND): the tile this player would
+        # receive, the tile it would give up, and the net cash it gets, all from
+        # its own perspective; -1/-1/0 outside a trade response.
+        tc = self._cur_trade
+        if phase == PHASE_TRADE_RESPOND and tc is not None:
+            recv, give = tc["recv"], tc["give"]
+            parts.append(self._prop_index[id(recv)] / NUM_OWNABLE
+                         if recv is not None else -1.0)
+            parts.append(self._prop_index[id(give)] / NUM_OWNABLE
+                         if give is not None else -1.0)
+            parts.append(tc["cash"] / 1500.0)
+        else:
+            parts.extend([-1.0, -1.0, 0.0])
 
         return np.asarray(parts, dtype=np.float32)
 

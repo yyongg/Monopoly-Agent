@@ -16,10 +16,12 @@ import numpy as np
 
 from engine.rl_env import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
-    NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE,
+    PHASE_AUCTION, PHASE_TRADE_RESPOND,
+    NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, BID_FRACTIONS,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
-    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
+    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
+    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
 )
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
@@ -44,12 +46,22 @@ class GUIAIDecider:
         self.game = None
         self.ownable = []
         self._prop_index = {}
+        self._groups = []
+        self._group_of = {}
+        # Trade context for a PHASE_TRADE_RESPOND observation (set transiently
+        # while the model judges an offer), and an optional arbiter the app
+        # provides to resolve trades this AI proposes to other players.
+        self._cur_trade = None
+        self.trade_arbiter = None
+        self._traded_this_manage = set()
 
     def bind(self, game, ownable):
         """Attach to a live game instance. Must be called before any decisions."""
         self.game = game
         self.ownable = ownable
         self._prop_index = {id(p): i for i, p in enumerate(ownable)}
+        self._groups = list(self._ownable_groups().values())
+        self._group_of = {id(t): grp for grp in self._groups for t in grp}
 
     # --- Public decision methods ---
 
@@ -85,9 +97,28 @@ class GUIAIDecider:
         self.log(f"{player.name} [AI] bought {prop.name} for ${prop.price}.")
         return True
 
+    def bid_choice(self, player, prop):
+        """Returns this AI's sealed bid (in dollars) for an auctioned property.
+
+        Mirrors the env's bid hook: the model picks a bucket and it is converted
+        to a fraction of the list price, capped at the player's cash. 0 passes.
+        """
+        seat = self.game.players.index(player)
+        action = self._decide(seat, PHASE_AUCTION, prop)
+        k = action - A_AUCTION_BID
+        if 0 <= k < NUM_BID_LEVELS:
+            bid = min(int(round(BID_FRACTIONS[k] * prop.price)), player.balance)
+            if bid > 0:
+                self.log(f"{player.name} [AI] bids ${bid} for {prop.name}.")
+            return bid
+        return 0
+
     def manage_loop(self, player):
         """Issues management actions until the model chooses END_MANAGE."""
         seat = self.game.players.index(player)
+        # A trade target is proposed at most once per manage pass (re-proposing a
+        # rejected offer changes nothing); mirrors the env's guard.
+        self._traded_this_manage = set()
         for _ in range(50):
             action = self._decide(seat, PHASE_MANAGE)
             if action == A_END_MANAGE:
@@ -151,6 +182,18 @@ class GUIAIDecider:
             parts.append(self._prop_index[id(prop)] / NUM_OWNABLE)
         else:
             parts.append(-1.0)
+        # Trade context (mirrors MonopolyEnv): received tile, given tile, net
+        # cash from the responder's view; neutral outside a trade response.
+        tc = self._cur_trade
+        if phase == PHASE_TRADE_RESPOND and tc is not None:
+            recv, give = tc["recv"], tc["give"]
+            parts.append(self._prop_index[id(recv)] / NUM_OWNABLE
+                         if recv is not None else -1.0)
+            parts.append(self._prop_index[id(give)] / NUM_OWNABLE
+                         if give is not None else -1.0)
+            parts.append(tc["cash"] / 1500.0)
+        else:
+            parts.extend([-1.0, -1.0, 0.0])
         return np.asarray(parts, dtype=np.float32)
 
     def _legal_mask(self, phase, prop, seat):
@@ -175,6 +218,19 @@ class GUIAIDecider:
                 mask[A_BUY] = 1
             return mask
 
+        if phase == PHASE_AUCTION:
+            mask[A_AUCTION_PASS] = 1
+            if prop is not None:
+                for k, frac in enumerate(BID_FRACTIONS):
+                    if player.balance >= int(round(frac * prop.price)):
+                        mask[A_AUCTION_BID + k] = 1
+            return mask
+
+        if phase == PHASE_TRADE_RESPOND:
+            mask[A_TRADE_ACCEPT] = 1
+            mask[A_TRADE_REJECT] = 1
+            return mask
+
         for i, p in enumerate(self.ownable):
             if p.owner is not player:
                 continue
@@ -195,7 +251,14 @@ class GUIAIDecider:
             if phase == PHASE_MANAGE:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
-                # No A_TRADE bit: the AI never initiates trades.
+
+        # Set-completing trade proposals target opponents' tiles (see
+        # _can_propose_trade); offered once each per manage pass.
+        if phase == PHASE_MANAGE:
+            for i, p in enumerate(self.ownable):
+                if i not in self._traded_this_manage \
+                        and self._can_propose_trade(player, p):
+                    mask[A_TRADE + i] = 1
 
         mask[A_END_MANAGE] = 1
         return mask
@@ -222,7 +285,92 @@ class GUIAIDecider:
             if g.unmortgage_property(prop, player):
                 self.log(f"{player.name} [AI] lifted the mortgage on "
                          f"{prop.name} for ${cost}.")
-        # A_TRADE is never legal: the AI does not initiate trades.
+        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
+            i = action - A_TRADE
+            self._traded_this_manage.add(i)
+            self._attempt_trade(player, self.ownable[i])
+
+    # --- Trade initiation (proposing a set-completing trade) ---------------
+
+    def _completes_monopoly_for(self, player, target):
+        """Whether acquiring ``target`` finishes a monopoly for ``player``."""
+        grp = self._group_of.get(id(target))
+        if grp is None:
+            return False
+        return all(t.owner is player for t in grp if t is not target)
+
+    def _can_propose_trade(self, initiator, target):
+        """Whether ``initiator`` may propose a set-completing trade for
+        ``target`` (owned by a solvent opponent, tradeable, and the initiator
+        has a tile to offer). Mirrors ``MonopolyEnv._can_propose_trade``."""
+        owner = target.owner
+        if owner is None or owner is initiator or owner.bankrupt:
+            return False
+        if not self.game.can_trade_property(target):
+            return False
+        if not self._completes_monopoly_for(initiator, target):
+            return False
+        return self._choose_give_tile(initiator, owner, target) is not None
+
+    def _choose_give_tile(self, initiator, partner, target):
+        """Picks the tile ``initiator`` offers for ``target`` (spare first, then
+        one that helps the partner, then cheapest). Mirrors the env."""
+        g = self.game
+        target_group = self._group_of.get(id(target))
+
+        def count(owner, group):
+            return sum(1 for t in group if t.owner is owner)
+
+        tradeable = [p for p in initiator.properties
+                     if g.can_trade_property(p)
+                     and self._group_of.get(id(p)) is not target_group]
+        if not tradeable:
+            return None
+        spares = [p for p in tradeable
+                  if count(initiator, self._group_of[id(p)]) == 1]
+        pool = spares or tradeable
+        helpful = [p for p in pool
+                   if count(partner, self._group_of[id(p)])
+                   == len(self._group_of[id(p)]) - 1]
+        final = helpful or pool
+        return min(final, key=lambda p: p.price)
+
+    def _balancing_cash(self, initiator, partner, give, receive):
+        """Cash the initiator pays to balance the trade (never negative).
+        Mirrors ``MonopolyEnv._balancing_cash``."""
+        recv_val = sum(self._property_value(t) for t in receive)
+        give_val = sum(self._property_value(t) for t in give)
+        grp = self._group_of.get(id(receive[0])) if receive else None
+        set_price = sum(t.price for t in grp) if grp else 0
+        premium = int(round(0.25 * set_price))
+        return max(0, int(round(recv_val - give_val)) + premium)
+
+    def _attempt_trade(self, initiator, target):
+        """Builds a set-completing offer and asks the partner (via the app's
+        arbiter, or the valuation formula when none is set)."""
+        partner = target.owner
+        if not self._can_propose_trade(initiator, target):
+            return
+        give = self._choose_give_tile(initiator, partner, target)
+        if give is None:
+            return
+        receive = [target]
+        cash = min(self._balancing_cash(initiator, partner, [give], receive),
+                   initiator.balance)
+        if cash < 0:
+            return
+        if self.trade_arbiter is not None:
+            accepted = self.trade_arbiter(
+                initiator, partner, [give], receive, cash)
+        else:  # headless fallback: the partner's own valuation formula
+            accepted, _ = self.evaluate_trade(
+                partner, initiator, [give], receive, cash)
+        if not accepted:
+            self.log(f"{partner.name} declined {initiator.name} [AI]'s trade.")
+            return
+        if self.game.execute_trade(initiator, partner, [give], receive, cash):
+            self.log(f"{initiator.name} [AI] traded {give.name} + ${cash} to "
+                     f"{partner.name} for {target.name}.")
 
     # --- Trade evaluation (responding to a human's proposal) ---------------
 
@@ -358,4 +506,8 @@ def _safe_default(phase):
         return A_ROLL_JAIL
     if phase == PHASE_BUY:
         return A_DECLINE
+    if phase == PHASE_AUCTION:
+        return A_AUCTION_PASS
+    if phase == PHASE_TRADE_RESPOND:
+        return A_TRADE_REJECT
     return A_END_MANAGE
