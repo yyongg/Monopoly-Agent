@@ -356,33 +356,60 @@ class Game:
         if payer.balance < amount and self.on_shortfall is not None:
             self.on_shortfall(payer, amount)
 
-        payer.balance -= amount
+        if payer.balance >= amount:
+            payer.balance -= amount
+            if payee is not None:
+                payee.balance += amount
+            return
+
+        # Still short after any liquidation: the payer goes bankrupt. The
+        # creditor (if this debt was owed to another player) takes whatever cash
+        # is left and inherits the payer's assets; a debt to the bank sends the
+        # assets to the bank instead.
         if payee is not None:
-            payee.balance += amount
+            payee.balance += max(0, payer.balance)
+        payer.balance = 0
+        self.declare_bankrupt(payer, creditor=payee)
 
-        if payer.balance < 0:
-            self.declare_bankrupt(payer)
-
-    def declare_bankrupt(self, player):
+    def declare_bankrupt(self, player, creditor=None):
         """
-        Removes a player from play: returns their properties (and any houses) to
-        the bank and their held Get Out of Jail Free cards to their decks.
+        Removes a player from play. If they went bankrupt to another player
+        (``creditor``), that player inherits their properties -- keeping any
+        houses and mortgages -- and their Get Out of Jail Free cards, following
+        the standard rule. A bankruptcy to the bank (``creditor`` None) instead
+        returns the properties (stripped of houses/mortgage) to the bank and the
+        jail cards to their decks.
 
-        Note: this simplifies the real rule (assets to the creditor) by always
-        returning assets to the bank, which is enough for a complete game.
+        Args:
+            player (type[Player]): The player going bankrupt.
+            creditor (type[Player] | None): The player owed the debt, or None
+                when the debt was to the bank.
         """
         player.bankrupt = True
 
-        for prop in list(player.properties):
-            prop.owner = None
-            prop.mortgaged = False
-            if hasattr(prop, "houses"):
-                prop.houses = 0
-        player.properties.clear()
+        if creditor is not None and not creditor.bankrupt:
+            self.announce(
+                f"{player.name} is bankrupt! {creditor.name} inherits their "
+                f"properties and cards.")
+            for prop in list(player.properties):
+                prop.transfer_ownership(creditor)
+            for card in list(player.jail_cards):
+                creditor.jail_cards.append(card)
+            player.jail_cards.clear()
+        else:
+            self.announce(
+                f"{player.name} is bankrupt! Their properties return to the "
+                f"bank.")
+            for prop in list(player.properties):
+                prop.owner = None
+                prop.mortgaged = False
+                if hasattr(prop, "houses"):
+                    prop.houses = 0
+            player.properties.clear()
 
-        for card in list(player.jail_cards):
-            card.source_deck.return_card(card)
-        player.jail_cards.clear()
+            for card in list(player.jail_cards):
+                card.source_deck.return_card(card)
+            player.jail_cards.clear()
 
         player.balance = 0
 
