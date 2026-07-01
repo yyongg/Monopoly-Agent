@@ -310,6 +310,10 @@ class MonopolyApp:
         self._ai_deciders = ai_deciders or {}
         self.log = []
         self.selected = None
+        # Player-panel click targets from the last drawn scene, so animation
+        # frames (the only input path during all-AI turns) can toggle the
+        # inventory view too.
+        self._player_rects = []
         self.roll_display = None
         self.board_dice = None
         self.vpos = {p.name: float(p.pos) for p in game.players}
@@ -807,6 +811,7 @@ class MonopolyApp:
         buttons = []
         if question:
             buttons = self._draw_prompt(box, lines, options, mouse)
+        self._player_rects = player_rects
         return buttons, player_rects
 
     def render(self):
@@ -852,9 +857,18 @@ class MonopolyApp:
             # while AI turns animate. Any key press still skips.
             if event.type == pygame.KEYDOWN:
                 skip = True
-            elif (event.type == pygame.MOUSEBUTTONDOWN
-                  and board_rect.collidepoint(event.pos)):
-                skip = True
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if board_rect.collidepoint(event.pos):
+                    skip = True
+                else:
+                    # A click off the board toggles the inventory panel (the
+                    # only way to open one during all-AI turns, which never
+                    # reach ``ask``); it must not skip the animation.
+                    for rect, index in self._player_rects:
+                        if rect.collidepoint(event.pos):
+                            self.selected = (None if self.selected == index
+                                             else index)
+                            break
         self._draw_scene()
         pygame.display.flip()
         self.clock.tick(60)
@@ -1477,7 +1491,6 @@ class MonopolyApp:
                 if not player.bankrupt:
                     self._post_roll_manage(player)
                 self._end_turn(player)
-                self.selected = None
                 turns += 1
             self._show_result()
         except QuitGame:
