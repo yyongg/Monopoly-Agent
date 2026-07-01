@@ -148,17 +148,27 @@ DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 # self-play falls into.
 #
 # Buying on landing earns the *full* bonus; winning the same tile at auction
-# earns only ``AUCTION_ACQUISITION_BONUS_COEF``. The gap is the fix for the agent
-# auctioning every property: because the shaped net worth already values an owned
-# tile above its cash price, declining-then-sniping a cheaper auction was as
-# good as (or better than) buying at list for the *same* bonus -- so the policy
-# declined everything and handed cheap tiles to opponents whenever it lost the
-# ensuing auction. Making a direct buy strictly more rewarding than an auction
-# win gives the agent a clear reason to buy the tile it wants outright, while the
-# smaller auction bonus still keeps it contesting auctions (rather than conceding
-# them) for tiles it declined or that an opponent put up.
+# earns only ``AUCTION_ACQUISITION_BONUS_COEF``. The gap keeps the agent
+# contesting auctions (rather than conceding them) while preferring to buy
+# outright.
+#
+# The income-scaled gap alone, though, is far too small to stop the agent
+# declining everything: the shaped net worth books an owned tile at ``price x
+# (1 + ACQUISITION_PREMIUM)`` regardless of what was paid, so acquiring *cheaply*
+# is an instant net-worth windfall -- and an early-game auction (few contested
+# bidders, opening bid ~10% of list) is the cheap route. That windfall scales
+# with *price* (~0.5-1.0 x price / 1000 of reward), which dwarfs the income-scaled
+# bonus gap (~a few x income / 1000). So buying on landing also earns a
+# *price-scaled* preference bonus (``BUY_PREFERENCE_COEF`` x price / 1000), paid
+# only on a direct buy and never on an auction win. Sized near ACQUISITION_PREMIUM
+# it roughly cancels the auction discount, so buying at list is the higher-reward
+# choice even when the tile could later be sniped cheaply -- this is the lever
+# that actually pulls the policy off "decline everything" early game. Raise it
+# toward 1.0 for a stronger buy bias (at the cost of more aggressive over-buying),
+# lower it toward 0.0 to relax back to auction-heavy play.
 ACQUISITION_BONUS_COEF = 3.0
 AUCTION_ACQUISITION_BONUS_COEF = 1.0
+BUY_PREFERENCE_COEF = 0.5
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -538,6 +548,11 @@ class MonopolyEnv(_GymEnv):
             coef = (ACQUISITION_BONUS_COEF if source == "buy"
                     else AUCTION_ACQUISITION_BONUS_COEF)
             self._pending_bonus += coef * self._expected_income(prop) / 1000.0
+            if source == "buy":
+                # Price-scaled premium for buying on landing (never on an auction
+                # win), sized to cancel the cheap-auction net-worth windfall so
+                # buying at list beats declining-to-snipe. See BUY_PREFERENCE_COEF.
+                self._pending_bonus += BUY_PREFERENCE_COEF * prop.price / 1000.0
         grp = self._group_of.get(id(prop))
         if grp is None:
             return
