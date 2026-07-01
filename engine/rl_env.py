@@ -160,15 +160,24 @@ DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 # with *price* (~0.5-1.0 x price / 1000 of reward), which dwarfs the income-scaled
 # bonus gap (~a few x income / 1000). So buying on landing also earns a
 # *price-scaled* preference bonus (``BUY_PREFERENCE_COEF`` x price / 1000), paid
-# only on a direct buy and never on an auction win. Sized near ACQUISITION_PREMIUM
-# it roughly cancels the auction discount, so buying at list is the higher-reward
-# choice even when the tile could later be sniped cheaply -- this is the lever
-# that actually pulls the policy off "decline everything" early game. Raise it
-# toward 1.0 for a stronger buy bias (at the cost of more aggressive over-buying),
-# lower it toward 0.0 to relax back to auction-heavy play.
+# only on a direct buy and never on an auction win.
+#
+# Sizing it (this matters -- earlier values that were "near ACQUISITION_PREMIUM"
+# were provably too weak). Comparing buy-at-list against decline-then-snipe the
+# auction at price ``A``, in /1000 reward units:
+#   buy   = 0.5*P (net-worth telescoping) + 3*income + c*P
+#   snipe = (1.5*P - A)  (telescoping)    + 1*income
+#   buy - snipe = (c - 1)*P + A + 2*income
+# So buying only out-scores a *free* snipe (A -> 0) once ``c >= 1.0`` -- at the
+# old c = 0.5 the bonus covered barely half the list-price gap, which is why the
+# agent kept declining. We set c = 1.25: comfortably past break-even so buying
+# wins for any realistic auction price with margin to spare for the policy to
+# latch onto, without inflating it so far the agent over-buys into rent it can't
+# cover. Raise it for an even stronger buy bias, lower toward 1.0 to tighten it
+# (below 1.0 reopens the decline-then-snipe exploit).
 ACQUISITION_BONUS_COEF = 3.0
 AUCTION_ACQUISITION_BONUS_COEF = 1.0
-BUY_PREFERENCE_COEF = 0.5
+BUY_PREFERENCE_COEF = 1.25
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
