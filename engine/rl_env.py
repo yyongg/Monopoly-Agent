@@ -177,7 +177,7 @@ DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 # (below 1.0 reopens the decline-then-snipe exploit).
 ACQUISITION_BONUS_COEF = 3.0
 AUCTION_ACQUISITION_BONUS_COEF = 1.0
-BUY_PREFERENCE_COEF = 1.25
+BUY_PREFERENCE_COEF = 1.40
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
