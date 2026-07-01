@@ -275,7 +275,7 @@ def main():
 
     opponent_policy = None
     if args.opponent is not None:
-        from selfplay import policy_from_model
+        from training.selfplay import policy_from_model
         opponent_policy = policy_from_model(MaskablePPO.load(args.opponent))
 
     seat = None if args.seat < 0 else args.seat

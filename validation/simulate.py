@@ -61,21 +61,26 @@ def liquidation_net_worth(player):
     return total
 
 
-def completed_groups(player, groups):
-    """Labels of the monopoly groups ``player`` currently fully owns."""
-    return [group_label(g) for g in groups if all(t.owner is player for t in g)]
+def completed_groups(player, groups, exclude_ids=frozenset()):
+    """Labels of the monopoly groups ``player`` currently fully owns, ignoring
+    any tiles in ``exclude_ids`` (properties inherited from a bankrupted
+    opponent) -- so a set only "counts" if it was completed through play."""
+    return [group_label(g) for g in groups
+            if all(t.owner is player and id(t) not in exclude_ids for t in g)]
 
 
-def count_holdings(player):
-    """``(num_properties, num_houses, num_hotels)`` for ``player``."""
+def count_holdings(player, exclude_ids=frozenset()):
+    """``(num_properties, num_houses, num_hotels)`` for ``player``, excluding
+    tiles inherited from a bankrupted opponent (``exclude_ids``)."""
     houses = hotels = 0
-    for prop in player.properties:
+    props = [p for p in player.properties if id(p) not in exclude_ids]
+    for prop in props:
         if isinstance(prop, StreetProperty):
             if prop.houses >= 5:
                 hotels += 1
             else:
                 houses += prop.houses
-    return len(player.properties), houses, hotels
+    return len(props), houses, hotels
 
 
 def play_one_game(env, policy, seed, max_turns):
@@ -126,6 +131,29 @@ def play_one_game(env, policy, seed, max_turns):
 
     g.on_auction_end = on_auction_end
 
+    # Exclude properties seized by bankrupting an opponent from the holdings /
+    # monopoly analytics: they were inherited, not won through play. Track the
+    # tiles currently held as inheritance -- add a bankrupt player's whole estate
+    # when a creditor inherits it, and clear a tile the moment it is next
+    # acquired legitimately (bought, won at auction, or traded for).
+    inherited_ids = set()
+
+    orig_declare = g.declare_bankrupt
+
+    def tracking_declare(player, creditor=None):
+        if creditor is not None and not creditor.bankrupt:
+            for prop in player.properties:
+                inherited_ids.add(id(prop))  # estate passes to the creditor
+        else:
+            for prop in player.properties:
+                inherited_ids.discard(id(prop))  # estate returns to the bank
+        orig_declare(player, creditor)
+
+    g.declare_bankrupt = tracking_declare
+    # A legitimate (re)acquisition -- buy, auction win, or trade -- clears the
+    # inherited flag; bankruptcy inheritance doesn't fire this hook.
+    g.on_acquire = lambda player, prop, from_bank=False: inherited_ids.discard(id(prop))
+
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n
     peak_net_worth = [0.0] * n
@@ -136,7 +164,7 @@ def play_one_game(env, policy, seed, max_turns):
             p = g.players[s]
             if p.bankrupt:
                 continue
-            for label in completed_groups(p, groups):
+            for label in completed_groups(p, groups, inherited_ids):
                 if label not in ever_monopolies[s]:
                     ever_monopolies[s].add(label)
                     if first_monopoly_turn[s] is None:
@@ -157,15 +185,16 @@ def play_one_game(env, policy, seed, max_turns):
     players = []
     for s in range(n):
         p = g.players[s]
-        props, houses, hotels = count_holdings(p)
+        props, houses, hotels = count_holdings(p, inherited_ids)
         players.append({
             "seat": s,
             "won": winner_seat == s,
             "bankrupt": p.bankrupt,
             "final_net_worth": liquidation_net_worth(p),
             "peak_net_worth": peak_net_worth[s],
-            "final_properties": [pr.name for pr in p.properties],
-            "final_monopolies": completed_groups(p, groups),
+            "final_properties": [pr.name for pr in p.properties
+                                 if id(pr) not in inherited_ids],
+            "final_monopolies": completed_groups(p, groups, inherited_ids),
             "ever_monopolies": sorted(ever_monopolies[s]),
             "num_ever_monopolies": len(ever_monopolies[s]),
             "first_monopoly_turn": first_monopoly_turn[s],
@@ -190,7 +219,7 @@ def simulate(model_path, games=200, num_players=4, max_turns=1000, seed=0,
              deterministic=True, progress=True):
     """Runs ``games`` self-play games and returns aggregated analytics."""
     from sb3_contrib import MaskablePPO
-    from selfplay import policy_from_model
+    from training.selfplay import policy_from_model
 
     model = MaskablePPO.load(model_path)
     policy = policy_from_model(model, deterministic=deterministic)

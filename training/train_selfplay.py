@@ -32,8 +32,8 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from engine.rl_env import MonopolyEnv
-from selfplay import SelfPlayCallback, make_selfplay_env
-from train import WinRateCallback
+from training.selfplay import SelfPlayCallback, make_selfplay_env
+from training.train import WinRateCallback
 
 torch.set_num_threads(1)
 
