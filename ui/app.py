@@ -48,6 +48,13 @@ BTN_HOVER = (78, 138, 197)
 BTN_INK = (255, 255, 255)
 BTN_DIM = (90, 90, 90)
 
+# Affirmative / negative action buttons (buy / auction, accept / reject).
+POS_GREEN = (39, 158, 70)
+NEG_RED = (200, 62, 55)
+CARD_BG = (252, 251, 247)
+MONEY_BG = (222, 246, 224)
+MONEY_INK = (22, 110, 52)
+
 CHOICE_ICONS = {
     "build": "up",
     "sell": "down",
@@ -708,12 +715,17 @@ class MonopolyApp:
         return DEFAULT_COLOR
 
     def _choice_icon(self, value):
-        if isinstance(value, int):
+        # Some prompts (auction bids) use integer *amounts* as option values,
+        # which must NOT be read as board indices -- only treat an int as a tile
+        # position when it is actually in range and points at a property.
+        if isinstance(value, int) and 0 <= value < len(self.game.board.tiles):
             tile = self.game.board.tiles[value]
             if isinstance(tile, Property):
                 return "swatch", self._property_color(tile)
         if value is None:
             return "x", None
+        if isinstance(value, int):
+            return "coin", ICON_COLORS.get("coin")
         shape = CHOICE_ICONS.get(value, "dot")
         return shape, ICON_COLORS.get(shape)
 
@@ -786,6 +798,269 @@ class MonopolyApp:
         self.screen.blit(
             self.f_small.render(prop.name, True, contrast_text(color)),
             (x + 2, y))
+
+    # ----- card popups & modals ------------------------------------------
+
+    def _fit_font(self, text, max_w, size, bold=True):
+        """Returns the largest bold font (down to 12px) that fits ``text``."""
+        while size > 12:
+            font = self._font(size, bold=bold)
+            if font.size(text)[0] <= max_w:
+                return font
+            size -= 2
+        return self._font(12, bold=bold)
+
+    def _dim_scene(self, alpha=190):
+        """Draws the live board/panels, then a dark scrim, ready for a modal."""
+        self._draw_scene()
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((8, 40, 26, alpha))
+        self.screen.blit(overlay, (0, 0))
+
+    def _run_overlay_modal(self, draw):
+        """Blocks on a modal drawn over a dimmed board.
+
+        ``draw(mouse)`` renders one full frame (it should call ``_dim_scene``
+        first) and returns a list of ``(rect, value)`` hot buttons; the chosen
+        value is returned. Number keys ``1..n`` map to the buttons in order.
+        Mouse-wheel notches are forwarded to ``draw`` via ``self._modal_wheel``
+        so scrollable modals can respond.
+        """
+        self._modal_wheel = 0
+        while True:
+            mouse = pygame.mouse.get_pos()
+            buttons = draw(mouse)
+            pygame.display.flip()
+            self._modal_wheel = 0
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise QuitGame
+                if event.type == pygame.MOUSEWHEEL:
+                    self._modal_wheel = event.y
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for rect, value in buttons:
+                        if rect.collidepoint(event.pos):
+                            return value
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return "__cancel__"
+                    idx = event.key - pygame.K_1
+                    if 0 <= idx < len(buttons):
+                        return buttons[idx][1]
+            self.clock.tick(60)
+
+    def _draw_title_deed(self, rect, prop):
+        """Renders a classic Monopoly title-deed card for ``prop`` in ``rect``."""
+        pygame.draw.rect(self.screen, CARD_BG, rect, border_radius=12)
+        pygame.draw.rect(self.screen, INK, rect, 2, border_radius=12)
+        pad = 18
+        inner_w = rect.w - 2 * pad
+        color = self._property_color(prop)
+        band = pygame.Rect(rect.x + pad, rect.y + pad, inner_w, 82)
+        pygame.draw.rect(self.screen, color, band)
+        pygame.draw.rect(self.screen, INK, band, 2)
+        bink = contrast_text(color)
+        td = self.f_small.render("TITLE DEED", True, bink)
+        self.screen.blit(td, td.get_rect(midtop=(band.centerx, band.y + 8)))
+        nfont = self._fit_font(prop.name.upper(), inner_w - 16, 26)
+        nm = nfont.render(prop.name.upper(), True, bink)
+        self.screen.blit(nm, nm.get_rect(center=(band.centerx, band.y + 52)))
+
+        x0, x1 = rect.x + pad, rect.right - pad
+        y = [band.bottom + 16]
+
+        def row(label, value, bold=False, gap=25):
+            font = self._font(19, bold=True) if bold else self.f_small
+            self.screen.blit(font.render(label, True, INK), (x0, y[0]))
+            if value is not None:
+                vs = font.render(value, True, INK)
+                self.screen.blit(vs, vs.get_rect(topright=(x1, y[0])))
+            y[0] += gap
+
+        def rule():
+            pygame.draw.line(self.screen, EDGE, (x0, y[0]), (x1, y[0]))
+            y[0] += 10
+
+        if isinstance(prop, StreetProperty):
+            rt = prop.rent_table
+            row("RENT", f"${rt[0]}", bold=True)
+            row("With Color Set", f"${rt[0] * 2}")
+            for i in range(1, 5):
+                row(f"With {i} House" + ("s" if i > 1 else ""), f"${rt[i]}")
+            row("With HOTEL", f"${rt[5]}", bold=True)
+            rule()
+            hc = prop.house_cost()
+            row("Houses cost", f"${hc} ea.")
+            row("Hotel (4 houses +)", f"${hc}")
+            rule()
+            row("Mortgage Value", f"${prop.mortgage_value}")
+        elif isinstance(prop, Railroad):
+            row("RAILROAD", None, bold=True)
+            y[0] += 4
+            for k in range(1, 5):
+                row(f"If {k} R.R. owned", f"${25 * 2 ** k}")
+            rule()
+            row("Mortgage Value", f"${prop.mortgage_value}")
+        else:  # Utility
+            row("UTILITY", None, bold=True)
+            y[0] += 4
+            for line in self._wrap(
+                    "If one Utility is owned, rent is 4 times the dice roll.",
+                    self.f_small, inner_w):
+                row(line, None, gap=22)
+            y[0] += 6
+            for line in self._wrap(
+                    "If both Utilities are owned, rent is 10 times the roll.",
+                    self.f_small, inner_w):
+                row(line, None, gap=22)
+            rule()
+            row("Mortgage Value", f"${prop.mortgage_value}")
+
+        pygame.draw.line(self.screen, EDGE, (x0, rect.bottom - 42),
+                         (x1, rect.bottom - 42))
+        pf = self._font(22, bold=True)
+        self.screen.blit(pf.render("PRICE", True, MUTED), (x0, rect.bottom - 34))
+        ps = pf.render(f"${prop.price}", True, INK)
+        self.screen.blit(ps, ps.get_rect(topright=(x1, rect.bottom - 34)))
+
+    def _draw_mini_card(self, rect, prop):
+        """A compact property card (color stripe + name + status) for lists."""
+        pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=6)
+        pygame.draw.rect(self.screen, INK, rect, 1, border_radius=6)
+        stripe = pygame.Rect(rect.x, rect.y, rect.w, 15)
+        color = self._property_color(prop)
+        pygame.draw.rect(self.screen, color, stripe,
+                         border_top_left_radius=6, border_top_right_radius=6)
+        name = self._truncate(prop.name, self.f_small, rect.w - 16)
+        self.screen.blit(self.f_small.render(name, True, INK),
+                         (rect.x + 8, rect.y + 20))
+        if prop.mortgaged:
+            tag = "mortgaged"
+        elif isinstance(prop, StreetProperty) and prop.houses:
+            tag = "HOTEL" if prop.houses >= 5 else f"{prop.houses} house" + (
+                "s" if prop.houses > 1 else "")
+        else:
+            tag = ""
+        if tag and rect.h >= 40:
+            self.screen.blit(self.f_small.render(tag, True, MUTED),
+                             (rect.x + 8, rect.y + 20 + self.f_small.get_height()))
+
+    def _draw_money_card(self, rect, amount):
+        """A green 'bill' chip showing a cash amount in a trade."""
+        pygame.draw.rect(self.screen, MONEY_BG, rect, border_radius=6)
+        pygame.draw.rect(self.screen, POS_GREEN, rect, 2, border_radius=6)
+        s = self._font(22, bold=True).render(f"$ {amount}", True, MONEY_INK)
+        self.screen.blit(s, s.get_rect(center=rect.center))
+
+    # ----- purchase card -------------------------------------------------
+
+    def _draw_purchase_card(self, player, prop, mouse):
+        self._dim_scene()
+        board_cx = BOARD_X + BOARD_PX // 2
+        board_cy = BOARD_Y + BOARD_PX // 2
+        card_w = 360
+        card_h = 500 if isinstance(prop, StreetProperty) else 320
+        card = pygame.Rect(board_cx - card_w // 2,
+                           board_cy - card_h // 2 - 22, card_w, card_h)
+        head = self.f_head.render(f"{player.name}, buy {prop.name}?", True,
+                                  FELT_INK)
+        self.screen.blit(head, head.get_rect(midbottom=(board_cx, card.y - 30)))
+        bal = self.f_small.render(f"Balance ${player.balance}", True, FELT_SUB)
+        self.screen.blit(bal, bal.get_rect(midbottom=(board_cx, card.y - 8)))
+        self._draw_title_deed(card, prop)
+        bw, gap = 168, 16
+        by = card.bottom + 22
+        buy = self._draw_dialog_button(f"Buy  ${prop.price}",
+                                       board_cx - bw - gap // 2, by, bw, mouse,
+                                       POS_GREEN)
+        auc = self._draw_dialog_button("Auction", board_cx + gap // 2, by, bw,
+                                       mouse, NEG_RED)
+        return [(buy, "buy"), (auc, "decline")]
+
+    # ----- trade offer (accept / reject) ---------------------------------
+
+    def _confirm_trade(self, proposer, responder, give, receive, cash):
+        """Shows ``responder`` a visual trade offer; returns True on accept.
+
+        ``give`` are tiles ``proposer`` hands over, ``receive`` tiles the
+        responder hands over, ``cash`` the amount the proposer pays the
+        responder (negative means the responder pays).
+        """
+        if self._auto is not None:
+            return False
+        choice = self._run_overlay_modal(
+            lambda mouse: self._draw_trade_offer(
+                proposer, responder, give, receive, cash, mouse))
+        return choice == "accept"
+
+    def _draw_trade_offer(self, proposer, responder, give, receive, cash, mouse):
+        self._dim_scene()
+        dlg = pygame.Rect(BOARD_X + 24, BOARD_Y + 34, BOARD_PX - 48,
+                          BOARD_PX - 68)
+        self._panel(dlg, PANEL)
+        title = self.f_title.render("Trade Offer", True, INK)
+        self.screen.blit(title, title.get_rect(midtop=(dlg.centerx, dlg.y + 14)))
+        sub = self.f_small.render(
+            f"{responder.name}, do you accept this trade?", True, MUTED)
+        self.screen.blit(sub, sub.get_rect(midtop=(dlg.centerx, dlg.y + 52)))
+
+        pad = 24
+        colw = (dlg.w - 3 * pad) // 2
+        col_top = dlg.y + 84
+        col_bottom = dlg.bottom - 88
+        left = pygame.Rect(dlg.x + pad, col_top, colw, col_bottom - col_top)
+        right = pygame.Rect(dlg.right - pad - colw, col_top, colw,
+                            col_bottom - col_top)
+        self._draw_trade_side(left, proposer, give, cash if cash > 0 else 0,
+                              "offers")
+        self._draw_trade_side(right, responder, receive,
+                              -cash if cash < 0 else 0, "gives")
+
+        mid = (dlg.centerx, (col_top + col_bottom) // 2)
+        pygame.draw.circle(self.screen, PANEL, mid, 24)
+        pygame.draw.circle(self.screen, EDGE, mid, 24, 1)
+        self._draw_icon("swap", INK, mid[0], mid[1], s=26)
+
+        bw, gap = 190, 20
+        by = dlg.bottom - 62
+        accept = self._draw_dialog_button("Accept Trade",
+                                          dlg.centerx - bw - gap // 2, by, bw,
+                                          mouse, POS_GREEN)
+        reject = self._draw_dialog_button("Reject Trade", dlg.centerx + gap // 2,
+                                          by, bw, mouse, NEG_RED)
+        return [(accept, "accept"), (reject, "reject")]
+
+    def _draw_trade_side(self, rect, player, tiles, cash, verb):
+        self._panel(rect, PANEL_ALT)
+        color = player_color(player.name)
+        hdr = pygame.Rect(rect.x, rect.y, rect.w, 40)
+        pygame.draw.rect(self.screen, color, hdr,
+                         border_top_left_radius=10, border_top_right_radius=10)
+        token = pygame.transform.smoothscale(self.tokens[player.name], (26, 26))
+        self.screen.blit(token, (hdr.x + 8, hdr.y + 7))
+        nm = self.f_body.render(player.name, True, contrast_text(color))
+        self.screen.blit(nm, nm.get_rect(midleft=(hdr.x + 42, hdr.centery)))
+        vb = self.f_small.render(verb, True, contrast_text(color))
+        self.screen.blit(vb, vb.get_rect(midright=(hdr.right - 10, hdr.centery)))
+
+        x, cw = rect.x + 12, rect.w - 24
+        y = hdr.bottom + 12
+        row_h = 52
+        slots = max(1, (rect.bottom - 12 - y) // row_h)
+        need_cash = cash > 0
+        max_cards = slots - (1 if need_cash else 0)
+        shown = tiles[:max(0, max_cards)]
+        for prop in shown:
+            self._draw_mini_card(pygame.Rect(x, y, cw, 46), prop)
+            y += row_h
+        hidden = len(tiles) - len(shown)
+        if hidden > 0:
+            self._text(f"+{hidden} more", (x, y), self.f_small, MUTED)
+            y += row_h
+        if need_cash:
+            self._draw_money_card(pygame.Rect(x, y, cw, 46), cash)
+        elif not tiles:
+            self._text("nothing", (x, y), self.f_small, MUTED)
 
     def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
@@ -1013,13 +1288,17 @@ class MonopolyApp:
         if player.balance < prop.price:
             self.add_log(f"{player.name} can't afford {prop.name}.")
             return False
-        choice = self.ask(
-            f"{player.name}: buy {prop.name} for ${prop.price}? "
-            f"(Balance ${player.balance})",
-            [("Buy", "buy"), ("Decline", "decline")])
+        if self._auto is not None:
+            choice = self._auto(f"{player.name}: buy {prop.name}?",
+                                [("Buy", "buy"), ("Auction", "decline")])
+            return choice == "buy"
+        # A Monopoly-style title-deed card over the board with green Buy / red
+        # Auction buttons; declining sends the property to auction (engine side).
+        choice = self._run_overlay_modal(
+            lambda mouse: self._draw_purchase_card(player, prop, mouse))
         bought = choice == "buy"
-        self.add_log(f"{player.name} {'bought' if bought else 'declined'} "
-                     f"{prop.name}.")
+        self.add_log(f"{player.name} {'bought' if bought else 'sent to auction'}"
+                     f" {prop.name}.")
         return bought
 
     def _prompt_bid(self, player, prop):
@@ -1060,13 +1339,7 @@ class MonopolyApp:
             return accepted
         if self._auto is not None:
             return False
-        gnames = ", ".join(t.name for t in give) or "nothing"
-        rnames = ", ".join(t.name for t in receive) or "nothing"
-        cash_txt = f" and ${cash}" if cash > 0 else ""
-        answer = self.ask(
-            f"{initiator.name} [AI] offers you {gnames}{cash_txt} for {rnames}. "
-            f"Accept?", [("Accept", "yes"), ("Decline", "no")])
-        return answer == "yes"
+        return self._confirm_trade(initiator, partner, give, receive, cash)
 
     def _show_card(self, pile, card):
         self.add_log(f"{pile}: {card.text}")
@@ -1164,6 +1437,13 @@ class MonopolyApp:
                              f"{tile.name} for ${cost}.")
 
     def _manage_menu(self, player, jail_exit=False):
+        # Headless/auto games use the plain option list; interactive players get
+        # the card-based panel drawn over the board.
+        if self._auto is not None:
+            return self._manage_menu_text(player, jail_exit)
+        return self._manage_menu_cards(player, jail_exit)
+
+    def _manage_menu_text(self, player, jail_exit=False):
         while True:
             options = []
             if jail_exit and player.balance >= 50:
@@ -1197,6 +1477,164 @@ class MonopolyApp:
                 self._trade_flow(player)
             else:
                 return None
+
+    # ----- manage-properties card panel ----------------------------------
+
+    def _small_button(self, label, rect, mouse, color):
+        """A compact filled button (f_small text) used inside the card grid."""
+        hover = rect.collidepoint(mouse) if mouse else False
+        shade = tuple(min(255, c + 24) for c in color) if hover else color
+        pygame.draw.rect(self.screen, shade, rect, border_radius=6)
+        surf = self.f_small.render(label, True, BTN_INK)
+        self.screen.blit(surf, surf.get_rect(center=rect.center))
+        return rect
+
+    def _manage_menu_cards(self, player, jail_exit=False):
+        """Card-grid management panel: build/sell/mortgage per property, plus
+        trade and (in jail) the pay/card exits. Returns ``"pay"``/``"card"`` for
+        a jail exit or ``None`` when the player is done managing."""
+        scroll = 0
+        while True:
+            mouse = pygame.mouse.get_pos()
+            hot, max_scroll = self._draw_manage_panel(
+                player, jail_exit, scroll, mouse)
+            pygame.display.flip()
+            scroll = max(0, min(scroll, max_scroll))
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise QuitGame
+                if event.type == pygame.MOUSEWHEEL:
+                    scroll = max(0, min(scroll - event.y, max_scroll))
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    return None
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    action = self._handle_manage_click(player, hot, event.pos)
+                    if action == "done":
+                        return None
+                    if action in ("pay", "card"):
+                        return action
+            self.clock.tick(60)
+
+    def _handle_manage_click(self, player, hot, pos):
+        """Applies a clicked manage action. Returns ``"done"``/``"pay"``/
+        ``"card"`` for terminal actions, else ``None`` (panel stays open)."""
+        for rect, (action, tile) in hot:
+            if not rect.collidepoint(pos):
+                continue
+            if action == "build":
+                if self.game.build_house(tile, player):
+                    self.add_log(f"{player.name} built on {tile.name} "
+                                 f"(now {tile.houses}).")
+            elif action == "sell":
+                if self.game.sell_house(tile, player):
+                    self.add_log(f"{player.name} sold a house on {tile.name}.")
+            elif action == "mortgage":
+                if self.game.mortgage_property(tile, player):
+                    self.add_log(f"{player.name} mortgaged {tile.name} for "
+                                 f"${tile.mortgage_value}.")
+            elif action == "unmortgage":
+                cost = tile.unmortgage_cost
+                if self.game.unmortgage_property(tile, player):
+                    self.add_log(f"{player.name} lifted the mortgage on "
+                                 f"{tile.name} for ${cost}.")
+            elif action == "trade":
+                self._trade_flow(player)
+            else:  # done / pay / card
+                return action
+            return None
+        return None
+
+    def _manage_card_actions(self, player, prop):
+        """The (label, action, color) buttons available for ``prop`` right now."""
+        actions = []
+        if isinstance(prop, StreetProperty):
+            if prop.can_build_house(self.game, player):
+                actions.append((f"Build  ${prop.house_cost()}", "build",
+                                POS_GREEN))
+            if prop.can_sell_house(self.game, player):
+                actions.append(("Sell house", "sell", (204, 133, 42)))
+        if prop.can_mortgage(self.game, player):
+            actions.append((f"Mortgage  +${prop.mortgage_value}", "mortgage",
+                            BTN))
+        if prop.can_unmortgage(self.game, player):
+            actions.append((f"Unmortgage  -${prop.unmortgage_cost}",
+                            "unmortgage", BTN))
+        return actions
+
+    def _draw_manage_panel(self, player, jail_exit, scroll, mouse):
+        self._dim_scene()
+        dlg = pygame.Rect(BOARD_X + 16, BOARD_Y + 16, BOARD_PX - 32,
+                          BOARD_PX - 32)
+        self._panel(dlg, PANEL)
+        pad = 18
+        hot = []
+
+        title = self.f_title.render("Manage Properties", True, INK)
+        self.screen.blit(title, title.get_rect(midtop=(dlg.centerx, dlg.y + 12)))
+        sub = self.f_small.render(f"{player.name}   ·   ${player.balance}", True,
+                                  MUTED)
+        self.screen.blit(sub, sub.get_rect(midtop=(dlg.centerx, dlg.y + 48)))
+
+        content_top = dlg.y + 78
+        if jail_exit:
+            bx = dlg.x + pad
+            if player.balance >= 50:
+                r = self._draw_dialog_button("Pay $50 to leave jail", bx,
+                                             content_top, 236, mouse, BTN)
+                hot.append((r, ("pay", None)))
+                bx += 248
+            if player.jail_cards:
+                r = self._draw_dialog_button("Use Jail Free card", bx,
+                                             content_top, 236, mouse, BTN)
+                hot.append((r, ("card", None)))
+            content_top += 56
+
+        bottom_bar = dlg.bottom - 60
+        grid_top = content_top
+        grid_bottom = bottom_bar - 12
+        props = player.properties
+
+        cols = 3
+        cell_pad = 14
+        cell_w = (dlg.w - 2 * pad - (cols - 1) * cell_pad) // cols
+        cell_h = 142
+        rows_fit = max(1, (grid_bottom - grid_top + cell_pad)
+                       // (cell_h + cell_pad))
+        total_rows = (len(props) + cols - 1) // cols
+        max_scroll = max(0, total_rows - rows_fit)
+
+        if not props:
+            self._text("You don't own any properties yet.",
+                       (dlg.x + pad, grid_top), self.f_body, MUTED)
+        else:
+            start = scroll * cols
+            visible = props[start:start + rows_fit * cols]
+            for i, prop in enumerate(visible):
+                r, c = divmod(i, cols)
+                cx = dlg.x + pad + c * (cell_w + cell_pad)
+                cy = grid_top + r * (cell_h + cell_pad)
+                self._draw_mini_card(pygame.Rect(cx, cy, cell_w, 62), prop)
+                by = cy + 68
+                for label, act, color in self._manage_card_actions(
+                        player, prop)[:2]:
+                    r_btn = self._small_button(
+                        label, pygame.Rect(cx, by, cell_w, 30), mouse, color)
+                    hot.append((r_btn, (act, prop)))
+                    by += 36
+            if max_scroll:
+                hint = f"scroll for more  ·  {scroll + 1}/{max_scroll + 1}"
+                self._text(hint, (dlg.x + pad, grid_bottom + 2), self.f_small,
+                           MUTED)
+
+        done = self._draw_dialog_button("Done", dlg.right - pad - 150,
+                                        bottom_bar, 150, mouse, POS_GREEN)
+        hot.append((done, ("done", None)))
+        if self._can_trade(player):
+            tr = self._draw_dialog_button("Propose Trade",
+                                          dlg.right - pad - 150 - 12 - 190,
+                                          bottom_bar, 190, mouse, BTN)
+            hot.append((tr, ("trade", None)))
+        return hot, max_scroll
 
     # ----- trading -------------------------------------------------------
 
@@ -1279,9 +1717,6 @@ class MonopolyApp:
         if not give and not receive and cash == 0:
             return False
 
-        gnames = ", ".join(t.name for t in give) or "nothing"
-        rnames = ", ".join(t.name for t in receive) or "nothing"
-
         if self._is_ai(partner):
             # The AI evaluates the offer with its valuation formula rather than
             # being asked. From the AI's perspective it gains the properties the
@@ -1302,12 +1737,7 @@ class MonopolyApp:
                      "afford it).", [("OK", "ok")])
             return False
 
-        accept = self.ask(
-            f"{partner.name}: {player.name} proposes a trade. You give "
-            f"{rnames}; you get {gnames}; "
-            f"{self._cash_label(player, partner, cash)}. Accept?",
-            [("Accept", "yes"), ("Decline", "no")])
-        if accept != "yes":
+        if not self._confirm_trade(player, partner, give, receive, cash):
             self.add_log(f"{partner.name} declined {player.name}'s trade.")
             return True
         if self.game.execute_trade(player, partner, give, receive, cash):
