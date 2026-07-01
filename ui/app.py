@@ -616,11 +616,26 @@ class MonopolyApp:
             return "Utility", f"Rent {4 if count == 1 else 10}× dice"
         return "", ""
 
+    def _property_worth(self, prop):
+        """Cash value of one property: mortgage value if mortgaged, else price,
+        plus any house investment. Matches the per-property term in
+        ``_net_worth`` so the inventory values sum to the player's property net
+        worth."""
+        worth = prop.mortgage_value if prop.mortgaged else prop.price
+        if isinstance(prop, StreetProperty):
+            worth += prop.houses * prop.house_cost()
+        return worth
+
     def _draw_inventory(self, y, player, bottom):
         self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head,
                    FELT_INK, shadow=True)
-        self._text("(click the player again to close)", (SIDE_X, y + 28),
-                   self.f_small, FELT_SUB, shadow=True)
+        if player.properties:
+            total = sum(self._property_worth(p) for p in player.properties)
+            subline = f"${total} in property  ·  click the player again to close"
+        else:
+            subline = "(click the player again to close)"
+        self._text(subline, (SIDE_X, y + 28), self.f_small, FELT_SUB,
+                   shadow=True)
         y += 56
         if not player.properties:
             self._text("No properties owned.", (SIDE_X, y), self.f_body,
@@ -631,7 +646,7 @@ class MonopolyApp:
                 break
             houses, rent = self._rent_line(prop)
             self._draw_property_chip(prop, SIDE_X, y)
-            info = f"{houses}  ·  {rent}"
+            info = f"${self._property_worth(prop)}  ·  {houses}  ·  {rent}"
             w = self.f_small.size(info)[0]
             self._text(info, (SIDE_X + SIDE_W - w, y), self.f_small, FELT_SUB,
                        shadow=True)
