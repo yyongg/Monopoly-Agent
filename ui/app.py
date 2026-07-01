@@ -370,12 +370,14 @@ class MonopolyApp:
                 player.decide_purchase = (
                     lambda prop, _ai=ai, _p=player: _ai.purchase_decision(_p, prop))
                 player.decide_bid = (
-                    lambda prop, _ai=ai, _p=player: _ai.bid_choice(_p, prop))
+                    lambda prop, min_bid=0, _ai=ai, _p=player:
+                    _ai.bid_choice(_p, prop, min_bid))
             else:
                 player.decide_purchase = (
                     lambda prop, _p=player: self._prompt_purchase(_p, prop))
                 player.decide_bid = (
-                    lambda prop, _p=player: self._prompt_bid(_p, prop))
+                    lambda prop, min_bid=0, _p=player:
+                    self._prompt_bid(_p, prop, min_bid))
 
         game.on_card = self._show_card
         game.notify = self._inform
@@ -1301,29 +1303,51 @@ class MonopolyApp:
                      f" {prop.name}.")
         return bought
 
-    def _prompt_bid(self, player, prop):
-        """Asks a human for a sealed auction bid on ``prop`` (0 = pass).
+    def _prompt_bid(self, player, prop, min_bid=0):
+        """Asks a human for one round of an ascending auction on ``prop``.
 
-        Called by ``Game.run_auction`` for each human when a property is left
-        unbought. Offers a few price-multiple bid buttons (capped at the
-        player's cash) plus Pass, mirroring the discrete buckets the AI uses.
+        Called each round by ``Game.run_auction``: ``min_bid`` is the smallest
+        bid that beats the current standing bid. Shows the property's title-deed
+        card with a green "Bid $min_bid" and a red "Pass"; returns ``min_bid`` to
+        raise or 0 to drop out. The engine keeps calling this as the price climbs
+        until the human passes or wins, so tied bids keep escalating.
         """
         if self._auto is not None:
             return 0
-        options, seen = [], set()
-        for frac in (0.5, 1.0, 1.5):
-            amount = int(round(frac * prop.price))
-            if 0 < amount <= player.balance and amount not in seen:
-                seen.add(amount)
-                options.append((f"Bid ${amount}", amount))
-        options.append(("Pass", 0))
-        choice = self.ask(
-            f"Auction — {prop.name} (list ${prop.price}). {player.name}, "
-            f"your sealed bid? (Balance ${player.balance})", options)
-        bid = int(choice)
+        if min_bid <= 0:
+            min_bid = max(1, round(prop.price * 0.1))
+        if player.balance < min_bid:
+            return 0
+        choice = self._run_overlay_modal(
+            lambda mouse: self._draw_auction_card(player, prop, min_bid, mouse))
+        bid = min_bid if choice == "bid" else 0
         if bid > 0:
-            self.add_log(f"{player.name} bid ${bid} for {prop.name}.")
+            self.add_log(f"{player.name} bids ${bid} for {prop.name}.")
         return bid
+
+    def _draw_auction_card(self, player, prop, min_bid, mouse):
+        self._dim_scene()
+        board_cx = BOARD_X + BOARD_PX // 2
+        board_cy = BOARD_Y + BOARD_PX // 2
+        card_w = 360
+        card_h = 500 if isinstance(prop, StreetProperty) else 320
+        card = pygame.Rect(board_cx - card_w // 2,
+                           board_cy - card_h // 2 - 22, card_w, card_h)
+        head = self.f_head.render(f"Auction — {prop.name}", True, FELT_INK)
+        self.screen.blit(head, head.get_rect(midbottom=(board_cx, card.y - 30)))
+        sub = self.f_small.render(
+            f"{player.name}   ·   next bid ${min_bid}   ·   balance "
+            f"${player.balance}", True, FELT_SUB)
+        self.screen.blit(sub, sub.get_rect(midbottom=(board_cx, card.y - 8)))
+        self._draw_title_deed(card, prop)
+        bw, gap = 168, 16
+        by = card.bottom + 22
+        bid = self._draw_dialog_button(f"Bid  ${min_bid}",
+                                       board_cx - bw - gap // 2, by, bw, mouse,
+                                       POS_GREEN)
+        skip = self._draw_dialog_button("Pass", board_cx + gap // 2, by, bw,
+                                        mouse, NEG_RED)
+        return [(bid, "bid"), (skip, "pass")]
 
     def _ai_trade_arbiter(self, initiator, partner, give, receive, cash):
         """Resolves a trade an AI seat proposes to ``partner``.

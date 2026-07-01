@@ -97,20 +97,24 @@ class GUIAIDecider:
         self.log(f"{player.name} [AI] bought {prop.name} for ${prop.price}.")
         return True
 
-    def bid_choice(self, player, prop):
-        """Returns this AI's sealed bid (in dollars) for an auctioned property.
+    def bid_choice(self, player, prop, min_bid=0):
+        """Returns this AI's bid for one ascending-auction round (0 passes).
 
-        Mirrors the env's bid hook: the model picks a bucket and it is converted
-        to a fraction of the list price, capped at the player's cash. 0 passes.
+        Mirrors the env's bid hook: the model picks a bucket read as a valuation
+        ceiling (a fraction of list price, capped at cash). The AI matches the
+        round's ``min_bid`` while that ceiling covers it, otherwise it drops out.
         """
         seat = self.game.players.index(player)
         action = self._decide(seat, PHASE_AUCTION, prop)
         k = action - A_AUCTION_BID
         if 0 <= k < NUM_BID_LEVELS:
-            bid = min(int(round(BID_FRACTIONS[k] * prop.price)), player.balance)
-            if bid > 0:
-                self.log(f"{player.name} [AI] bids ${bid} for {prop.name}.")
-            return bid
+            ceiling = min(int(round(BID_FRACTIONS[k] * prop.price)),
+                          player.balance)
+            if min_bid <= 0:
+                return ceiling
+            if ceiling >= min_bid:
+                self.log(f"{player.name} [AI] bids ${min_bid} for {prop.name}.")
+                return min_bid
         return 0
 
     def manage_loop(self, player):

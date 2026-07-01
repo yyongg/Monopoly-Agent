@@ -119,42 +119,71 @@ class Game:
 
     def run_auction(self, prop, start_index):
         """
-        Auctions an unbought property to the highest bidder.
+        Auctions an unbought property with an ascending (English) auction.
 
-        Each still-in-game player (including the one who declined) submits a
-        sealed bid via their ``decide_bid`` hook; the highest bid wins and its
-        owner pays the bank that amount. Bids are clamped to the bidder's cash,
-        and the first bidder in turn order wins any tie. A property nobody bids
-        on simply stays with the bank.
+        Starting from ``start_index`` in seat order, each still-in-game player is
+        repeatedly asked -- via ``decide_bid(prop, min_bid)`` -- whether to beat
+        the current standing bid. Each time a player accepts, the price climbs by
+        ``increment``; a player who declines (or can't afford the next step)
+        drops out. Bidding continues until only one willing bidder remains, so
+        tied valuations are settled by continuing to raise the price rather than
+        by seat order alone. The winner pays the bank the final standing bid; a
+        property nobody bids on stays with the bank.
 
         Args:
             prop (type[Property]): The unowned property being auctioned.
             start_index (int): Seat to begin bidding from (bidding proceeds in
-                seat order from here, so this seat wins ties).
+                seat order from here).
 
         Returns:
             Player | None: The winning bidder, or None if nobody bid.
         """
         n = len(self.players)
-        best_bid = 0
-        best_bidder = None
-        for offset in range(n):
-            player = self.players[(start_index + offset) % n]
-            if player.bankrupt:
-                continue
-            bid = max(0, min(int(player.decide_bid(prop)), player.balance))
-            if bid > best_bid:
-                best_bid = bid
-                best_bidder = player
-
-        if best_bidder is None:
+        order = [self.players[(start_index + offset) % n] for offset in range(n)]
+        live = [p for p in order if not p.bankrupt]
+        if not live:
             return None
 
-        best_bidder.balance -= best_bid
-        prop.transfer_ownership(best_bidder)
+        # Minimum raise between bids -- 10% of list price (at least $1), so a
+        # contested auction resolves in a handful of ascending rounds.
+        increment = max(1, round(prop.price * 0.1))
+        standing_bid = 0
+        standing_bidder = None
+
+        # Round-robin: ask every live non-leader to beat the standing bid. A full
+        # pass with no raise ends the auction (only the leader still wants it).
+        while True:
+            raised = False
+            for player in list(live):
+                if player is standing_bidder:
+                    continue
+                min_bid = standing_bid + increment
+                if player.balance < min_bid:
+                    live.remove(player)  # can't afford to continue -> out
+                    continue
+                bid = max(0, min(int(player.decide_bid(prop, min_bid)),
+                                 player.balance))
+                if bid >= min_bid:
+                    standing_bid = bid
+                    standing_bidder = player
+                    raised = True
+                    self.announce(
+                        f"{player.name} bids ${standing_bid} for {prop.name}.")
+                else:
+                    live.remove(player)  # declines to raise -> out
+            if not raised:
+                break
+
+        if standing_bidder is None:
+            self.announce(f"No one bid on {prop.name}; it stays with the bank.")
+            return None
+
+        standing_bidder.balance -= standing_bid
+        prop.transfer_ownership(standing_bidder)
         self.announce(
-            f"{best_bidder.name} won the auction for {prop.name} at ${best_bid}.")
-        return best_bidder
+            f"{standing_bidder.name} won the auction for {prop.name} "
+            f"at ${standing_bid}.")
+        return standing_bidder
 
     def build_house(self, prop, player):
         """

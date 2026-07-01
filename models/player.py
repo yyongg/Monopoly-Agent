@@ -37,19 +37,24 @@ class Player:
         """
         return self.balance >= prop.price
 
-    def decide_bid(self, prop):
+    def decide_bid(self, prop, min_bid=0):
         """
-        Decides how much to bid for a property that has gone to auction.
+        Decides whether to bid in an ascending auction for a property.
 
-        Like :meth:`decide_purchase`, this is a hook an RL policy overrides. The
-        default baseline never bids (returns 0), leaving auctions to be contested
-        by policy-driven seats; the engine clamps any bid to the player's cash.
+        Called once per bidding round by ``Game.run_auction``: ``min_bid`` is the
+        smallest bid that beats the current standing bid. Return a value
+        ``>= min_bid`` to raise (taking the lead) or anything below it (e.g. 0)
+        to drop out. Like :meth:`decide_purchase`, this is a hook an RL policy
+        overrides; the default baseline never bids, leaving auctions to be
+        contested by policy-driven seats. The engine clamps any bid to the
+        player's cash.
 
         Args:
             prop (type[Property]): The property being auctioned.
+            min_bid (int): The minimum bid needed to beat the standing bid.
 
         Returns:
-            int: The player's sealed bid (0 to pass on the auction).
+            int: A bid ``>= min_bid`` to stay in, or below it to pass.
         """
         return 0
 

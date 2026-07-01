@@ -377,20 +377,26 @@ class MonopolyEnv(_GymEnv):
         return hook
 
     def _make_bid_hook(self, seat, decide):
-        """Returns a ``decide_bid(prop)`` hook routed through ``decide``.
+        """Returns a ``decide_bid(prop, min_bid)`` hook routed through ``decide``.
 
-        The decider picks a sealed-bid bucket for ``prop``; the hook converts it
-        to a dollar amount (a fraction of the list price) and caps it at the
-        bidder's cash. ``A_AUCTION_PASS`` bids nothing.
+        Each ascending-auction round the decider picks a bid bucket for ``prop``;
+        the hook reads it as the seat's valuation ceiling (a fraction of list
+        price, capped at cash). It matches the round's ``min_bid`` while that
+        ceiling covers it, and otherwise passes -- so the agent stays in the
+        bidding until the price climbs past what its chosen bucket is worth.
+        ``A_AUCTION_PASS`` (or an unaffordable bucket) drops out immediately.
         """
         player = self.game.players[seat]
 
-        def hook(prop):
+        def hook(prop, min_bid=0):
             action = decide(PHASE_AUCTION, prop)
             k = action - A_AUCTION_BID
             if 0 <= k < NUM_BID_LEVELS:
-                bid = int(round(BID_FRACTIONS[k] * prop.price))
-                return min(bid, player.balance)
+                ceiling = min(int(round(BID_FRACTIONS[k] * prop.price)),
+                              player.balance)
+                if min_bid <= 0:
+                    return ceiling
+                return min_bid if ceiling >= min_bid else 0
             return 0  # A_AUCTION_PASS or anything unexpected
 
         return hook
