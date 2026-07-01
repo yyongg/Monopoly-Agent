@@ -152,15 +152,17 @@ class Game:
 
         # Round-robin: ask every live non-leader to beat the standing bid. A full
         # pass with no raise ends the auction (only the leader still wants it).
+        # Players short on cash are NOT forced out: they are still asked to bid,
+        # and their ``decide_bid`` hook may raise money (mortgaging / selling
+        # houses) to stay in. A player only drops out by choosing to -- i.e. by
+        # returning a bid below ``min_bid`` (which includes being unable, or
+        # unwilling, to raise the cash).
         while True:
             raised = False
             for player in list(live):
                 if player is standing_bidder:
                     continue
                 min_bid = standing_bid + increment
-                if player.balance < min_bid:
-                    live.remove(player)  # can't afford to continue -> out
-                    continue
                 bid = max(0, min(int(player.decide_bid(prop, min_bid)),
                                  player.balance))
                 if bid >= min_bid:

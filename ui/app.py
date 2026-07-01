@@ -1409,27 +1409,33 @@ class MonopolyApp:
             return 0
         if min_bid <= 0:
             min_bid = max(1, round(prop.price * 0.1))
-        if player.balance < min_bid:
-            return 0
-        options = self._bid_options(player, prop, min_bid)
-        choice = self._run_overlay_modal(
-            lambda mouse: self._draw_auction_card(player, prop, min_bid,
-                                                  options, mouse))
-        bid = int(choice) if isinstance(choice, int) else 0
-        if bid > 0:
-            self.add_log(f"{player.name} bids ${bid} for {prop.name}.")
-        return bid
+        # No forced forfeit: even when the human is short on cash they can open
+        # the manage panel to mortgage / sell and raise the money to keep
+        # bidding, then come back to the auction card.
+        while True:
+            options = self._bid_options(player, prop, min_bid)
+            choice = self._run_overlay_modal(
+                lambda mouse: self._draw_auction_card(player, prop, min_bid,
+                                                      options, mouse))
+            if choice == "raise":
+                self._manage_menu_cards(player)
+                continue
+            bid = int(choice) if isinstance(choice, int) else 0
+            if bid > 0:
+                self.add_log(f"{player.name} bids ${bid} for {prop.name}.")
+            return bid
 
     def _bid_options(self, player, prop, min_bid):
-        """Distinct affordable bid amounts to offer the human this round:
-        the minimum raise, a couple of larger jumps, and an all-in. Always at
-        least ``[min_bid]`` (the caller guarantees it's affordable)."""
+        """Distinct affordable bid amounts to offer the human this round: the
+        minimum raise, a couple of larger jumps, and an all-in. Empty when the
+        player can't currently afford the minimum bid (they can still raise
+        cash from the auction card)."""
         increment = max(1, round(prop.price * 0.1))
         options = []
         for amt in (min_bid, min_bid + increment, min_bid + 3 * increment):
             if amt <= player.balance and amt not in options:
                 options.append(amt)
-        if player.balance > options[-1]:
+        if options and player.balance > options[-1]:
             options.append(player.balance)  # all-in
         return options
 
@@ -1443,27 +1449,35 @@ class MonopolyApp:
                            board_cy - card_h // 2 - 22, card_w, card_h)
         head = self.f_head.render(f"Auction — {prop.name}", True, FELT_INK)
         self.screen.blit(head, head.get_rect(midbottom=(board_cx, card.y - 30)))
-        sub = self.f_small.render(
-            f"{player.name}   ·   next bid ${min_bid}   ·   balance "
-            f"${player.balance}", True, FELT_SUB)
+        can_raise = bool(self._mortgageable(player) or self._sellable(player))
+        note = (f"{player.name}   ·   next bid ${min_bid}   ·   balance "
+                f"${player.balance}")
+        if not options:
+            note += "   ·   short — raise cash to bid" if can_raise \
+                else "   ·   can't cover the next bid"
+        sub = self.f_small.render(note, True, FELT_SUB)
         self.screen.blit(sub, sub.get_rect(midbottom=(board_cx, card.y - 8)))
         self._draw_title_deed(card, prop)
-        # One button per bid amount plus Pass, laid out in a single row that
-        # spans the board width so 2-5 choices all fit.
+        # One button per affordable bid amount, an optional Raise Cash button
+        # (mortgage / sell to bid beyond the current balance), then Pass -- all
+        # in a single row spanning the board width.
+        specs = [(f"All in ${amt}" if amt >= player.balance else f"Bid ${amt}",
+                  amt, POS_GREEN) for amt in options]
+        if can_raise:
+            specs.append(("Raise Cash", "raise", BTN))
+        specs.append(("Pass", "pass", NEG_RED))
+
         buttons = []
-        nbtn = len(options) + 1
+        nbtn = len(specs)
         gap = 12
         avail = min(BOARD_PX - 48, nbtn * 160)
         bw = (avail - (nbtn - 1) * gap) // nbtn
         x = board_cx - avail // 2
         by = card.bottom + 22
-        for amt in options:
-            label = f"All in ${amt}" if amt >= player.balance else f"Bid ${amt}"
-            r = self._draw_dialog_button(label, x, by, bw, mouse, POS_GREEN)
-            buttons.append((r, amt))
+        for label, value, color in specs:
+            r = self._draw_dialog_button(label, x, by, bw, mouse, color)
+            buttons.append((r, value))
             x += bw + gap
-        skip = self._draw_dialog_button("Pass", x, by, bw, mouse, NEG_RED)
-        buttons.append((skip, "pass"))
         return buttons
 
     def _ai_trade_arbiter(self, initiator, partner, give, receive, cash):
@@ -1942,6 +1956,15 @@ class MonopolyApp:
                 if choice == "toggle":
                     target.discard(tile) if selected else target.add(tile)
                 return False
+        if hot["view_mine"].collidepoint(pos):
+            self._browse_inventory(player, state["give"],
+                                   f"Your inventory — {player.name}")
+            return False
+        if hot["view_theirs"].collidepoint(pos):
+            partner = state["partner"]
+            self._browse_inventory(partner, state["receive"],
+                                   f"{partner.name}'s inventory")
+            return False
         if hot["cash_you"].collidepoint(pos):
             state["active"] = "you"
         elif hot["cash_them"].collidepoint(pos):
@@ -2037,24 +2060,34 @@ class MonopolyApp:
 
         colw = (dlg.w - 3 * pad) // 2
         col_top = dlg.y + 112
-        cash_y = dlg.bottom - 132
-        chips_bottom = cash_y - 28
+        cash_y = dlg.bottom - 116
+        view_y = cash_y - 58
+        col_bottom = view_y - 14
         left_x = dlg.x + pad
         right_x = dlg.x + pad + colw + pad
 
-        hot["give"], gmax = self._draw_trade_column(
-            player, state["give"], left_x, col_top, colw, chips_bottom,
-            f"You give — {player.name}", player.balance, state["scroll_give"])
-        hot["receive"], rmax = self._draw_trade_column(
-            partner, state["receive"], right_x, col_top, colw, chips_bottom,
-            f"You receive — {partner.name}", partner.balance,
-            state["scroll_recv"])
+        # The two columns now show the cards *currently in the trade*; picking
+        # cards happens in the per-player inventory browsers below.
+        give_tiles = [t for t in player.properties if t in state["give"]]
+        recv_tiles = [t for t in partner.properties if t in state["receive"]]
+        hot["give"], gmax = self._draw_selected_column(
+            give_tiles, left_x, col_top, colw, col_bottom,
+            f"You give — {player.name}", state["scroll_give"])
+        hot["receive"], rmax = self._draw_selected_column(
+            recv_tiles, right_x, col_top, colw, col_bottom,
+            f"You receive — {partner.name}", state["scroll_recv"])
         state["scroll_give"] = max(0, min(state["scroll_give"], gmax))
         state["scroll_recv"] = max(0, min(state["scroll_recv"], rmax))
         state["_left_region"] = pygame.Rect(left_x, col_top, colw,
-                                            chips_bottom - col_top)
+                                            col_bottom - col_top)
         state["_right_region"] = pygame.Rect(right_x, col_top, colw,
-                                             chips_bottom - col_top)
+                                             col_bottom - col_top)
+
+        hot["view_mine"] = self._draw_dialog_button(
+            "View Your Inventory", left_x, view_y, colw, mouse, BTN)
+        hot["view_theirs"] = self._draw_dialog_button(
+            f"View {partner.name}'s Inventory", right_x, view_y, colw, mouse,
+            BTN)
 
         hot["cash_you"] = self._draw_cash_box(
             "Your cash to add", state["cash_you"], left_x, cash_y, colw,
@@ -2073,45 +2106,146 @@ class MonopolyApp:
             "Propose", dlg.right - pad - 312, dlg.bottom - 58, 150, mouse, BTN)
         return hot
 
-    def _draw_trade_column(self, owner, selected, x, y, w, bottom, header, bal,
-                           scroll):
-        """A trade-builder column of clickable property mini-cards (selected
-        ones ringed with the accent colour). Returns ``(rows, max_scroll)``
-        where ``rows`` are ``(rect, prop)`` hit-boxes."""
+    def _draw_selected_column(self, tiles, x, y, w, bottom, header, scroll):
+        """A trade column showing the property cards *currently in the trade*
+        (``tiles``) as mini-cards; clicking one opens its full card to view or
+        remove it. Returns ``(rows, max_scroll)`` of ``(rect, prop)`` hit-boxes.
+        """
         self._text(header, (x, y), self.f_head, INK)
-        self._text(f"Balance ${bal}  ·  click a card to view", (x, y + 28),
-                   self.f_small, MUTED)
+        self._text(f"{len(tiles)} card" + ("s" if len(tiles) != 1 else "")
+                   + " in trade", (x, y + 28), self.f_small, MUTED)
         list_top = y + 54
         rows = []
-        tradeable = self._tradeable(owner)
-        if not tradeable:
-            self._text("Nothing tradeable.", (x, list_top), self.f_small, MUTED)
+        if not tiles:
+            self._text("No cards yet — use the", (x, list_top), self.f_small,
+                       MUTED)
+            self._text("inventory button below.", (x, list_top + 20),
+                       self.f_small, MUTED)
             return rows, 0
         row_h = 52
         slots = max(1, (bottom - list_top) // row_h)
-        max_scroll = max(0, len(tradeable) - slots)
+        max_scroll = max(0, len(tiles) - slots)
         scroll = max(0, min(scroll, max_scroll))
-        cy = list_top
-        for prop in tradeable[scroll:scroll + slots]:
-            card = pygame.Rect(x, cy, w, 46)
+        for prop in tiles[scroll:scroll + slots]:
+            card = pygame.Rect(x, list_top, w, 46)
             self._draw_mini_card(card, prop)
             stripe_color = self._property_color(prop)
             price = self.f_small.render(f"${prop.price}", True,
                                         contrast_text(stripe_color))
             self.screen.blit(price,
                              price.get_rect(topright=(card.right - 6, card.y)))
-            if prop in selected:
-                pygame.draw.rect(self.screen, ACCENT, card, 3, border_radius=6)
+            pygame.draw.rect(self.screen, ACCENT, card, 3, border_radius=6)
             rows.append((card, prop))
-            cy += row_h
+            list_top += row_h
         if max_scroll:
-            self._text(f"scroll · {len(tradeable)} properties",
-                       (x, bottom + 2), self.f_small, MUTED)
+            self._text(f"scroll · {len(tiles)} in trade", (x, bottom + 2),
+                       self.f_small, MUTED)
         return rows, max_scroll
 
-    def _draw_trade_property_card(self, prop, selected, mouse):
+    def _browse_inventory(self, owner, target_set, title):
+        """Full-screen inventory browser for ``owner``: a scrollable grid of
+        their property cards. Clicking a card opens its full title deed to add
+        or remove it from ``target_set`` (a set of tiles in the trade)."""
+        scroll = 0
+        while True:
+            mouse = pygame.mouse.get_pos()
+            hot, max_scroll = self._draw_inventory_browser(
+                owner, target_set, title, scroll, mouse)
+            pygame.display.flip()
+            scroll = max(0, min(scroll, max_scroll))
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise QuitGame
+                if event.type == pygame.MOUSEWHEEL:
+                    scroll = max(0, min(scroll - event.y, max_scroll))
+                if event.type == pygame.KEYDOWN \
+                        and event.key == pygame.K_ESCAPE:
+                    return
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for rect, item in hot:
+                        if not rect.collidepoint(event.pos):
+                            continue
+                        if item == "__done__":
+                            return
+                        prop = item
+                        can = self.game.can_trade_property(prop)
+                        selected = prop in target_set
+                        choice = self._run_overlay_modal(
+                            lambda m, _p=prop, _s=selected, _c=can:
+                            self._draw_trade_property_card(_p, _s, m, _c))
+                        if choice == "toggle" and can:
+                            (target_set.discard(prop) if selected
+                             else target_set.add(prop))
+                        break
+            self.clock.tick(60)
+
+    def _draw_inventory_browser(self, owner, target_set, title, scroll, mouse):
+        self._dim_scene()
+        dlg = pygame.Rect(BOARD_X + 16, BOARD_Y + 16, BOARD_PX - 32,
+                          BOARD_PX - 32)
+        self._panel(dlg, PANEL)
+        pad = 18
+        hot = []
+        t = self.f_title.render(title, True, INK)
+        self.screen.blit(t, t.get_rect(midtop=(dlg.centerx, dlg.y + 12)))
+        sub = self.f_small.render(
+            "click a card to view its rents and add / remove it from the trade",
+            True, MUTED)
+        self.screen.blit(sub, sub.get_rect(midtop=(dlg.centerx, dlg.y + 48)))
+
+        bottom_bar = dlg.bottom - 60
+        grid_top = dlg.y + 78
+        grid_bottom = bottom_bar - 12
+        props = list(owner.properties)
+        cols = 3
+        cell_pad = 14
+        cell_w = (dlg.w - 2 * pad - (cols - 1) * cell_pad) // cols
+        cell_h = 74
+        rows_fit = max(1, (grid_bottom - grid_top + cell_pad)
+                       // (cell_h + cell_pad))
+        total_rows = (len(props) + cols - 1) // cols
+        max_scroll = max(0, total_rows - rows_fit)
+
+        if not props:
+            self._text("No properties owned.", (dlg.x + pad, grid_top),
+                       self.f_body, MUTED)
+        else:
+            start = scroll * cols
+            for i, prop in enumerate(props[start:start + rows_fit * cols]):
+                r, c = divmod(i, cols)
+                cx = dlg.x + pad + c * (cell_w + cell_pad)
+                cy = grid_top + r * (cell_h + cell_pad)
+                card = pygame.Rect(cx, cy, cell_w, cell_h)
+                self._draw_mini_card(card, prop)
+                stripe = self._property_color(prop)
+                price = self.f_small.render(f"${prop.price}", True,
+                                            contrast_text(stripe))
+                self.screen.blit(
+                    price, price.get_rect(topright=(card.right - 6, card.y)))
+                if prop in target_set:
+                    pygame.draw.rect(self.screen, ACCENT, card, 3,
+                                     border_radius=6)
+                    self._text("in trade", (card.x + 8, card.bottom - 20),
+                               self.f_small, ACCENT)
+                elif not self.game.can_trade_property(prop):
+                    self._text("has houses", (card.x + 8, card.bottom - 20),
+                               self.f_small, MUTED)
+                hot.append((card, prop))
+            if max_scroll:
+                hint = f"scroll for more  ·  {scroll + 1}/{max_scroll + 1}"
+                self._text(hint, (dlg.x + pad, grid_bottom + 2), self.f_small,
+                           MUTED)
+
+        done = self._draw_dialog_button("Done", dlg.right - pad - 150,
+                                        bottom_bar, 150, mouse, POS_GREEN)
+        hot.append((done, "__done__"))
+        return hot, max_scroll
+
+    def _draw_trade_property_card(self, prop, selected, mouse, can_toggle=True):
         """Full title-deed card popup for a property in the trade builder, with
-        an add/remove toggle (green/red) and a Close button."""
+        an add/remove toggle (green/red) and a Close button. When
+        ``can_toggle`` is False the property can't be traded (it has houses in
+        its group), so only a Close button and a note are shown."""
         self._dim_scene()
         board_cx = BOARD_X + BOARD_PX // 2
         board_cy = BOARD_Y + BOARD_PX // 2
@@ -2122,6 +2256,14 @@ class MonopolyApp:
         self._draw_title_deed(card, prop)
         bw, gap = 190, 16
         by = card.bottom + 22
+        if not can_toggle:
+            note = self.f_small.render(
+                "Sell the houses in this color group before trading it.", True,
+                FELT_SUB)
+            self.screen.blit(note, note.get_rect(midtop=(board_cx, by)))
+            close = self._draw_dialog_button("Close", board_cx - bw // 2, by + 24,
+                                             bw, mouse, BTN)
+            return [(close, "close")]
         if selected:
             act = self._draw_dialog_button("Remove from Trade",
                                            board_cx - bw - gap // 2, by, bw,
