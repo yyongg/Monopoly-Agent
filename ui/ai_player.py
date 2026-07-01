@@ -233,6 +233,17 @@ class GUIAIDecider:
     # one to the opponent costs the same.
     SET_BONUS = 1.0
 
+    # Extra value the AI places on a property it *already owns*, above the cash
+    # list price, when deciding whether to part with it. A held property earns
+    # rent and carries set-completion potential, so its long-term worth is well
+    # above what it cost -- the same reasoning as the RL net worth's
+    # ``ACQUISITION_PREMIUM``. Applied only to properties leaving the AI, this
+    # makes it demand a real premium (list price * (1 + KEEP_PREMIUM)) to give a
+    # tile up, so a human can no longer buy one for a dollar over face value.
+    # It is one-sided (incoming property is still valued at plain list price) so
+    # the AI can't be baited into overpaying to acquire a tile it does not need.
+    KEEP_PREMIUM = 0.5
+
     def evaluate_trade(self, me, other, gain, lose, cash_delta):
         """Estimates the dollar value to ``me`` of a trade and decides on it.
 
@@ -242,15 +253,18 @@ class GUIAIDecider:
 
             value =  cash_delta
                    + sum(property_value(p) for p in gain)
-                   - sum(property_value(p) for p in lose)
+                   - sum(property_value(p) * (1 + KEEP_PREMIUM) for p in lose)
                    + SET_BONUS * (group price of any monopoly this completes
                                   for ``me``, minus any it breaks for ``me``)
                    - SET_BONUS * (group price of any monopoly this hands to
                                   ``other``, minus any it strips from ``other``)
 
         where a property is valued at its list price, less the outstanding
-        unmortgage cost if it is mortgaged. ``me`` accepts only when the value
-        is strictly positive (and it can afford any cash it owes).
+        unmortgage cost if it is mortgaged. Property the AI gives up carries the
+        ``KEEP_PREMIUM`` on top, reflecting the rent and set potential lost, so
+        it will not surrender a tile for a marginal cash gain. ``me`` accepts
+        only when the value is strictly positive (and it can afford any cash it
+        owes).
 
         Returns ``(accepted: bool, value: float)``.
         """
@@ -260,7 +274,8 @@ class GUIAIDecider:
 
         value = float(cash_delta)
         value += sum(self._property_value(p) for p in gain)
-        value -= sum(self._property_value(p) for p in lose)
+        value -= sum(self._property_value(p) * (1.0 + self.KEEP_PREMIUM)
+                     for p in lose)
 
         # Strategic set synergy. Only ``me`` and ``other`` change holdings.
         value += self.SET_BONUS * self._set_swing(me, gain, lose)
