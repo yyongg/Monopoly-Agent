@@ -122,17 +122,24 @@ A_MORTGAGE = 62      # A_MORTGAGE + i
 A_UNMORTGAGE = 90    # A_UNMORTGAGE + i
 A_TRADE = 118        # A_TRADE + i: propose to acquire ownable tile i by trade
 NUM_OWNABLE = 28
+NUM_GROUPS = 10      # monopoly groups: 8 street colors + railroads + utilities
 A_TRADE_ACCEPT = 146     # accept a trade offered to me (PHASE_TRADE_RESPOND)
 A_TRADE_REJECT = 147     # reject a trade offered to me
 A_AUCTION_PASS = 148     # bid nothing in the current auction
-A_AUCTION_BID = 149      # A_AUCTION_BID + k: bid BID_FRACTIONS[k] * price
-NUM_BID_LEVELS = 5
-# Sealed-bid buckets as a multiple of the property's list price. Capped at
-# 1.5x so that winning is never a net-worth loss under ACQUISITION_PREMIUM=0.5
-# (a property is booked at price * 1.5), while still letting the agent learn a
-# context-dependent valuation by choosing how high to bid.
-BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5]
-NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 154
+A_AUCTION_BID = 149      # A_AUCTION_BID + k: bid BID_FRACTIONS[k] * bid-value
+NUM_BID_LEVELS = 6
+# Auction bid buckets, each a multiple of the property's *value to the bidder*
+# (``_bid_value``: list price, boosted when the tile completes the bidder's set
+# or blocks an opponent's). Scaling by value -- not raw list price -- lets the
+# agent pay a premium for a pivotal tile while staying conservative on ordinary
+# ones. The absolute bid is still bounded by ``BID_CEILING_MULT`` * list price
+# and by cash (see ``_make_bid_hook``).
+BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+BID_CEILING_MULT = 3.0   # hard ceiling on any bid, as a multiple of list price
+DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
+DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
+#                          as a fraction of that denied set's shaped value
+NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # Sentinels passed between the worker thread and the env.
 _TERMINAL = "__terminal__"
@@ -218,12 +225,15 @@ class MonopolyEnv(_GymEnv):
             if isinstance(t, (StreetProperty, Railroad, Utility))
         ]
         assert len(self._ownable_template) == NUM_OWNABLE
+        assert len(self._build_groups(self._ownable_template)) == NUM_GROUPS
 
         self.action_space = Discrete(NUM_ACTIONS)
         obs_len = (5 * num_players
                    + NUM_OWNABLE * (num_players + 3)
                    + NUM_PHASES + 1
-                   + 3)  # trade context: received tile, given tile, net cash
+                   + 3               # trade context: recv tile, give tile, cash
+                   + 2               # context flags: completes mine / opp's set
+                   + NUM_GROUPS * 2)  # per-group progress: mine / max-opp frac
         self.observation_space = Box(
             low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
@@ -241,7 +251,8 @@ class MonopolyEnv(_GymEnv):
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
         self._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
         self._traded_this_manage = set()  # trade targets tried this MANAGE phase
-        self._prev_networth = 0.0
+        self._prev_advantage = 0.0  # last relative-advantage potential (shaping)
+        self._pending_bonus = 0.0   # denial reward queued by the on_acquire hook
         self._truncated = False
         self.game = None
         self.ownable = []
@@ -277,10 +288,14 @@ class MonopolyEnv(_GymEnv):
         # Shortfalls are dispatched by payer: the agent and any policy-driven
         # opponents may liquidate; baseline opponents fall through to bankruptcy.
         self.game.on_shortfall = self._on_shortfall
+        # Credit a denial bonus whenever a tile changes hands to the agent.
+        self.game.on_acquire = self._on_acquire
 
         self._done = False
         self._truncated = False
-        self._prev_networth = self._net_worth(controlled)
+        self._prev_advantage = (self._net_worth(controlled)
+                                - self._mean_opp_networth())
+        self._pending_bonus = 0.0
         self._thread = threading.Thread(target=self._run_game, daemon=True)
         self._thread.start()
         obs, _, _, _, info = self._pump_until_request()
@@ -380,11 +395,12 @@ class MonopolyEnv(_GymEnv):
         """Returns a ``decide_bid(prop, min_bid)`` hook routed through ``decide``.
 
         Each ascending-auction round the decider picks a bid bucket for ``prop``;
-        the hook reads it as the seat's valuation ceiling (a fraction of list
-        price, capped at cash). It matches the round's ``min_bid`` while that
-        ceiling covers it, and otherwise passes -- so the agent stays in the
-        bidding until the price climbs past what its chosen bucket is worth.
-        ``A_AUCTION_PASS`` (or an unaffordable bucket) drops out immediately.
+        the hook reads it as the seat's valuation ceiling -- a fraction of the
+        tile's *value to this bidder* (``_bid_value``), bounded by
+        ``BID_CEILING_MULT`` * list price and by cash. It matches the round's
+        ``min_bid`` while that ceiling covers it, and otherwise passes -- so the
+        agent stays in the bidding until the price climbs past what its chosen
+        bucket is worth. ``A_AUCTION_PASS`` (or an unaffordable bucket) drops out.
         """
         player = self.game.players[seat]
 
@@ -392,7 +408,9 @@ class MonopolyEnv(_GymEnv):
             action = decide(PHASE_AUCTION, prop)
             k = action - A_AUCTION_BID
             if 0 <= k < NUM_BID_LEVELS:
-                ceiling = min(int(round(BID_FRACTIONS[k] * prop.price)),
+                value = self._bid_value(player, prop)
+                ceiling = min(int(round(BID_FRACTIONS[k] * value)),
+                              int(round(BID_CEILING_MULT * prop.price)),
                               player.balance)
                 if min_bid <= 0:
                     return ceiling
@@ -400,6 +418,46 @@ class MonopolyEnv(_GymEnv):
             return 0  # A_AUCTION_PASS or anything unexpected
 
         return hook
+
+    def _group_price(self, grp):
+        """Total list price of every tile in a monopoly group."""
+        return sum(t.price for t in grp)
+
+    def _bid_value(self, player, prop):
+        """``prop``'s value to ``player`` for auction bidding: its list price,
+        boosted by the group's value when winning it completes ``player``'s own
+        set, or (weighted) when it would complete an opponent's set -- so the
+        ceiling reflects how pivotal the tile is, not just its sticker price."""
+        value = float(prop.price)
+        grp = self._group_of.get(id(prop))
+        if grp is None:
+            return value
+        if self._completes_monopoly_for(player, prop):
+            value += self.MONOPOLY_BONUS * self._group_price(grp)
+        elif any(o is not player and not o.bankrupt
+                 and self._completes_monopoly_for(o, prop)
+                 for o in self.game.players):
+            value += (DENIAL_VALUE_WEIGHT * self.MONOPOLY_BONUS
+                      * self._group_price(grp))
+        return value
+
+    def _on_acquire(self, player, prop):
+        """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
+
+        If the controlled agent took a tile that was an opponent's last-missing
+        piece, queue a one-time denial bonus (it blocked their monopoly). The
+        completion test ignores ``prop``'s new owner, so evaluating it after the
+        transfer is correct."""
+        if player is not self.game.players[self.seat]:
+            return
+        grp = self._group_of.get(id(prop))
+        if grp is None:
+            return
+        if any(o is not player and not o.bankrupt
+               and self._completes_monopoly_for(o, prop)
+               for o in self.game.players):
+            self._pending_bonus += (DENIAL_BONUS_COEF * self.MONOPOLY_BONUS
+                                    * self._group_price(grp) / 1000.0)
 
     # -- Game construction --------------------------------------------------
     def _build_game(self):
@@ -431,17 +489,19 @@ class MonopolyEnv(_GymEnv):
 
     @staticmethod
     def _build_groups(ownable):
-        """Groups ownable tiles into the sets that form a monopoly."""
+        """Groups ownable tiles into the sets that form a monopoly, returned in
+        a stable order (by group key) so the per-group observation features line
+        up identically between the env and the GUI mirror."""
         groups = {}
         for t in ownable:
             if isinstance(t, StreetProperty):
                 key = ("street", t.color)
             elif isinstance(t, Railroad):
-                key = ("railroad", None)
+                key = ("railroad", "")
             else:
-                key = ("utility", None)
+                key = ("utility", "")
             groups.setdefault(key, []).append(t)
-        return list(groups.values())
+        return [groups[k] for k in sorted(groups)]
 
     def _make_roll_dice(self, game):
         """Returns a ``roll_dice`` bound to this env's private RNG."""
@@ -938,6 +998,26 @@ class MonopolyEnv(_GymEnv):
         else:
             parts.extend([-1.0, -1.0, 0.0])
 
+        # Set-awareness. Two context flags for the property in play: does
+        # acquiring it complete *my* set, and is it an opponent's last-missing
+        # tile (completing it would finish *their* set)?
+        me = g.players[perspective]
+        opponents = [g.players[(perspective + k) % n] for k in range(1, n)]
+        parts.append(1.0 if prop is not None
+                     and self._completes_monopoly_for(me, prop) else 0.0)
+        parts.append(1.0 if prop is not None and any(
+            not o.bankrupt and self._completes_monopoly_for(o, prop)
+            for o in opponents) else 0.0)
+
+        # Per-group progress: how much of each monopoly group I own, and the
+        # most any single opponent owns -- general set-awareness for bidding,
+        # building, and trading.
+        for grp in self._groups:
+            size = len(grp)
+            parts.append(sum(1 for t in grp if t.owner is me) / size)
+            parts.append(max((sum(1 for t in grp if t.owner is o)
+                              for o in opponents), default=0) / size)
+
         return np.asarray(parts, dtype=np.float32)
 
     def _net_worth(self, player):
@@ -1021,12 +1101,30 @@ class MonopolyEnv(_GymEnv):
         controlled = self.game.players[self.seat]
         reward = 0.0
         if self.reward_mode == "shaped":
-            nw = self._net_worth(controlled)
-            reward += (nw - self._prev_networth) / 1000.0
-            self._prev_networth = nw
+            # Shape on *relative* advantage (my net worth minus the mean
+            # opponent's), not absolute net worth. This way an opponent
+            # completing a set raises the baseline and costs me reward -- so the
+            # agent is pushed to spend to block it -- while finishing my own set
+            # still pays. It telescopes over the episode, so the decisive
+            # terminal reward is unaffected.
+            adv = self._net_worth(controlled) - self._mean_opp_networth()
+            reward += (adv - self._prev_advantage) / 1000.0
+            self._prev_advantage = adv
+            # One-time bonus for snatching an opponent's last-missing tile
+            # (denying their monopoly); credited by the on_acquire hook.
+            reward += self._pending_bonus
+            self._pending_bonus = 0.0
         if terminal:
             reward += self._terminal_reward()
         return reward
+
+    def _mean_opp_networth(self):
+        """Mean net worth of the controlled seat's non-bankrupt opponents (0 if
+        none remain), the baseline for the relative shaped reward."""
+        controlled = self.game.players[self.seat]
+        others = [self._net_worth(p) for p in self.game.players
+                  if p is not controlled and not p.bankrupt]
+        return sum(others) / len(others) if others else 0.0
 
     def _info(self, terminal=False):
         info = {

@@ -36,6 +36,17 @@ class Game:
         # play and the RL layer (where liquidation is part of the policy).
         self.on_shortfall = None
 
+        # Optional hook: called as on_acquire(player, prop) right after a
+        # property changes hands to ``player`` (auction win, purchase, trade, or
+        # bankruptcy inheritance). The RL layer uses it to reward blocking an
+        # opponent's monopoly. Left as None for headless play.
+        self.on_acquire = None
+
+        # Optional hook: called as on_auction_end(prop, winner, bid) when an
+        # auction resolves (winner None if it drew no bids). Used by simulate.py
+        # for auction analytics. Left as None otherwise.
+        self.on_auction_end = None
+
     def announce(self, message):
         """
         Reports an automatic game event via the optional ``notify`` hook so the
@@ -111,11 +122,18 @@ class Game:
         """
         if player.decide_purchase(prop):
             if prop.buy(player):
+                self._acquired(player, prop)
                 return True
         # Not bought (declined, or unaffordable): the property goes to auction
         # among all remaining players, starting to the left of the one offered.
         self.run_auction(prop, self.players.index(player))
         return prop.owner is not None
+
+    def _acquired(self, player, prop):
+        """Fires the ``on_acquire`` hook (if set) after ``prop`` has just
+        transferred to ``player``."""
+        if self.on_acquire is not None:
+            self.on_acquire(player, prop)
 
     def run_auction(self, prop, start_index):
         """
@@ -178,6 +196,8 @@ class Game:
 
         if standing_bidder is None:
             self.announce(f"No one bid on {prop.name}; it stays with the bank.")
+            if self.on_auction_end is not None:
+                self.on_auction_end(prop, None, 0)
             return None
 
         standing_bidder.balance -= standing_bid
@@ -185,6 +205,9 @@ class Game:
         self.announce(
             f"{standing_bidder.name} won the auction for {prop.name} "
             f"at ${standing_bid}.")
+        if self.on_auction_end is not None:
+            self.on_auction_end(prop, standing_bidder, standing_bid)
+        self._acquired(standing_bidder, prop)
         return standing_bidder
 
     def build_house(self, prop, player):
@@ -280,8 +303,10 @@ class Game:
         partner.balance += cash
         for prop in give:
             prop.transfer_ownership(partner)
+            self._acquired(partner, prop)
         for prop in receive:
             prop.transfer_ownership(initiator)
+            self._acquired(initiator, prop)
         return True
 
     def award_go(self, player):

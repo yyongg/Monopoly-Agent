@@ -15,14 +15,18 @@ ahead -- see that method for the formula.
 import numpy as np
 
 from engine.rl_env import (
+    MonopolyEnv,
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
-    NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, BID_FRACTIONS,
+    NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_GROUPS,
+    NUM_BID_LEVELS, BID_FRACTIONS, BID_CEILING_MULT, DENIAL_VALUE_WEIGHT,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
 )
+
+MONOPOLY_BONUS = MonopolyEnv.MONOPOLY_BONUS
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
@@ -60,7 +64,9 @@ class GUIAIDecider:
         self.game = game
         self.ownable = ownable
         self._prop_index = {id(p): i for i, p in enumerate(ownable)}
-        self._groups = list(self._ownable_groups().values())
+        # Stable group order (by key), identical to MonopolyEnv._build_groups, so
+        # the per-group observation features line up with the trained model.
+        self._groups = [g for _, g in sorted(self._ownable_groups().items())]
         self._group_of = {id(t): grp for grp in self._groups for t in grp}
 
     # --- Public decision methods ---
@@ -101,14 +107,18 @@ class GUIAIDecider:
         """Returns this AI's bid for one ascending-auction round (0 passes).
 
         Mirrors the env's bid hook: the model picks a bucket read as a valuation
-        ceiling (a fraction of list price, capped at cash). The AI matches the
-        round's ``min_bid`` while that ceiling covers it, otherwise it drops out.
+        ceiling -- a fraction of the tile's *value to this bidder*
+        (``_bid_value``), bounded by ``BID_CEILING_MULT`` * list price and by
+        cash. The AI matches the round's ``min_bid`` while that ceiling covers
+        it, otherwise it drops out.
         """
         seat = self.game.players.index(player)
         action = self._decide(seat, PHASE_AUCTION, prop)
         k = action - A_AUCTION_BID
         if 0 <= k < NUM_BID_LEVELS:
-            ceiling = min(int(round(BID_FRACTIONS[k] * prop.price)),
+            value = self._bid_value(player, prop)
+            ceiling = min(int(round(BID_FRACTIONS[k] * value)),
+                          int(round(BID_CEILING_MULT * prop.price)),
                           player.balance)
             if min_bid <= 0:
                 return ceiling
@@ -116,6 +126,26 @@ class GUIAIDecider:
                 self.log(f"{player.name} [AI] bids ${min_bid} for {prop.name}.")
                 return min_bid
         return 0
+
+    def _group_price(self, grp):
+        """Total list price of every tile in a monopoly group."""
+        return sum(t.price for t in grp)
+
+    def _bid_value(self, player, prop):
+        """``prop``'s value to ``player`` for bidding (mirrors MonopolyEnv):
+        list price, boosted by the group's value when winning it completes
+        ``player``'s own set, or (weighted) when it blocks an opponent's set."""
+        value = float(prop.price)
+        grp = self._group_of.get(id(prop))
+        if grp is None:
+            return value
+        if self._completes_monopoly_for(player, prop):
+            value += MONOPOLY_BONUS * self._group_price(grp)
+        elif any(o is not player and not o.bankrupt
+                 and self._completes_monopoly_for(o, prop)
+                 for o in self.game.players):
+            value += DENIAL_VALUE_WEIGHT * MONOPOLY_BONUS * self._group_price(grp)
+        return value
 
     def manage_loop(self, player):
         """Issues management actions until the model chooses END_MANAGE."""
@@ -198,6 +228,22 @@ class GUIAIDecider:
             parts.append(tc["cash"] / 1500.0)
         else:
             parts.extend([-1.0, -1.0, 0.0])
+
+        # Set-awareness (mirrors MonopolyEnv): two context flags -- does the
+        # property in play complete my set / an opponent's set -- then per-group
+        # progress (my fraction, best opponent's fraction).
+        me = g.players[perspective]
+        opponents = [g.players[(perspective + k) % n] for k in range(1, n)]
+        parts.append(1.0 if prop is not None
+                     and self._completes_monopoly_for(me, prop) else 0.0)
+        parts.append(1.0 if prop is not None and any(
+            not o.bankrupt and self._completes_monopoly_for(o, prop)
+            for o in opponents) else 0.0)
+        for grp in self._groups:
+            size = len(grp)
+            parts.append(sum(1 for t in grp if t.owner is me) / size)
+            parts.append(max((sum(1 for t in grp if t.owner is o)
+                              for o in opponents), default=0) / size)
         return np.asarray(parts, dtype=np.float32)
 
     def _legal_mask(self, phase, prop, seat):
@@ -449,9 +495,9 @@ class GUIAIDecider:
             if isinstance(t, StreetProperty):
                 key = ("street", t.color)
             elif isinstance(t, Railroad):
-                key = ("railroad", None)
+                key = ("railroad", "")
             else:
-                key = ("utility", None)
+                key = ("utility", "")
             groups.setdefault(key, []).append(t)
         return groups
 

@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--opp-deterministic", action="store_true",
                         help="sampled opponents act greedily")
     # I/O.
-    parser.add_argument("--save-path", default="runs/monopoly_selfplay")
+    parser.add_argument("--save-path", default="runs/monopoly_ppo")
     parser.add_argument("--checkpoint-dir", default="runs/sp_checkpoints")
     parser.add_argument("--save-freq", type=int, default=200_000)
     parser.add_argument("--logdir", default="runs/sp_tb")
@@ -109,7 +109,7 @@ def main():
         callbacks.append(CheckpointCallback(
             save_freq=max(args.save_freq // args.n_envs, 1),
             save_path=args.checkpoint_dir,
-            name_prefix="monopoly_selfplay",
+            name_prefix="monopoly_ppo",
         ))
 
     model.learn(total_timesteps=args.timesteps, callback=callbacks,

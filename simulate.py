@@ -101,7 +101,30 @@ def play_one_game(env, policy, seed, max_turns):
     env._deciders = {s: env._make_policy_decider(s) for s in range(n)}
     for s, decide in env._deciders.items():
         g.players[s].decide_purchase = env._make_buy_hook(s, decide)
+        g.players[s].decide_bid = env._make_bid_hook(s, decide)
     g.on_shortfall = env._on_shortfall
+
+    # Auction analytics: for each auction that draws a bid, record how hard it
+    # was contested and whether the winner completed their own set or blocked an
+    # opponent who held the group's other tiles.
+    auction = {"won": 0, "blocking": 0, "self_complete": 0,
+               "self_ratios": [], "all_ratios": []}
+
+    def on_auction_end(prop, winner, bid):
+        if winner is None:
+            return
+        auction["won"] += 1
+        ratio = bid / prop.price if prop.price else 0.0
+        auction["all_ratios"].append(ratio)
+        completer = next((p for p in g.players if not p.bankrupt
+                          and env._completes_monopoly_for(p, prop)), None)
+        if completer is winner:
+            auction["self_complete"] += 1
+            auction["self_ratios"].append(ratio)
+        elif completer is not None:
+            auction["blocking"] += 1  # took an opponent's last-missing tile
+
+    g.on_auction_end = on_auction_end
 
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n
@@ -156,6 +179,7 @@ def play_one_game(env, policy, seed, max_turns):
         "length": turns,
         "timeout": winner_seat is None,
         "players": players,
+        "auction": auction,
     }
 
 
@@ -234,6 +258,13 @@ def aggregate(records, num_players):
         for label in group_ever
     }
 
+    # Auction aggression / blocking analytics (across all games).
+    auc_won = sum(r["auction"]["won"] for r in records)
+    auc_blocking = sum(r["auction"]["blocking"] for r in records)
+    auc_self = sum(r["auction"]["self_complete"] for r in records)
+    all_ratios = [x for r in records for x in r["auction"]["all_ratios"]]
+    self_ratios = [x for r in records for x in r["auction"]["self_ratios"]]
+
     return {
         "games": games,
         "decisive": len(decisive),
@@ -255,6 +286,14 @@ def aggregate(records, num_players):
                                             if winner_first_monopoly_turns else None),
         "frac_winners_with_monopoly": (np.mean([m > 0 for m in winner_num_monopolies])
                                        if winner_num_monopolies else 0.0),
+        "auctions_won": auc_won,
+        "auctions_won_per_game": auc_won / max(1, games),
+        "blocking_wins": auc_blocking,
+        "blocking_wins_per_game": auc_blocking / max(1, games),
+        "set_completion_wins": auc_self,
+        "mean_bid_price_ratio": float(np.mean(all_ratios)) if all_ratios else 0.0,
+        "mean_set_completion_bid_ratio": (float(np.mean(self_ratios))
+                                          if self_ratios else 0.0),
         "winner_net_worths": winner_net_worths,
         "winner_num_monopolies": winner_num_monopolies,
         "loser_num_monopolies": loser_num_monopolies,
@@ -290,6 +329,16 @@ def print_report(stats):
         print(f"  winner's first monopoly     : turn "
               f"{stats['mean_winner_first_monopoly_turn']:.0f} (mean)")
     print(f"  winner net worth            : ${stats['mean_winner_net_worth']:,.0f} (mean)")
+
+    print("\nAuction play (aggression & blocking):")
+    print(f"  auctions won            : {stats['auctions_won']} "
+          f"({stats['auctions_won_per_game']:.2f}/game)")
+    print(f"  blocking wins           : {stats['blocking_wins']} "
+          f"({stats['blocking_wins_per_game']:.2f}/game "
+          f"-- opponents' sets denied)")
+    print(f"  own-set-completion wins : {stats['set_completion_wins']}")
+    print(f"  mean winning bid / price: {stats['mean_bid_price_ratio']:.2f}  "
+          f"(set-completers {stats['mean_set_completion_bid_ratio']:.2f})")
 
     print("\nSets that most predict a win  (P(win | player ever completed the set)):")
     ranked = sorted(stats["group_win_rate"].items(),
