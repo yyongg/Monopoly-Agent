@@ -36,10 +36,12 @@ class Game:
         # play and the RL layer (where liquidation is part of the policy).
         self.on_shortfall = None
 
-        # Optional hook: called as on_acquire(player, prop) right after a
-        # property changes hands to ``player`` (auction win, purchase, trade, or
-        # bankruptcy inheritance). The RL layer uses it to reward blocking an
-        # opponent's monopoly. Left as None for headless play.
+        # Optional hook: called as on_acquire(player, prop, from_bank) right
+        # after a property changes hands to ``player`` (auction win, purchase,
+        # or trade). ``from_bank`` is True for a fresh acquisition from the bank
+        # (buying on landing or winning an auction) and False for a player-to-
+        # player trade. The RL layer uses it to reward acquiring properties and
+        # blocking an opponent's monopoly. Left as None for headless play.
         self.on_acquire = None
 
         # Optional hook: called as on_auction_end(prop, winner, bid) when an
@@ -122,18 +124,19 @@ class Game:
         """
         if player.decide_purchase(prop):
             if prop.buy(player):
-                self._acquired(player, prop)
+                self._acquired(player, prop, from_bank=True)
                 return True
         # Not bought (declined, or unaffordable): the property goes to auction
         # among all remaining players, starting to the left of the one offered.
         self.run_auction(prop, self.players.index(player))
         return prop.owner is not None
 
-    def _acquired(self, player, prop):
+    def _acquired(self, player, prop, from_bank=False):
         """Fires the ``on_acquire`` hook (if set) after ``prop`` has just
-        transferred to ``player``."""
+        transferred to ``player``. ``from_bank`` marks a fresh acquisition from
+        the bank (buy on landing / auction win) versus a player-to-player trade."""
         if self.on_acquire is not None:
-            self.on_acquire(player, prop)
+            self.on_acquire(player, prop, from_bank)
 
     def run_auction(self, prop, start_index):
         """
@@ -207,7 +210,7 @@ class Game:
             f"at ${standing_bid}.")
         if self.on_auction_end is not None:
             self.on_auction_end(prop, standing_bidder, standing_bid)
-        self._acquired(standing_bidder, prop)
+        self._acquired(standing_bidder, prop, from_bank=True)
         return standing_bidder
 
     def build_house(self, prop, player):
