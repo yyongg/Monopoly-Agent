@@ -24,6 +24,7 @@ from engine.rl_env import (
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
+    load_landing_frequencies, base_rent,
 )
 
 MONOPOLY_BONUS = MonopolyEnv.MONOPOLY_BONUS
@@ -68,6 +69,10 @@ class GUIAIDecider:
         # the per-group observation features line up with the trained model.
         self._groups = [g for _, g in sorted(self._ownable_groups().items())]
         self._group_of = {id(t): grp for grp in self._groups for t in grp}
+        # Landing-frequency prior + board size, mirroring MonopolyEnv so the
+        # economics features of the observation match the trained model.
+        self._land_freq = load_landing_frequencies()
+        self._board_size = game.board.length
 
     # --- Public decision methods ---
 
@@ -244,6 +249,18 @@ class GUIAIDecider:
             parts.append(sum(1 for t in grp if t.owner is me) / size)
             parts.append(max((sum(1 for t in grp if t.owner is o)
                               for o in opponents), default=0) / size)
+        # Economics of the property in play (mirrors MonopolyEnv): price, a
+        # nominal rent, and landing traffic vs an average tile; 0s when none.
+        econ = prop
+        if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
+            econ = tc.get("recv")
+        if econ is not None:
+            uniform = 1.0 / self._board_size
+            parts.append(econ.price / 400.0)
+            parts.append(base_rent(econ) / 50.0)
+            parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+        else:
+            parts.extend([0.0, 0.0, 0.0])
         return np.asarray(parts, dtype=np.float32)
 
     def _legal_mask(self, phase, prop, seat):

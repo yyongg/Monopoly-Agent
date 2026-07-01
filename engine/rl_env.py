@@ -60,6 +60,8 @@ Illegal actions (those not set in the mask) are clamped to a safe default rather
 than raising, and reported via ``info["illegal"]``.
 """
 
+import json
+import os
 import queue
 import random
 import threading
@@ -140,6 +142,49 @@ DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
 DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 #                          as a fraction of that denied set's shaped value
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
+
+# --- Landing-frequency prior ----------------------------------------------
+# How often each board tile is landed on, precomputed by
+# ``validation/board_visits.py`` (a movement-only Monte-Carlo). Fed into the
+# observation so the agent can value a high-traffic property above a quiet one
+# of the same price: a tile landed on twice as often earns ~twice the rent.
+# Stored as a share of all landings (sums to ~1 over the 40 tiles); the
+# observation multiplies by the board size to express it as a "traffic vs even"
+# multiple (1.0 == average). If the table is missing the env falls back to a
+# uniform prior, so training still runs (every tile just looks average).
+LANDING_FREQ_PATH = os.path.join("runs", "board_visits.json")
+_LAND_FREQ_CACHE = None
+
+
+def load_landing_frequencies(path=LANDING_FREQ_PATH):
+    """Returns ``{board_pos: landing_share}`` from the saved visit table.
+
+    Cached after first load. On a missing/unreadable file returns ``{}``, which
+    callers treat as a uniform prior (see ``base_traffic``)."""
+    global _LAND_FREQ_CACHE
+    if _LAND_FREQ_CACHE is not None:
+        return _LAND_FREQ_CACHE
+    freqs = {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        for t in data["tiles"]:
+            freqs[int(t["pos"])] = float(t["frequency"])
+    except (OSError, ValueError, KeyError):
+        freqs = {}
+    _LAND_FREQ_CACHE = freqs
+    return freqs
+
+
+def base_rent(prop):
+    """A nominal single-ownership rent for ``prop``, used as a scale-normalised
+    "rent it can collect" observation feature (exact value is unimportant)."""
+    if isinstance(prop, StreetProperty):
+        return float(prop.rent_table[0])
+    if isinstance(prop, Railroad):
+        return 25.0            # nominal one-railroad rent
+    return 28.0               # utility: 4x an average roll of 7
+
 
 # Sentinels passed between the worker thread and the env.
 _TERMINAL = "__terminal__"
@@ -233,7 +278,8 @@ class MonopolyEnv(_GymEnv):
                    + NUM_PHASES + 1
                    + 3               # trade context: recv tile, give tile, cash
                    + 2               # context flags: completes mine / opp's set
-                   + NUM_GROUPS * 2)  # per-group progress: mine / max-opp frac
+                   + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
+                   + 3)              # context prop economics: price, rent, traffic
         self.observation_space = Box(
             low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
@@ -486,6 +532,10 @@ class MonopolyEnv(_GymEnv):
         # precomputed once for the completed-set reward bonus and trade logic.
         self._groups = self._build_groups(self.ownable)
         self._group_of = {id(t): grp for grp in self._groups for t in grp}
+        # Landing-frequency prior (share per board pos) and the board size, used
+        # to expose each tile's "traffic vs even" multiple in the observation.
+        self._land_freq = load_landing_frequencies()
+        self._board_size = board.length
 
     @staticmethod
     def _build_groups(ownable):
@@ -1017,6 +1067,22 @@ class MonopolyEnv(_GymEnv):
             parts.append(sum(1 for t in grp if t.owner is me) / size)
             parts.append(max((sum(1 for t in grp if t.owner is o)
                               for o in opponents), default=0) / size)
+
+        # Economics of the property in play (the tile being bought / auctioned /
+        # traded for): its price, a nominal rent, and how often it is landed on
+        # relative to an average tile (1.0 == even). Together these let the agent
+        # weigh traffic against cost and rent when valuing an acquisition; 0s
+        # when no single property is in play.
+        econ = prop
+        if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
+            econ = tc.get("recv")
+        if econ is not None:
+            uniform = 1.0 / self._board_size
+            parts.append(econ.price / 400.0)
+            parts.append(base_rent(econ) / 50.0)
+            parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+        else:
+            parts.extend([0.0, 0.0, 0.0])
 
         return np.asarray(parts, dtype=np.float32)
 
