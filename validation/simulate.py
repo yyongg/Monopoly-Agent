@@ -152,7 +152,7 @@ def play_one_game(env, policy, seed, max_turns):
     g.declare_bankrupt = tracking_declare
     # A legitimate (re)acquisition -- buy, auction win, or trade -- clears the
     # inherited flag; bankruptcy inheritance doesn't fire this hook.
-    g.on_acquire = lambda player, prop, from_bank=False: inherited_ids.discard(id(prop))
+    g.on_acquire = lambda player, prop, source="trade": inherited_ids.discard(id(prop))
 
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n

@@ -141,15 +141,24 @@ BID_CEILING_MULT = 3.0   # hard ceiling on any bid, as a multiple of list price
 DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
 DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 #                          as a fraction of that denied set's shaped value
-# One-time reward for acquiring an unowned property from the bank (buying on
-# landing or winning its auction), scaled by the tile's *expected income*
-# (landing traffic x nominal rent). This breaks the passive "decline everything
-# and let it go to auction" equilibrium that self-play falls into -- declining a
-# property forgoes this bonus, and rewarding auction wins makes the agent
-# contest auctions rather than hand properties to opponents. Scaling by expected
-# income keeps it "balanced": busy, high-rent tiles are worth chasing while junk
-# earns almost nothing, so the agent buys good properties without overextending.
+# One-time reward for acquiring an unowned property from the bank, scaled by the
+# tile's *expected income* (landing traffic x nominal rent) so busy, high-rent
+# tiles are worth chasing while junk earns almost nothing. This breaks the
+# passive "decline everything and let it go to auction" equilibrium that
+# self-play falls into.
+#
+# Buying on landing earns the *full* bonus; winning the same tile at auction
+# earns only ``AUCTION_ACQUISITION_BONUS_COEF``. The gap is the fix for the agent
+# auctioning every property: because the shaped net worth already values an owned
+# tile above its cash price, declining-then-sniping a cheaper auction was as
+# good as (or better than) buying at list for the *same* bonus -- so the policy
+# declined everything and handed cheap tiles to opponents whenever it lost the
+# ensuing auction. Making a direct buy strictly more rewarding than an auction
+# win gives the agent a clear reason to buy the tile it wants outright, while the
+# smaller auction bonus still keeps it contesting auctions (rather than conceding
+# them) for tiles it declined or that an opponent put up.
 ACQUISITION_BONUS_COEF = 3.0
+AUCTION_ACQUISITION_BONUS_COEF = 1.0
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -503,26 +512,32 @@ class MonopolyEnv(_GymEnv):
         traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         return traffic * base_rent(prop)
 
-    def _on_acquire(self, player, prop, from_bank=False):
+    def _on_acquire(self, player, prop, source="trade"):
         """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
 
-        For the controlled agent, queue two one-time shaped bonuses:
+        ``source`` is "buy" (bought on landing), "auction" (won at auction), or
+        "trade" (player-to-player). For the controlled agent, queue two one-time
+        shaped bonuses:
 
-        * **Acquisition** -- when the tile was taken fresh from the bank
-          (``from_bank``: a buy on landing or an auction win), a reward scaled by
-          its expected income, so the agent actively acquires properties instead
-          of dumping them to auction, and contests auctions it would otherwise
-          concede. Player-to-player trades don't earn it (they aren't the source
-          of the passivity problem and net worth already prices them).
+        * **Acquisition** -- when the tile was taken fresh from the bank, a reward
+          scaled by its expected income, so the agent actively acquires properties
+          instead of dumping them to auction. Buying on landing earns the full
+          ``ACQUISITION_BONUS_COEF``; an auction win earns the smaller
+          ``AUCTION_ACQUISITION_BONUS_COEF`` -- so buying the tile it wants
+          outright beats declining it and sniping the cheaper auction, while
+          winning is still worth more than conceding to an opponent. Trades don't
+          earn it (they aren't the source of the passivity problem and net worth
+          already prices them).
         * **Denial** -- when the tile was an opponent's last-missing piece,
           blocking their monopoly (any source). The completion test ignores
           ``prop``'s new owner, so evaluating it after the transfer is correct.
         """
         if player is not self.game.players[self.seat]:
             return
-        if from_bank:
-            self._pending_bonus += (ACQUISITION_BONUS_COEF
-                                    * self._expected_income(prop) / 1000.0)
+        if source in ("buy", "auction"):
+            coef = (ACQUISITION_BONUS_COEF if source == "buy"
+                    else AUCTION_ACQUISITION_BONUS_COEF)
+            self._pending_bonus += coef * self._expected_income(prop) / 1000.0
         grp = self._group_of.get(id(prop))
         if grp is None:
             return
