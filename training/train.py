@@ -143,7 +143,7 @@ def main():
     venv.close()
 
     # Final evaluation on a fresh single environment vs the baseline.
-    from evaluate import run_evaluation
+    from validation.evaluate import run_evaluation
 
     eval_env = MonopolyEnv(seat=0, reward_mode=args.reward_mode,
                            seed=args.seed + 10_000)

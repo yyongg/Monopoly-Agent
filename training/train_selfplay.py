@@ -119,7 +119,7 @@ def main():
     venv.close()
 
     # Final evaluation against the fixed baseline (a stationary yardstick).
-    from evaluate import run_evaluation
+    from validation.evaluate import run_evaluation
 
     eval_env = MonopolyEnv(seat=0, reward_mode=args.reward_mode,
                            seed=args.seed + 10_000)
