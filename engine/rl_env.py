@@ -154,6 +154,14 @@ class MonopolyEnv(_GymEnv):
 
     metadata = {"render_modes": []}
 
+    # Shaped-reward premium on an owned, unmortgaged property above its cash
+    # price. A property earns rent, so it is worth more than the cash paid for
+    # it; without this premium buying is exactly net-worth-neutral (reward 0)
+    # and the policy collapses to "always decline". With it, buying yields a
+    # small positive shaped reward (premium * price / 1000), so acquisition is
+    # encouraged while the terminal -1 still punishes reckless over-buying.
+    ACQUISITION_PREMIUM = 0.5
+
     def __init__(self, seat=None, num_players=4, names=None, max_turns=1000,
                  reward_mode="shaped", seed=None, opponent_policy=None,
                  opponent_provider=None):
@@ -645,20 +653,25 @@ class MonopolyEnv(_GymEnv):
         return np.asarray(parts, dtype=np.float32)
 
     def _net_worth(self, player):
-        """Liquidation-style net worth used for reward shaping.
+        """Net worth used for reward shaping.
+
+        An owned, unmortgaged property is valued at ``price * (1 +
+        ACQUISITION_PREMIUM)``: above the cash price, reflecting the rent it
+        earns, so *buying* a property is a small net gain (cash ``-price`` but
+        property ``+price*(1+premium)``) rather than net-worth-neutral. Without
+        that premium buying scores reward 0 and the policy collapses to "always
+        decline".
 
         A mortgaged property is valued at ``price - unmortgage_cost`` (its worth
-        once the outstanding mortgage debt is cleared) rather than at its
-        mortgage value. Because mortgaging also pays the owner ``mortgage_value``
-        in cash, this makes the round trip cost exactly the ~10% mortgage
-        interest -- so the agent sees a real (if small) net-worth penalty for
-        mortgage-flipping a property it just bought, instead of mortgaging being
-        net-worth-neutral and therefore "free".
+        once the outstanding mortgage debt is cleared). Combined with the
+        ``mortgage_value`` cash a mortgage pays out, this makes forced
+        mortgaging during liquidation a clear net-worth loss -- the agent only
+        does it when it genuinely needs the cash.
         """
         total = float(player.balance)
         for prop in player.properties:
             total += (prop.price - prop.unmortgage_cost) if prop.mortgaged \
-                else prop.price
+                else prop.price * (1.0 + self.ACQUISITION_PREMIUM)
             if isinstance(prop, StreetProperty):
                 total += prop.houses * (prop.house_cost() // 2)
         return total
