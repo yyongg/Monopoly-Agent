@@ -310,6 +310,9 @@ class MonopolyApp:
         self._ai_deciders = ai_deciders or {}
         self.log = []
         self.selected = None
+        # Row offset for the open inventory panel, so a player owning more
+        # properties than fit on screen can be scrolled through (mouse wheel).
+        self._inv_scroll = 0
         # Player-panel click targets from the last drawn scene, so animation
         # frames (the only input path during all-AI turns) can toggle the
         # inventory view too.
@@ -626,31 +629,69 @@ class MonopolyApp:
             worth += prop.houses * prop.house_cost()
         return worth
 
+    ROW_H = 30  # pixel height of one inventory row
+
     def _draw_inventory(self, y, player, bottom):
         self._text(f"{player.name}'s inventory", (SIDE_X, y), self.f_head,
                    FELT_INK, shadow=True)
-        if player.properties:
-            total = sum(self._property_worth(p) for p in player.properties)
+        props = player.properties
+
+        # How many rows fit, and how far we may scroll, given the space below
+        # the header. Clamp the stored scroll here so the wheel handler can
+        # never push it past the last page.
+        list_top = y + 56
+        visible = max(1, (bottom - list_top) // self.ROW_H)
+        max_scroll = max(0, len(props) - visible)
+        self._inv_scroll = max(0, min(self._inv_scroll, max_scroll))
+        scroll = self._inv_scroll
+
+        if props:
+            total = sum(self._property_worth(p) for p in props)
             subline = f"${total} in property  ·  click the player again to close"
+            if max_scroll:
+                first, last = scroll + 1, min(scroll + visible, len(props))
+                subline = (f"${total} in property  ·  showing {first}-{last} of "
+                           f"{len(props)}  ·  scroll to see more")
         else:
             subline = "(click the player again to close)"
         self._text(subline, (SIDE_X, y + 28), self.f_small, FELT_SUB,
                    shadow=True)
-        y += 56
-        if not player.properties:
+        y = list_top
+        if not props:
             self._text("No properties owned.", (SIDE_X, y), self.f_body,
                        FELT_SUB, shadow=True)
             return
-        for prop in player.properties:
-            if y > bottom - 30:
-                break
+
+        # A scrollbar on the right edge indicates position when overflowing;
+        # nudge the row text left of it so they don't overlap.
+        text_right = SIDE_X + SIDE_W - (12 if max_scroll else 0)
+        for prop in props[scroll:scroll + visible]:
             houses, rent = self._rent_line(prop)
             self._draw_property_chip(prop, SIDE_X, y)
             info = f"${self._property_worth(prop)}  ·  {houses}  ·  {rent}"
             w = self.f_small.size(info)[0]
-            self._text(info, (SIDE_X + SIDE_W - w, y), self.f_small, FELT_SUB,
+            self._text(info, (text_right - w, y), self.f_small, FELT_SUB,
                        shadow=True)
-            y += 30
+            y += self.ROW_H
+
+        if max_scroll:
+            self._draw_inventory_scrollbar(list_top, visible, len(props), scroll)
+
+    def _draw_inventory_scrollbar(self, top, visible, total, scroll):
+        """Draws a slim scrollbar for the inventory list along the panel edge."""
+        track_h = visible * self.ROW_H
+        x = SIDE_X + SIDE_W - 5
+        pygame.draw.rect(self.screen, FELT_SUB,
+                         pygame.Rect(x, top, 3, track_h), border_radius=2)
+        thumb_h = max(18, int(track_h * visible / total))
+        thumb_y = top + int((track_h - thumb_h) * scroll / max(1, total - visible))
+        pygame.draw.rect(self.screen, FELT_INK,
+                         pygame.Rect(x, thumb_y, 3, thumb_h), border_radius=2)
+
+    def _scroll_inventory(self, dy):
+        """Scrolls the open inventory panel by ``dy`` wheel notches (up = +)."""
+        if self.selected is not None:
+            self._inv_scroll = max(0, self._inv_scroll - dy)
 
     def _property_color(self, prop):
         if isinstance(prop, StreetProperty):
@@ -846,6 +887,8 @@ class MonopolyApp:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     raise QuitGame
+                if event.type == pygame.MOUSEWHEEL:
+                    self._scroll_inventory(event.y)
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, value in buttons:
                         if rect.collidepoint(event.pos):
@@ -853,6 +896,7 @@ class MonopolyApp:
                     for rect, index in player_rects:
                         if rect.collidepoint(event.pos):
                             self.selected = None if self.selected == index else index
+                            self._inv_scroll = 0
                 if event.type == pygame.KEYDOWN:
                     idx = event.key - pygame.K_1
                     if 0 <= idx < len(options):
@@ -872,6 +916,9 @@ class MonopolyApp:
             # while AI turns animate. Any key press still skips.
             if event.type == pygame.KEYDOWN:
                 skip = True
+            elif event.type == pygame.MOUSEWHEEL:
+                # Scrolling the inventory must not skip the animation.
+                self._scroll_inventory(event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if board_rect.collidepoint(event.pos):
                     skip = True
@@ -883,6 +930,7 @@ class MonopolyApp:
                         if rect.collidepoint(event.pos):
                             self.selected = (None if self.selected == index
                                              else index)
+                            self._inv_scroll = 0
                             break
         self._draw_scene()
         pygame.display.flip()
