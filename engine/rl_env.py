@@ -195,6 +195,30 @@ BUY_PREFERENCE_COEF = 1.30
 # leads into houses harder, lower it if the agent over-builds into rent it then
 # cannot cover.
 BUILD_BONUS_COEF = 0.5
+# Cost-normalised strategy signals derived from landing traffic (visualised by
+# ``validation/traffic_plots.py`` -> ``buy_yield.png`` / ``development_roi.png``).
+# Two board facts these surface -- both confirmed by Monopoly analysts -- are
+# handed to the agent so it need not rediscover them from self-play alone:
+#   * **buy yield** = expected income / price. The railroads, the utilities, and
+#     the cheap high-traffic streets return the most rent per dollar of *purchase*
+#     price -- the best value acquisitions.
+#   * **development ROI** = traffic x rent-gain / build cost. The orange and
+#     light-blue groups return the most rent per dollar sunk into *houses* -- the
+#     best value to develop.
+# Both are fed into the observation (so the learned policy can weigh them when
+# buying and when trading). Development ROI additionally tilts two shaped values
+# toward the cheap-to-develop money groups: the build bonus (below) and the value
+# of completing a colour set in a trade (:meth:`_set_quality`).
+#
+# ``BUILD_ROI_REF_HOUSE_COST`` is the house cost at which the build tilt
+# (ref / house_cost) is 1.0; set to the groups' harmonic-mean house cost so the
+# *average* build bonus is unchanged and only its distribution across colours
+# shifts -- cheap-house sets up, pricey-house sets down. The set-completion tilt
+# (avg group dev-ROI / ``SET_ROI_REF``) is clamped to ``SET_QUALITY_CLAMP`` so it
+# nudges rather than dominates the sticker/traffic value already in a trade.
+BUILD_ROI_REF_HOUSE_COST = 95.0
+SET_ROI_REF = 1.3
+SET_QUALITY_CLAMP = (0.75, 1.25)
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -333,7 +357,8 @@ class MonopolyEnv(_GymEnv):
                    + 3               # trade context: recv tile, give tile, cash
                    + 2               # context flags: completes mine / opp's set
                    + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
-                   + 3)              # context prop economics: price, rent, traffic
+                   + 5)              # context prop economics: price, rent,
+                                     # traffic, buy-yield, dev-ROI
         self.observation_space = Box(
             low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
@@ -548,16 +573,56 @@ class MonopolyEnv(_GymEnv):
         traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         return traffic * base_rent(prop)
 
+    def _buy_yield(self, prop):
+        """Expected rent per dollar of purchase price: ``_expected_income`` /
+        price. The cost-normalised "how cheap is this for what it earns" signal
+        (``buy_yield.png``) -- high for the railroads/utilities and the cheap
+        high-traffic streets, the best value acquisitions."""
+        price = float(getattr(prop, "price", 0) or 0)
+        return self._expected_income(prop) / price if price else 0.0
+
+    def _dev_roi(self, prop):
+        """Expected extra rent from a full hotel per dollar sunk into houses (a
+        hotel is five house-purchases): traffic x (hotel rent - base rent) /
+        (5 x house cost). The "best set to develop" signal (``development_roi``)
+        -- peaks on the orange and light-blue groups. Zero for railroads and
+        utilities, which never build."""
+        if not isinstance(prop, StreetProperty):
+            return 0.0
+        uniform = 1.0 / self._board_size
+        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
+        build_cost = 5.0 * prop.house_cost()
+        rent_gain = traffic * (prop.rent_table[-1] - prop.rent_table[0])
+        return rent_gain / build_cost if build_cost else 0.0
+
+    def _set_quality(self, grp):
+        """Development-ROI multiplier for a colour group (~1.0 average), used to
+        prize *completing* an efficient, cheap-to-develop set above a
+        sticker-equal but sluggish one. The average dev-ROI over the group's
+        streets, expressed against ``SET_ROI_REF`` and clamped to
+        ``SET_QUALITY_CLAMP``: >1 for the orange/light-blue money groups, <1 for
+        the pricey greens/dark-blue. Neutral (1.0) for railroad/utility groups,
+        which never build."""
+        rois = [self._dev_roi(t) for t in grp if isinstance(t, StreetProperty)]
+        if not rois:
+            return 1.0
+        lo, hi = SET_QUALITY_CLAMP
+        return max(lo, min(hi, (sum(rois) / len(rois)) / SET_ROI_REF))
+
     def _build_bonus(self, prop):
         """Shaped bonus for the house/hotel just added to ``prop`` (see
         ``BUILD_BONUS_COEF``): the rent the new house adds -- its rent-table jump
-        over the previous level, weighted by the tile's landing traffic. Called
-        after :meth:`Game.build_house` has incremented ``prop.houses``."""
+        over the previous level, weighted by the tile's landing traffic and by a
+        cost tilt (``BUILD_ROI_REF_HOUSE_COST`` / house cost) so a build dollar is
+        rewarded by the *rent it returns* -- steering limited cash to the
+        cheap-to-develop money groups (development ROI). Called after
+        :meth:`Game.build_house` has incremented ``prop.houses``."""
         uniform = 1.0 / self._board_size
         traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         h = prop.houses
         rent_gain = float(prop.rent_table[h] - prop.rent_table[h - 1])
-        return BUILD_BONUS_COEF * traffic * rent_gain / 1000.0
+        roi_tilt = BUILD_ROI_REF_HOUSE_COST / prop.house_cost()
+        return BUILD_BONUS_COEF * traffic * rent_gain * roi_tilt / 1000.0
 
     def _on_acquire(self, player, prop, source="trade"):
         """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
@@ -900,13 +965,16 @@ class MonopolyEnv(_GymEnv):
         grp = self._group_of.get(id(prop))
         if grp is None:
             return value
+        # Completing a cheap-to-develop set (orange/light-blue) is worth more than
+        # completing a sticker-equal but sluggish one -- tilt the set value by its
+        # development ROI (:meth:`_set_quality`).
+        set_value = self.MONOPOLY_BONUS * self._group_price(grp) * self._set_quality(grp)
         if self._completes_monopoly_for(owner, prop):
-            value += self.MONOPOLY_BONUS * self._group_price(grp)
+            value += set_value
         elif any(o is not owner and not o.bankrupt
                  and self._completes_monopoly_for(o, prop)
                  for o in self.game.players):
-            value += (DENIAL_VALUE_WEIGHT * self.MONOPOLY_BONUS
-                      * self._group_price(grp))
+            value += DENIAL_VALUE_WEIGHT * set_value
         return value
 
     def _completes_monopoly_for(self, player, target):
@@ -1196,10 +1264,12 @@ class MonopolyEnv(_GymEnv):
                               for o in opponents), default=0) / size)
 
         # Economics of the property in play (the tile being bought / auctioned /
-        # traded for): its price, a nominal rent, and how often it is landed on
-        # relative to an average tile (1.0 == even). Together these let the agent
-        # weigh traffic against cost and rent when valuing an acquisition; 0s
-        # when no single property is in play.
+        # traded for): its price, a nominal rent, how often it is landed on
+        # relative to an average tile (1.0 == even), and two cost-normalised value
+        # signals -- buy yield (rent per $ of price) and development ROI (rent per
+        # $ of houses). Together these let the agent weigh traffic *and cost*
+        # when valuing an acquisition or trade; 0s when no single property is in
+        # play. (See BUILD_ROI_REF_HOUSE_COST for the two value signals.)
         econ = prop
         if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
             econ = tc.get("recv")
@@ -1208,8 +1278,10 @@ class MonopolyEnv(_GymEnv):
             parts.append(econ.price / 400.0)
             parts.append(base_rent(econ) / 50.0)
             parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+            parts.append(self._buy_yield(econ) * 5.0)   # ~0.25-0.95
+            parts.append(self._dev_roi(econ))           # ~0-2.3, 0 for RR/util
         else:
-            parts.extend([0.0, 0.0, 0.0])
+            parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
 
         return np.asarray(parts, dtype=np.float32)
 

@@ -20,7 +20,7 @@ from engine.rl_env import (
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
     NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_GROUPS,
     NUM_BID_LEVELS, BID_FRACTIONS, BID_CEILING_MULT, DENIAL_VALUE_WEIGHT,
-    TRADE_INCOME_WEIGHT,
+    TRADE_INCOME_WEIGHT, SET_ROI_REF, SET_QUALITY_CLAMP,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
@@ -160,22 +160,51 @@ class GUIAIDecider:
         traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         return traffic * base_rent(prop)
 
+    def _buy_yield(self, prop):
+        """Expected rent per dollar of purchase price. Mirrors the env."""
+        price = float(getattr(prop, "price", 0) or 0)
+        return self._expected_income(prop) / price if price else 0.0
+
+    def _dev_roi(self, prop):
+        """Expected extra hotel rent per dollar sunk into houses (a hotel is five
+        house-purchases); zero for railroads/utilities. Mirrors the env."""
+        if not isinstance(prop, StreetProperty):
+            return 0.0
+        uniform = 1.0 / self._board_size
+        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
+        build_cost = 5.0 * prop.house_cost()
+        rent_gain = traffic * (prop.rent_table[-1] - prop.rent_table[0])
+        return rent_gain / build_cost if build_cost else 0.0
+
+    def _set_quality(self, grp):
+        """Development-ROI multiplier for a colour group (~1.0 average), clamped
+        to ``SET_QUALITY_CLAMP``: >1 for the cheap-to-develop orange/light-blue
+        money groups, <1 for the pricey greens/dark-blue, neutral for
+        railroad/utility groups. Mirrors the env."""
+        rois = [self._dev_roi(t) for t in grp if isinstance(t, StreetProperty)]
+        if not rois:
+            return 1.0
+        lo, hi = SET_QUALITY_CLAMP
+        return max(lo, min(hi, (sum(rois) / len(rois)) / SET_ROI_REF))
+
     def _trade_value(self, prop, owner):
         """Value of ``prop`` to ``owner`` for trading: list value plus expected
         rent (traffic * nominal rent, weighted by ``TRADE_INCOME_WEIGHT``) plus
         the monopoly value it completes for ``owner`` or the (weighted) blocking
-        value when it is an opponent's last-missing piece. Mirrors the env."""
+        value when it is an opponent's last-missing piece -- the set value tilted
+        by the group's development ROI. Mirrors the env."""
         value = self._property_value(prop)
         value += TRADE_INCOME_WEIGHT * self._expected_income(prop)
         grp = self._group_of.get(id(prop))
         if grp is None:
             return value
+        set_value = MONOPOLY_BONUS * self._group_price(grp) * self._set_quality(grp)
         if self._completes_monopoly_for(owner, prop):
-            value += MONOPOLY_BONUS * self._group_price(grp)
+            value += set_value
         elif any(o is not owner and not o.bankrupt
                  and self._completes_monopoly_for(o, prop)
                  for o in self.game.players):
-            value += DENIAL_VALUE_WEIGHT * MONOPOLY_BONUS * self._group_price(grp)
+            value += DENIAL_VALUE_WEIGHT * set_value
         return value
 
     def manage_loop(self, player):
@@ -276,7 +305,8 @@ class GUIAIDecider:
             parts.append(max((sum(1 for t in grp if t.owner is o)
                               for o in opponents), default=0) / size)
         # Economics of the property in play (mirrors MonopolyEnv): price, a
-        # nominal rent, and landing traffic vs an average tile; 0s when none.
+        # nominal rent, landing traffic vs an average tile, buy yield (rent per $
+        # of price) and development ROI (rent per $ of houses); 0s when none.
         econ = prop
         if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
             econ = tc.get("recv")
@@ -285,8 +315,10 @@ class GUIAIDecider:
             parts.append(econ.price / 400.0)
             parts.append(base_rent(econ) / 50.0)
             parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+            parts.append(self._buy_yield(econ) * 5.0)
+            parts.append(self._dev_roi(econ))
         else:
-            parts.extend([0.0, 0.0, 0.0])
+            parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
         return np.asarray(parts, dtype=np.float32)
 
     def _legal_mask(self, phase, prop, seat):
@@ -567,10 +599,14 @@ class GUIAIDecider:
         for tiles in self._ownable_groups().values():
             before = all(t.owner is player for t in tiles)
             after = all(owns_after(t) for t in tiles)
+            # Weight a completed/broken set by its development ROI, so gaining an
+            # efficient money group (orange/light-blue) counts for more than a
+            # sticker-equal but sluggish one -- consistent with _trade_value.
+            set_price = sum(t.price for t in tiles) * self._set_quality(tiles)
             if after and not before:
-                swing += sum(t.price for t in tiles)   # completed a monopoly
+                swing += set_price   # completed a monopoly
             elif before and not after:
-                swing -= sum(t.price for t in tiles)   # broke a monopoly
+                swing -= set_price   # broke a monopoly
         return swing
 
     def _has_liquidation_options(self, player):
