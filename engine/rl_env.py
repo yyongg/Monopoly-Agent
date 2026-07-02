@@ -184,6 +184,17 @@ DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 ACQUISITION_BONUS_COEF = 3.0
 AUCTION_ACQUISITION_BONUS_COEF = 1.0
 BUY_PREFERENCE_COEF = 1.30
+# One-time reward for putting a house/hotel on a tile, scaled by the *extra*
+# rent that house adds (its rent-table jump x the tile's landing traffic). The
+# shaped net worth books a built house at only a small premium over its cost, so
+# on its own building is nearly net-worth-neutral and the agent hoards liquid
+# cash -- most visibly late, when a leader sitting on a pile of cash could be
+# developing houses to bankrupt opponents faster. This bonus front-loads the
+# rent a house will earn, so converting idle cash into buildings is an active
+# gain. Cumulative over a full development, so keep it modest: raise it to press
+# leads into houses harder, lower it if the agent over-builds into rent it then
+# cannot cover.
+BUILD_BONUS_COEF = 0.5
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -537,6 +548,17 @@ class MonopolyEnv(_GymEnv):
         traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         return traffic * base_rent(prop)
 
+    def _build_bonus(self, prop):
+        """Shaped bonus for the house/hotel just added to ``prop`` (see
+        ``BUILD_BONUS_COEF``): the rent the new house adds -- its rent-table jump
+        over the previous level, weighted by the tile's landing traffic. Called
+        after :meth:`Game.build_house` has incremented ``prop.houses``."""
+        uniform = 1.0 / self._board_size
+        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
+        h = prop.houses
+        rent_gain = float(prop.rent_table[h] - prop.rent_table[h - 1])
+        return BUILD_BONUS_COEF * traffic * rent_gain / 1000.0
+
     def _on_acquire(self, player, prop, source="trade"):
         """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
 
@@ -804,7 +826,13 @@ class MonopolyEnv(_GymEnv):
         """
         g = self.game
         if A_BUILD <= action < A_BUILD + NUM_OWNABLE:
-            g.build_house(self.ownable[action - A_BUILD], player)
+            prop = self.ownable[action - A_BUILD]
+            before = prop.houses
+            g.build_house(prop, player)
+            # Reward the controlled agent for actually placing a house (the
+            # engine re-validates, so a masked-through build may be a no-op).
+            if prop.houses > before and player is self.game.players[self.seat]:
+                self._pending_bonus += self._build_bonus(prop)
         elif A_SELL <= action < A_SELL + NUM_OWNABLE:
             g.sell_house(self.ownable[action - A_SELL], player)
         elif A_MORTGAGE <= action < A_MORTGAGE + NUM_OWNABLE:

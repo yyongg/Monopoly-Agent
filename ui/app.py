@@ -2163,7 +2163,9 @@ class MonopolyApp:
         colw = (dlg.w - 3 * pad) // 2
         col_top = dlg.y + 112
         cash_y = dlg.bottom - 116
-        view_y = cash_y - 58
+        # Leave room for the cash-box label, which _draw_cash_box renders 22px
+        # above the box top — a smaller gap makes it overlap the view button.
+        view_y = cash_y - 82
         col_bottom = view_y - 14
         left_x = dlg.x + pad
         right_x = dlg.x + pad + colw + pad
@@ -2536,14 +2538,20 @@ class MonopolyApp:
         self.game.advance_turn()
 
     def _show_result(self):
+        """Announces the outcome and lets the player start another game or quit.
+        Returns ``"restart"`` or ``"quit"``."""
         winner = self.game.winner()
         message = f"{winner.name} wins!" if winner else "Game over."
         self.add_log(message)
-        self.ask(message, [("Quit", "quit")])
+        return self.ask(message, [("Play Again", "restart"), ("Quit", "quit")])
 
     # ----- main loop -----------------------------------------------------
 
     def run(self, max_turns=10000):
+        """Plays one game to its end. Returns ``"restart"`` if the player chose
+        Play Again on the result screen, otherwise ``"quit"`` (including closing
+        the window mid-game). Leaves pygame running so the caller can start a new
+        game on the same window."""
         try:
             turns = 0
             while not self.game.is_over() and turns < max_turns:
@@ -2557,16 +2565,51 @@ class MonopolyApp:
                     self._post_roll_manage(player)
                 self._end_turn(player)
                 turns += 1
-            self._show_result()
+            return self._show_result()
         except QuitGame:
-            pass
-        finally:
-            pygame.quit()
+            return "quit"
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _new_match(config, model, ai_names, deterministic, seed):
+    """Seeds every RNG for one match and builds a fresh ``Game`` plus a
+    ``GUIAIDecider`` for each AI seat (all sharing ``model``).
+
+    Seeds dice and card shuffles (stdlib ``random``), the turn-order shuffle,
+    and the AI's policy sampling (torch), then prints the seed so the game can
+    be replayed with ``--seed``.
+    """
+    random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except Exception:
+        pass
+    print(f"Game seed: {seed}  (replay with --seed {seed})")
+
+    from engine.game import Game
+    from models.board import Board
+    from models.player import Player
+    from data.decks import build_chance_deck, build_community_deck
+    from data.board_tiles import build_board_tiles
+
+    players = [Player(n) for n in ("Red", "Blue", "Green", "Yellow")]
+    if config["randomize"]:
+        random.shuffle(players)
+    game = Game(players, Board(build_board_tiles()),
+                build_chance_deck(), build_community_deck())
+
+    ai_deciders = {}
+    if model is not None:
+        from ui.ai_player import GUIAIDecider
+        for name in ai_names:
+            ai_deciders[name] = GUIAIDecider(
+                num_players=4, model=model, deterministic=deterministic)
+    return game, ai_deciders
+
 
 def main():
     """Shows the setup screen, then launches the game."""
@@ -2629,49 +2672,27 @@ def main():
             ])
             ai_names = set()
 
-    # Seed every source of randomness for this game: dice and card shuffles
-    # (both draw from the stdlib ``random`` module), the turn-order shuffle, and
-    # the AI's policy sampling (torch). A fresh entropy-based seed each game
-    # gives variety; ``--seed`` makes a game reproducible. We print it so any
-    # game can be replayed.
+    # Play matches back-to-back: "Play Again" on the result screen loops here
+    # for a fresh game on the same window, without re-running setup or reloading
+    # the model. ``--seed`` fixes the *first* game (for reproducibility); every
+    # restart draws a fresh game.
     #
-    # The seed is drawn from ``SystemRandom`` (OS entropy), NOT ``random``,
+    # A fresh seed is drawn from ``SystemRandom`` (OS entropy), NOT ``random``,
     # because loading the MaskablePPO model reseeds the global ``random`` module
     # to its training seed -- so ``random.randrange`` here would return the same
     # value on every launch and every AI game would play out identically.
-    seed = args.seed if args.seed is not None \
-        else random.SystemRandom().randrange(2 ** 31)
-    random.seed(seed)
-    try:
-        import torch
-        torch.manual_seed(seed)
-    except Exception:
-        pass
-    print(f"Game seed: {seed}  (replay with --seed {seed})")
+    next_seed = args.seed
+    while True:
+        seed = (next_seed if next_seed is not None
+                else random.SystemRandom().randrange(2 ** 31))
+        next_seed = None  # any restart is a fresh, differently-seeded game
+        game, ai_deciders = _new_match(
+            config, model, ai_names, args.deterministic, seed)
+        result = MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
+        if result != "restart":
+            break
 
-    # Build players and (optionally) shuffle turn order.
-    from engine.game import Game
-    from models.board import Board
-    from models.player import Player
-    from data.decks import build_chance_deck, build_community_deck
-    from data.board_tiles import build_board_tiles
-
-    players = [Player(n) for n in ("Red", "Blue", "Green", "Yellow")]
-    if config["randomize"]:
-        random.shuffle(players)
-
-    game = Game(players, Board(build_board_tiles()),
-                build_chance_deck(), build_community_deck())
-
-    # Create one GUIAIDecider per AI seat (all share the same model).
-    ai_deciders = {}
-    if model is not None:
-        from ui.ai_player import GUIAIDecider
-        for name in ai_names:
-            ai_deciders[name] = GUIAIDecider(
-                num_players=4, model=model, deterministic=args.deterministic)
-
-    MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
+    pygame.quit()
 
 
 if __name__ == "__main__":
