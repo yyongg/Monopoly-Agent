@@ -20,6 +20,7 @@ from engine.rl_env import (
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
     NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_GROUPS,
     NUM_BID_LEVELS, BID_FRACTIONS, BID_CEILING_MULT, DENIAL_VALUE_WEIGHT,
+    TRADE_INCOME_WEIGHT,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
@@ -147,6 +148,31 @@ class GUIAIDecider:
         if self._completes_monopoly_for(player, prop):
             value += MONOPOLY_BONUS * self._group_price(grp)
         elif any(o is not player and not o.bankrupt
+                 and self._completes_monopoly_for(o, prop)
+                 for o in self.game.players):
+            value += DENIAL_VALUE_WEIGHT * MONOPOLY_BONUS * self._group_price(grp)
+        return value
+
+    def _expected_income(self, prop):
+        """Proxy for the rent ``prop`` earns its owner: landing traffic (vs an
+        average tile) times its nominal rent. Mirrors the env."""
+        uniform = 1.0 / self._board_size
+        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
+        return traffic * base_rent(prop)
+
+    def _trade_value(self, prop, owner):
+        """Value of ``prop`` to ``owner`` for trading: list value plus expected
+        rent (traffic * nominal rent, weighted by ``TRADE_INCOME_WEIGHT``) plus
+        the monopoly value it completes for ``owner`` or the (weighted) blocking
+        value when it is an opponent's last-missing piece. Mirrors the env."""
+        value = self._property_value(prop)
+        value += TRADE_INCOME_WEIGHT * self._expected_income(prop)
+        grp = self._group_of.get(id(prop))
+        if grp is None:
+            return value
+        if self._completes_monopoly_for(owner, prop):
+            value += MONOPOLY_BONUS * self._group_price(grp)
+        elif any(o is not owner and not o.bankrupt
                  and self._completes_monopoly_for(o, prop)
                  for o in self.game.players):
             value += DENIAL_VALUE_WEIGHT * MONOPOLY_BONUS * self._group_price(grp)
@@ -380,8 +406,10 @@ class GUIAIDecider:
         return self._choose_give_tile(initiator, owner, target) is not None
 
     def _choose_give_tile(self, initiator, partner, target):
-        """Picks the tile ``initiator`` offers for ``target`` (spare first, then
-        one that helps the partner, then cheapest). Mirrors the env."""
+        """Picks the tile ``initiator`` offers for ``target``: a spare first,
+        then the one of least :meth:`_trade_value` to the initiator (parting with
+        quiet, low-rent tiles and avoiding handing the partner a set-completer).
+        Mirrors the env."""
         g = self.game
         target_group = self._group_of.get(id(target))
 
@@ -396,17 +424,14 @@ class GUIAIDecider:
         spares = [p for p in tradeable
                   if count(initiator, self._group_of[id(p)]) == 1]
         pool = spares or tradeable
-        helpful = [p for p in pool
-                   if count(partner, self._group_of[id(p)])
-                   == len(self._group_of[id(p)]) - 1]
-        final = helpful or pool
-        return min(final, key=lambda p: p.price)
+        return min(pool, key=lambda p: self._trade_value(p, initiator))
 
     def _balancing_cash(self, initiator, partner, give, receive):
-        """Cash the initiator pays to balance the trade (never negative).
+        """Cash the initiator pays to balance the trade (never negative), valued
+        from the partner's side with :meth:`_trade_value`.
         Mirrors ``MonopolyEnv._balancing_cash``."""
-        recv_val = sum(self._property_value(t) for t in receive)
-        give_val = sum(self._property_value(t) for t in give)
+        recv_val = sum(self._trade_value(t, partner) for t in receive)
+        give_val = sum(self._trade_value(t, partner) for t in give)
         grp = self._group_of.get(id(receive[0])) if receive else None
         set_price = sum(t.price for t in grp) if grp else 0
         premium = int(round(0.25 * set_price))
@@ -469,17 +494,20 @@ class GUIAIDecider:
             value =  cash_delta
                    + sum(property_value(p) for p in gain)
                    - sum(property_value(p) * (1 + KEEP_PREMIUM) for p in lose)
+                   + TRADE_INCOME_WEIGHT * (expected income gained - lost)
                    + SET_BONUS * (group price of any monopoly this completes
                                   for ``me``, minus any it breaks for ``me``)
                    - SET_BONUS * (group price of any monopoly this hands to
                                   ``other``, minus any it strips from ``other``)
 
         where a property is valued at its list price, less the outstanding
-        unmortgage cost if it is mortgaged. Property the AI gives up carries the
-        ``KEEP_PREMIUM`` on top, reflecting the rent and set potential lost, so
-        it will not surrender a tile for a marginal cash gain. ``me`` accepts
-        only when the value is strictly positive (and it can afford any cash it
-        owes).
+        unmortgage cost if it is mortgaged. On top of that each tile carries a
+        few turns of its expected rent (landing traffic * nominal rent), so a
+        busy tile is worth more to take and dearer to give up than a quiet one.
+        Property the AI gives up also carries the ``KEEP_PREMIUM``, reflecting
+        the rent and set potential lost, so it will not surrender a tile for a
+        marginal cash gain. ``me`` accepts only when the value is strictly
+        positive (and it can afford any cash it owes).
 
         Returns ``(accepted: bool, value: float)``.
         """
@@ -491,6 +519,10 @@ class GUIAIDecider:
         value += sum(self._property_value(p) for p in gain)
         value -= sum(self._property_value(p) * (1.0 + self.KEEP_PREMIUM)
                      for p in lose)
+
+        # Traffic/rent: value a few turns of each tile's expected income.
+        value += TRADE_INCOME_WEIGHT * sum(self._expected_income(p) for p in gain)
+        value -= TRADE_INCOME_WEIGHT * sum(self._expected_income(p) for p in lose)
 
         # Strategic set synergy. Only ``me`` and ``other`` change holdings.
         value += self.SET_BONUS * self._set_swing(me, gain, lose)

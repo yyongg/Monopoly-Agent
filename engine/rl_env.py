@@ -139,6 +139,12 @@ NUM_BID_LEVELS = 6
 BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 BID_CEILING_MULT = 3.0   # hard ceiling on any bid, as a multiple of list price
 DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
+# How many turns of expected rent to fold into a tile's trade value. Trade
+# valuation starts from list price and adds ``TRADE_INCOME_WEIGHT`` times the
+# tile's expected per-turn income (landing traffic * nominal rent), so a busy,
+# high-rent tile is worth more to trade for -- and more expensive to give up --
+# than a quiet one of the same sticker price.
+TRADE_INCOME_WEIGHT = 3.0
 DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 #                          as a fraction of that denied set's shaped value
 # One-time reward for acquiring an unowned property from the bank, scaled by the
@@ -177,7 +183,7 @@ DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
 # (below 1.0 reopens the decline-then-snipe exploit).
 ACQUISITION_BONUS_COEF = 3.0
 AUCTION_ACQUISITION_BONUS_COEF = 1.0
-BUY_PREFERENCE_COEF = 1.40
+BUY_PREFERENCE_COEF = 1.30
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -849,6 +855,32 @@ class MonopolyEnv(_GymEnv):
             return float(prop.price - prop.unmortgage_cost)
         return float(prop.price)
 
+    def _trade_value(self, prop, owner):
+        """Value of ``prop`` to ``owner`` for trading purposes.
+
+        Richer than the raw list value: it adds the rent the tile is expected to
+        earn (landing traffic * nominal rent, weighted by ``TRADE_INCOME_WEIGHT``)
+        and the group's monopoly value when the tile completes ``owner``'s own
+        set, or the (weighted) blocking value when it is instead an *opponent*'s
+        last-missing piece. So a busy, set-completing tile is prized while a quiet
+        spare that helps no one is cheap to part with -- and handing an opponent
+        their final set-completer is correctly seen as expensive. Mirrors the
+        bidding valuation in :meth:`_bid_value`, plus the traffic/rent term.
+        """
+        value = self._prop_value(prop)
+        value += TRADE_INCOME_WEIGHT * self._expected_income(prop)
+        grp = self._group_of.get(id(prop))
+        if grp is None:
+            return value
+        if self._completes_monopoly_for(owner, prop):
+            value += self.MONOPOLY_BONUS * self._group_price(grp)
+        elif any(o is not owner and not o.bankrupt
+                 and self._completes_monopoly_for(o, prop)
+                 for o in self.game.players):
+            value += (DENIAL_VALUE_WEIGHT * self.MONOPOLY_BONUS
+                      * self._group_price(grp))
+        return value
+
     def _completes_monopoly_for(self, player, target):
         """Whether acquiring ``target`` would complete a monopoly for ``player``
         (they already own every other tile in ``target``'s group)."""
@@ -879,9 +911,11 @@ class MonopolyEnv(_GymEnv):
         ``target`` (or ``None`` if it has nothing suitable to give).
 
         Prefers parting with a *spare* -- the only tile the initiator owns in its
-        group, so the trade breaks no progress -- and, among spares, one that
-        helps the partner complete a set (likelier to be accepted); otherwise the
-        cheapest tradeable tile outside the target's group.
+        group, so the trade breaks no progress -- and, among the pool, gives up
+        the tile of least :meth:`_trade_value` to the initiator. That parts with
+        quiet, low-rent tiles first and, because a tile that would complete the
+        partner's set carries that set's blocking value, steers away from handing
+        the opponent their final set-completer unless there is nothing else.
         """
         g = self.game
         target_group = self._group_of.get(id(target))
@@ -897,33 +931,32 @@ class MonopolyEnv(_GymEnv):
         spares = [p for p in tradeable
                   if count(initiator, self._group_of[id(p)]) == 1]
         pool = spares or tradeable
-        helpful = [p for p in pool
-                   if count(partner, self._group_of[id(p)])
-                   == len(self._group_of[id(p)]) - 1]
-        final = helpful or pool
-        return min(final, key=lambda p: p.price)
+        return min(pool, key=lambda p: self._trade_value(p, initiator))
 
     def _balancing_cash(self, initiator, partner, give, receive):
         """Cash the initiator pays the partner to balance a trade.
 
-        The initiator covers the list-value gap (the received tile completes its
-        set, so it is usually worth more than the tile given up) plus a premium
-        for prying loose a set-completing tile. Never negative -- in the T1 model
-        only the initiator pays, so the partner is never asked for cash.
+        Valued from the *partner*'s side with :meth:`_trade_value`, so the cash
+        covers what the partner gives up (the target -- worth extra to them as
+        the initiator's set-completer they are handing over) net of what they get
+        back, factoring in traffic, rent, and any set the give-tile completes for
+        them, plus a premium for prying loose a set-completing tile. Never
+        negative -- in the T1 model only the initiator pays.
         """
-        recv_val = sum(self._prop_value(t) for t in receive)
-        give_val = sum(self._prop_value(t) for t in give)
+        recv_val = sum(self._trade_value(t, partner) for t in receive)
+        give_val = sum(self._trade_value(t, partner) for t in give)
         grp = self._group_of.get(id(receive[0])) if receive else None
         set_price = sum(t.price for t in grp) if grp else 0
         premium = int(round(0.25 * set_price))
         return max(0, int(round(recv_val - give_val)) + premium)
 
     def _formula_trade_ok(self, partner, gain, lose, cash):
-        """Baseline partner's accept rule: take the deal if it is non-negative by
-        list value (``cash`` received plus tiles gained minus tiles given up)."""
+        """Baseline partner's accept rule: take the deal when it is non-negative
+        by :meth:`_trade_value` from the partner's side -- ``cash`` received plus
+        the traffic/rent/set-aware value of tiles gained minus tiles given up."""
         value = float(cash)
-        value += sum(self._prop_value(p) for p in gain)
-        value -= sum(self._prop_value(p) for p in lose)
+        value += sum(self._trade_value(p, partner) for p in gain)
+        value -= sum(self._trade_value(p, partner) for p in lose)
         return value >= 0
 
     def _attempt_trade(self, initiator, target):

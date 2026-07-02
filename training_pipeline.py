@@ -12,8 +12,8 @@ the shared model path round out the common case. Any stage can be skipped so you
 can, e.g., re-run just evaluation against an already-trained model.
 
 Usage:
-    python run_pipeline.py --n-envs 64 --episodes 200 --games 50
-    python run_pipeline.py --skip-train            # evaluate + simulate only
+    python training_pipeline.py --n-envs 64 --episodes 200 --games 100
+    python training_pipeline.py --skip-train            # evaluate + simulate only
 """
 
 import argparse
@@ -51,7 +51,7 @@ def main():
                         help="parallel envs for training")
     parser.add_argument("--episodes", type=int, default=200,
                         help="episodes for evaluation")
-    parser.add_argument("--games", type=int, default=50,
+    parser.add_argument("--games", type=int, default=100,
                         help="games for simulation")
     # Rounding out the common case.
     parser.add_argument("--timesteps", type=int, default=2_000_000,
