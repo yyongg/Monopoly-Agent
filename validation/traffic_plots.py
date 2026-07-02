@@ -14,6 +14,19 @@ Produces, under ``--out`` (default ``runs/traffic_analysis/``):
   4. ``traffic_x_hotel.png``   -- traffic x full-hotel rent: what a developed
                                   tile is expected to earn, i.e. why the build
                                   bonus favours busy colour groups.
+  5. ``buy_yield.png``         -- (traffic x base rent) / price, as a percent:
+                                  expected rent per dollar of purchase price --
+                                  which tiles are cheap for what they earn (the
+                                  cheap sets shine here, unlike the absolute
+                                  charts above).
+  6. ``development_roi.png``   -- traffic x (hotel rent - base rent) per dollar
+                                  sunk into houses (5 x house cost): rent gained
+                                  per build dollar -- why the orange/red belt is
+                                  the money set. Streets only (only streets build).
+
+These last two divide by cost, so they answer "best value", where charts 3-4
+answer "most earning power". Both matter; neither is used by the agent directly
+(cost already enters the agent via net-worth reward and the trade base price).
 
 Usage:
     PYTHONPATH=. python -m validation.traffic_plots
@@ -146,17 +159,28 @@ def main():
     by_pos = {t.pos: t for t in build_board_tiles()}
     uniform = 1.0 / board_size
 
-    ownable, exp_income, exp_hotel = [], [], []
+    ownable, exp_income, exp_hotel, buy_yield = [], [], [], []
+    dev_tiles, dev_roi = [], []
     for t in tiles:
         obj = by_pos.get(t["pos"])
         if not hasattr(obj, "price"):        # not an ownable tile
             continue
         traffic = t["frequency"] * board_size
         ownable.append(t)
-        exp_income.append(traffic * base_rent(obj))
+        income = traffic * base_rent(obj)
+        exp_income.append(income)
         hotel_rent = obj.rent_table[-1] if isinstance(obj, StreetProperty) \
             else base_rent(obj)
         exp_hotel.append(traffic * hotel_rent)
+        # Buy yield: rent per $ of price, as a percent (cost-adjusted).
+        buy_yield.append(100.0 * income / obj.price if obj.price else 0.0)
+        # Development ROI: extra rent from a full hotel per $ sunk into houses
+        # (a hotel is 5 house-purchases). Streets only -- only streets build.
+        if isinstance(obj, StreetProperty):
+            build_cost = 5 * obj.house_cost()
+            rent_gain = traffic * (obj.rent_table[-1] - base_rent(obj))
+            dev_tiles.append(t)
+            dev_roi.append(rent_gain / build_cost if build_cost else 0.0)
 
     board_heatmap(tiles, os.path.join(args.out, "board_heatmap.png"))
     landing_frequency(tiles, board_size,
@@ -169,8 +193,17 @@ def main():
                  "Traffic × full-hotel rent  (developed earning power)",
                  "expected hotel rent  ($ · traffic)",
                  os.path.join(args.out, "traffic_x_hotel.png"), top=args.top)
+    _value_chart(ownable, buy_yield,
+                 "Buy yield: (traffic × base rent) / price  (best value buys)",
+                 "expected rent per $ of price  (%, · traffic)",
+                 os.path.join(args.out, "buy_yield.png"), top=args.top)
+    _value_chart(dev_tiles, dev_roi,
+                 "Development ROI: traffic × rent gain per $ of houses  "
+                 "(a hotel = 5 house costs)",
+                 "extra hotel rent per build $  (· traffic)",
+                 os.path.join(args.out, "development_roi.png"), top=args.top)
 
-    print(f"wrote 4 figures -> {args.out}/")
+    print(f"wrote 6 figures -> {args.out}/")
     # A compact top-10 table to stdout as well.
     top10 = sorted(tiles, key=lambda t: t["frequency"], reverse=True)[:10]
     print(f"\n{'tile':<22}{'share':>8}{'vs even':>9}")
