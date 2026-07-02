@@ -332,6 +332,10 @@ class MonopolyApp:
         # Row offset for the open inventory panel, so a player owning more
         # properties than fit on screen can be scrolled through (mouse wheel).
         self._inv_scroll = 0
+        # Lines the game log is scrolled back from its newest entry (0 = pinned
+        # to the bottom, following new events); the wheel scrolls it when no
+        # inventory panel is open. Clamped to the log length in ``_draw_log``.
+        self._log_scroll = 0
         # Player-panel click targets from the last drawn scene, so animation
         # frames (the only input path during all-AI turns) can toggle the
         # inventory view too.
@@ -431,7 +435,11 @@ class MonopolyApp:
 
     def add_log(self, message):
         self.log.append((message, self._log_color(message)))
-        self.log = self.log[-40:]
+        self.log = self.log[-200:]
+        # Keep the same lines in view when scrolled back into history; when
+        # pinned to the bottom (scroll 0) stay following the newest events.
+        if self._log_scroll:
+            self._log_scroll = min(self._log_scroll + 1, len(self.log) - 1)
 
     def _log_color(self, message):
         """Maps a log line to a colour by the kind of action it describes, so
@@ -750,9 +758,10 @@ class MonopolyApp:
         if max_scroll:
             self._draw_inventory_scrollbar(list_top, visible, len(props), scroll)
 
-    def _draw_inventory_scrollbar(self, top, visible, total, scroll):
-        """Draws a slim scrollbar for the inventory list along the panel edge."""
-        track_h = visible * self.ROW_H
+    def _draw_inventory_scrollbar(self, top, visible, total, scroll, row_h=None):
+        """Draws a slim scrollbar for a scrolling side list along the panel edge
+        (the inventory, or the log when ``row_h`` overrides the row height)."""
+        track_h = visible * (row_h or self.ROW_H)
         x = SIDE_X + SIDE_W - 5
         pygame.draw.rect(self.screen, FELT_SUB,
                          pygame.Rect(x, top, 3, track_h), border_radius=2)
@@ -1204,13 +1213,45 @@ class MonopolyApp:
                 pygame.Rect(x, rect.bottom - 12 - cash_h, cw, cash_h), cash)
         return max_scroll
 
+    LOG_ROW_H = 24  # pixel height of one log line
+
     def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
-        y += 40
-        rows = max(0, (bottom - y) // 24)
-        for line, color in self.log[-rows:] if rows else []:
-            self._text(line, (SIDE_X, y), self.f_small, color, shadow=True)
-            y += 24
+        list_top = y + 40
+        rows = max(0, (bottom - list_top) // self.LOG_ROW_H)
+        # Clamp the stored scroll (lines back from the newest) to the history
+        # above the last page, so the wheel handler can never overshoot.
+        max_scroll = max(0, len(self.log) - rows)
+        self._log_scroll = max(0, min(self._log_scroll, max_scroll))
+        if not rows or not self.log:
+            return
+
+        end = len(self.log) - self._log_scroll
+        start = max(0, end - rows)
+        # Leave room for a scrollbar on the right edge when the log overflows.
+        text_right = SIDE_X + SIDE_W - (12 if max_scroll else 0)
+        y = list_top
+        for line, color in self.log[start:end]:
+            text = self._truncate(line, self.f_small, text_right - SIDE_X)
+            self._text(text, (SIDE_X, y), self.f_small, color, shadow=True)
+            y += self.LOG_ROW_H
+        if max_scroll:
+            self._draw_inventory_scrollbar(list_top, end - start, len(self.log),
+                                           start, row_h=self.LOG_ROW_H)
+
+    def _scroll_log(self, dy):
+        """Scrolls the game log by ``dy`` wheel notches (up = +, back into
+        history); only when no inventory panel has taken over the side area."""
+        if self.selected is None:
+            self._log_scroll = max(0, self._log_scroll + dy)
+
+    def _scroll_side_panel(self, dy):
+        """Routes a wheel notch to whichever side panel is showing: the open
+        inventory, or the game log when none is open."""
+        if self.selected is not None:
+            self._scroll_inventory(dy)
+        else:
+            self._scroll_log(dy)
 
     # ----- prompt --------------------------------------------------------
 
@@ -1310,7 +1351,7 @@ class MonopolyApp:
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
-                    self._scroll_inventory(event.y)
+                    self._scroll_side_panel(event.y)
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, value in buttons:
                         if rect.collidepoint(event.pos):
@@ -1339,8 +1380,8 @@ class MonopolyApp:
             if event.type == pygame.KEYDOWN:
                 skip = True
             elif event.type == pygame.MOUSEWHEEL:
-                # Scrolling the inventory must not skip the animation.
-                self._scroll_inventory(event.y)
+                # Scrolling the inventory or log must not skip the animation.
+                self._scroll_side_panel(event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if board_rect.collidepoint(event.pos):
                     skip = True
