@@ -60,8 +60,6 @@ Illegal actions (those not set in the mask) are clamped to a safe default rather
 than raising, and reported via ``info["illegal"]``.
 """
 
-import json
-import os
 import queue
 import random
 import threading
@@ -76,6 +74,31 @@ from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
 from data.board_tiles import build_board_tiles
 from data.decks import build_chance_deck, build_community_deck
+
+# Structural ids, tuning knobs, the observation encoder, and reward shaping live
+# in dedicated modules; re-export the public names so existing
+# ``from engine.rl_env import PHASE_BUY, MonopolyEnv, ...`` imports keep working.
+from engine.constants import (
+    PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE, PHASE_TERMINAL,
+    PHASE_AUCTION, PHASE_TRADE_RESPOND, NUM_PHASES,
+    A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
+    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
+    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
+    NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS,
+    BID_FRACTIONS, BID_CEILING_MULT,
+)
+from engine.config import (
+    RewardConfig, DEFAULT_REWARD_CONFIG,
+    ACQUISITION_PREMIUM, MONOPOLY_BONUS, DENIAL_VALUE_WEIGHT, TRADE_INCOME_WEIGHT,
+    DENIAL_BONUS_COEF, ACQUISITION_BONUS_COEF, AUCTION_ACQUISITION_BONUS_COEF,
+    BUY_PREFERENCE_COEF, BUILD_BONUS_COEF, BUILD_ROI_REF_HOUSE_COST,
+    SET_ROI_REF, SET_QUALITY_CLAMP, PROFIT_SCALE, SET_BONUS, KEEP_PREMIUM,
+)
+from engine.observation import (
+    ObsEncoder, observation_length, load_landing_frequencies, base_rent,
+    build_groups, safe_default, LANDING_FREQ_PATH,
+)
+from engine.rewards import RewardMixin
 
 try:  # Gymnasium is optional; the env works standalone without it.
     from gymnasium import Env as _GymEnv
@@ -101,180 +124,6 @@ except ImportError:  # pragma: no cover - exercised only without gymnasium
             self.low, self.high, self.shape, self.dtype = low, high, shape, dtype
 
 
-# --- Decision phases -------------------------------------------------------
-PHASE_JAIL = 0
-PHASE_BUY = 1
-PHASE_MANAGE = 2
-PHASE_LIQUIDATE = 3
-PHASE_TERMINAL = 4
-PHASE_AUCTION = 5        # submit a sealed bid for a property up for auction
-PHASE_TRADE_RESPOND = 6  # accept or reject a trade offered by another player
-NUM_PHASES = 7
-
-# --- Action layout ---------------------------------------------------------
-A_PAY_JAIL = 0
-A_USE_CARD = 1
-A_ROLL_JAIL = 2
-A_BUY = 3
-A_DECLINE = 4
-A_END_MANAGE = 5
-A_BUILD = 6          # A_BUILD + i, for ownable tile i (0..27)
-A_SELL = 34          # A_SELL + i
-A_MORTGAGE = 62      # A_MORTGAGE + i
-A_UNMORTGAGE = 90    # A_UNMORTGAGE + i
-A_TRADE = 118        # A_TRADE + i: propose to acquire ownable tile i by trade
-NUM_OWNABLE = 28
-NUM_GROUPS = 10      # monopoly groups: 8 street colors + railroads + utilities
-A_TRADE_ACCEPT = 146     # accept a trade offered to me (PHASE_TRADE_RESPOND)
-A_TRADE_REJECT = 147     # reject a trade offered to me
-A_AUCTION_PASS = 148     # bid nothing in the current auction
-A_AUCTION_BID = 149      # A_AUCTION_BID + k: bid BID_FRACTIONS[k] * bid-value
-NUM_BID_LEVELS = 6
-# Auction bid buckets, each a multiple of the property's *value to the bidder*
-# (``_bid_value``: list price, boosted when the tile completes the bidder's set
-# or blocks an opponent's). Scaling by value -- not raw list price -- lets the
-# agent pay a premium for a pivotal tile while staying conservative on ordinary
-# ones. The absolute bid is still bounded by ``BID_CEILING_MULT`` * list price
-# and by cash (see ``_make_bid_hook``).
-BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-BID_CEILING_MULT = 4.0   # hard ceiling on any bid, as a multiple of list price
-DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
-# How many turns of expected rent to fold into a tile's trade value. Trade
-# valuation starts from list price and adds ``TRADE_INCOME_WEIGHT`` times the
-# tile's expected per-turn income (landing traffic * nominal rent), so a busy,
-# high-rent tile is worth more to trade for -- and more expensive to give up --
-# than a quiet one of the same sticker price.
-TRADE_INCOME_WEIGHT = 3.0
-DENIAL_BONUS_COEF = 0.5  # one-time reward for taking an opponent's last tile,
-#                          as a fraction of that denied set's shaped value
-# One-time reward for acquiring an unowned property from the bank, scaled by the
-# tile's *expected income* (landing traffic x nominal rent) so busy, high-rent
-# tiles are worth chasing while junk earns almost nothing. This breaks the
-# passive "decline everything and let it go to auction" equilibrium that
-# self-play falls into.
-#
-# Buying on landing earns the *full* bonus; winning the same tile at auction
-# earns only ``AUCTION_ACQUISITION_BONUS_COEF``. The gap keeps the agent
-# contesting auctions (rather than conceding them) while preferring to buy
-# outright.
-#
-# The income-scaled gap alone, though, is far too small to stop the agent
-# declining everything: the shaped net worth books an owned tile at ``price x
-# (1 + ACQUISITION_PREMIUM)`` regardless of what was paid, so acquiring *cheaply*
-# is an instant net-worth windfall -- and an early-game auction (few contested
-# bidders, opening bid ~10% of list) is the cheap route. That windfall scales
-# with *price* (~0.5-1.0 x price / 1000 of reward), which dwarfs the income-scaled
-# bonus gap (~a few x income / 1000). So buying on landing also earns a
-# *price-scaled* preference bonus (``BUY_PREFERENCE_COEF`` x price / 1000), paid
-# only on a direct buy and never on an auction win.
-#
-# Sizing it (this matters -- earlier values that were "near ACQUISITION_PREMIUM"
-# were provably too weak). Comparing buy-at-list against decline-then-snipe the
-# auction at price ``A``, in /1000 reward units:
-#   buy   = 0.5*P (net-worth telescoping) + 3*income + c*P
-#   snipe = (1.5*P - A)  (telescoping)    + 1*income
-#   buy - snipe = (c - 1)*P + A + 2*income
-# So buying only out-scores a *free* snipe (A -> 0) once ``c >= 1.0`` -- at the
-# old c = 0.5 the bonus covered barely half the list-price gap, which is why the
-# agent kept declining. We set c = 1.25: comfortably past break-even so buying
-# wins for any realistic auction price with margin to spare for the policy to
-# latch onto, without inflating it so far the agent over-buys into rent it can't
-# cover. Raise it for an even stronger buy bias, lower toward 1.0 to tighten it
-# (below 1.0 reopens the decline-then-snipe exploit).
-ACQUISITION_BONUS_COEF = 3.0
-AUCTION_ACQUISITION_BONUS_COEF = 1.0
-BUY_PREFERENCE_COEF = 1.30
-# One-time reward for putting a house/hotel on a tile, scaled by the *extra*
-# rent that house adds (its rent-table jump x the tile's landing traffic). The
-# shaped net worth books a built house at only a small premium over its cost, so
-# on its own building is nearly net-worth-neutral and the agent hoards liquid
-# cash -- most visibly late, when a leader sitting on a pile of cash could be
-# developing houses to bankrupt opponents faster. This bonus front-loads the
-# rent a house will earn, so converting idle cash into buildings is an active
-# gain. Cumulative over a full development, so keep it modest: raise it to press
-# leads into houses harder, lower it if the agent over-builds into rent it then
-# cannot cover.
-BUILD_BONUS_COEF = 0.5
-# Cost-normalised strategy signals derived from landing traffic (visualised by
-# ``validation/traffic_plots.py`` -> ``buy_yield.png`` / ``development_roi.png``).
-# Two board facts these surface -- both confirmed by Monopoly analysts -- are
-# handed to the agent so it need not rediscover them from self-play alone:
-#   * **buy yield** = expected income / price. The railroads, the utilities, and
-#     the cheap high-traffic streets return the most rent per dollar of *purchase*
-#     price -- the best value acquisitions.
-#   * **development ROI** = traffic x rent-gain / build cost. The orange and
-#     light-blue groups return the most rent per dollar sunk into *houses* -- the
-#     best value to develop.
-# Both are fed into the observation (so the learned policy can weigh them when
-# buying and when trading). Development ROI additionally tilts two shaped values
-# toward the cheap-to-develop money groups: the build bonus (below) and the value
-# of completing a colour set in a trade (:meth:`_set_quality`).
-#
-# ``BUILD_ROI_REF_HOUSE_COST`` is the house cost at which the build tilt
-# (ref / house_cost) is 1.0; set to the groups' harmonic-mean house cost so the
-# *average* build bonus is unchanged and only its distribution across colours
-# shifts -- cheap-house sets up, pricey-house sets down. The set-completion tilt
-# (avg group dev-ROI / ``SET_ROI_REF``) is clamped to ``SET_QUALITY_CLAMP`` so it
-# nudges rather than dominates the sticker/traffic value already in a trade.
-BUILD_ROI_REF_HOUSE_COST = 95.0
-SET_ROI_REF = 1.3
-SET_QUALITY_CLAMP = (0.75, 1.25)
-# **Expected profit per turn** (one observation feature per seat): each player's
-# net rent *flow* -- the cash-flow complement to the balance/net-worth *stock*
-# features. Per full board round every live opponent passes a player's tiles
-# once (income x live opponents) while the player passes every opponent tile
-# once itself (loss x 1), so income scales up with the field and shrinks as it
-# thins. Flow per pass is landing traffic x *developed* rent (current houses,
-# the unimproved-monopoly double, railroad count, expected utility roll;
-# mortgaged tiles collect nothing) -- unlike the static base-rent features this
-# climbs as sets develop, telling the agent who owns a money engine and who is
-# bleeding. ``PROFIT_SCALE`` divides the dollar figure into feature range.
-PROFIT_SCALE = 1000.0
-NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
-
-# --- Landing-frequency prior ----------------------------------------------
-# How often each board tile is landed on, precomputed by
-# ``validation/board_visits.py`` (a movement-only Monte-Carlo). Fed into the
-# observation so the agent can value a high-traffic property above a quiet one
-# of the same price: a tile landed on twice as often earns ~twice the rent.
-# Stored as a share of all landings (sums to ~1 over the 40 tiles); the
-# observation multiplies by the board size to express it as a "traffic vs even"
-# multiple (1.0 == average). If the table is missing the env falls back to a
-# uniform prior, so training still runs (every tile just looks average).
-LANDING_FREQ_PATH = os.path.join("runs", "board_visits.json")
-_LAND_FREQ_CACHE = None
-
-
-def load_landing_frequencies(path=LANDING_FREQ_PATH):
-    """Returns ``{board_pos: landing_share}`` from the saved visit table.
-
-    Cached after first load. On a missing/unreadable file returns ``{}``, which
-    callers treat as a uniform prior (see ``base_traffic``)."""
-    global _LAND_FREQ_CACHE
-    if _LAND_FREQ_CACHE is not None:
-        return _LAND_FREQ_CACHE
-    freqs = {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        for t in data["tiles"]:
-            freqs[int(t["pos"])] = float(t["frequency"])
-    except (OSError, ValueError, KeyError):
-        freqs = {}
-    _LAND_FREQ_CACHE = freqs
-    return freqs
-
-
-def base_rent(prop):
-    """A nominal single-ownership rent for ``prop``, used as a scale-normalised
-    "rent it can collect" observation feature (exact value is unimportant)."""
-    if isinstance(prop, StreetProperty):
-        return float(prop.rent_table[0])
-    if isinstance(prop, Railroad):
-        return 25.0            # nominal one-railroad rent
-    return 28.0               # utility: 4x an average roll of 7
-
-
 # Sentinels passed between the worker thread and the env.
 _TERMINAL = "__terminal__"
 _ABORT = "__abort__"
@@ -284,7 +133,7 @@ class _Abort(Exception):
     """Raised inside the worker thread to tear it down on ``reset``/``close``."""
 
 
-class MonopolyEnv(_GymEnv):
+class MonopolyEnv(RewardMixin, _GymEnv):
     """Single-agent Gymnasium environment for one seat of a Monopoly game.
 
     Args:
@@ -359,21 +208,15 @@ class MonopolyEnv(_GymEnv):
             if isinstance(t, (StreetProperty, Railroad, Utility))
         ]
         assert len(self._ownable_template) == NUM_OWNABLE
-        assert len(self._build_groups(self._ownable_template)) == NUM_GROUPS
+        assert len(build_groups(self._ownable_template)) == NUM_GROUPS
 
         self.action_space = Discrete(NUM_ACTIONS)
-        obs_len = (6 * num_players  # balance, pos, jail, cards, bankrupt,
-                                    # expected profit/turn
-                   + NUM_OWNABLE * (num_players + 3)
-                   + NUM_PHASES + 1
-                   + 3               # trade context: recv tile, give tile, cash
-                   + 2               # context flags: completes mine / opp's set
-                   + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
-                   + 5)              # context prop economics: price, rent,
-                                     # traffic, buy-yield, dev-ROI
+        obs_len = observation_length(num_players)
         self.observation_space = Box(
             low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
+        self.cfg = RewardConfig()
+        self.encoder = ObsEncoder(self.cfg)
 
         # Cross-thread channels and per-episode worker state.
         self._req_q = queue.Queue()
@@ -386,8 +229,8 @@ class MonopolyEnv(_GymEnv):
         self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._cur_prop = None      # property offered (BUY/AUCTION) or liquidated
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
-        self._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
-        self._traded_this_manage = set()  # trade targets tried this MANAGE phase
+        self.encoder._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
+        self.encoder._traded_this_manage = set()  # trade targets tried this MANAGE phase
         self._prev_advantage = 0.0  # last relative-advantage potential (shaping)
         self._pending_bonus = 0.0   # denial reward queued by the on_acquire hook
         self._truncated = False
@@ -518,7 +361,7 @@ class MonopolyEnv(_GymEnv):
             if decide(PHASE_BUY, prop) != A_BUY:
                 return False
             while player.balance < prop.price:
-                if not self._has_liquidation_options(player):
+                if not self.encoder._has_liquidation_options(player):
                     return False
                 action = decide(PHASE_LIQUIDATE, prop, prop.price)
                 if action == A_END_MANAGE:
@@ -545,7 +388,7 @@ class MonopolyEnv(_GymEnv):
             action = decide(PHASE_AUCTION, prop)
             k = action - A_AUCTION_BID
             if 0 <= k < NUM_BID_LEVELS:
-                value = self._bid_value(player, prop)
+                value = self.encoder._bid_value(player, prop)
                 ceiling = min(int(round(BID_FRACTIONS[k] * value)),
                               int(round(BID_CEILING_MULT * prop.price)),
                               player.balance)
@@ -555,164 +398,6 @@ class MonopolyEnv(_GymEnv):
             return 0  # A_AUCTION_PASS or anything unexpected
 
         return hook
-
-    def _group_price(self, grp):
-        """Total list price of every tile in a monopoly group."""
-        return sum(t.price for t in grp)
-
-    def _bid_value(self, player, prop):
-        """``prop``'s value to ``player`` for auction bidding: its list price,
-        boosted by the group's value when winning it completes ``player``'s own
-        set, or (weighted) when it would complete an opponent's set -- so the
-        ceiling reflects how pivotal the tile is, not just its sticker price."""
-        value = float(prop.price)
-        grp = self._group_of.get(id(prop))
-        if grp is None:
-            return value
-        if self._completes_monopoly_for(player, prop):
-            value += self.MONOPOLY_BONUS * self._group_price(grp)
-        elif any(o is not player and not o.bankrupt
-                 and self._completes_monopoly_for(o, prop)
-                 for o in self.game.players):
-            value += (DENIAL_VALUE_WEIGHT * self.MONOPOLY_BONUS
-                      * self._group_price(grp))
-        return value
-
-    def _traffic(self, prop):
-        """How often ``prop`` is landed on, as a multiple of an average tile
-        (1.0 == an even 1/board share)."""
-        uniform = 1.0 / self._board_size
-        return self._land_freq.get(prop.pos, uniform) * self._board_size
-
-    def _expected_income(self, prop):
-        """A proxy for the rent ``prop`` will earn its owner: how often it is
-        landed on (traffic vs an average tile) times its nominal rent."""
-        return self._traffic(prop) * base_rent(prop)
-
-    def _developed_rent(self, prop):
-        """The rent ``prop`` collects *as developed right now* (unlike
-        ``base_rent``'s nominal undeveloped figure): the street's rent table at
-        its current house count (with the unimproved-monopoly double),
-        railroads at the owner's count, utilities at the expected 7-pip roll.
-        Mortgaged tiles collect nothing."""
-        if prop.owner is None or prop.mortgaged:
-            return 0.0
-        if isinstance(prop, Utility):
-            count = sum(isinstance(p, Utility) for p in prop.owner.properties)
-            return (4.0 if count == 1 else 10.0) * 7.0
-        return float(prop.get_rent(self.game, None))
-
-    def _profits_per_turn(self):
-        """Each player's expected net cash flow per full board round (see
-        ``PROFIT_SCALE``): every live opponent passes the player's tiles once a
-        round (income x live opponents) while the player passes every
-        opponent-owned tile once itself (loss x 1). Flow per pass is landing
-        traffic x developed rent. Returns a list aligned with
-        ``game.players``; 0.0 for bankrupt seats."""
-        g = self.game
-        n = len(g.players)
-        income = [0.0] * n
-        total = 0.0
-        for prop in self.ownable:
-            owner = prop.owner
-            if owner is None or owner.bankrupt:
-                continue
-            flow = self._traffic(prop) * self._developed_rent(prop)
-            income[g.players.index(owner)] += flow
-            total += flow
-        n_live = sum(1 for p in g.players if not p.bankrupt)
-        return [0.0 if p.bankrupt
-                else (n_live - 1) * income[i] - (total - income[i])
-                for i, p in enumerate(g.players)]
-
-    def _buy_yield(self, prop):
-        """Expected rent per dollar of purchase price: ``_expected_income`` /
-        price. The cost-normalised "how cheap is this for what it earns" signal
-        (``buy_yield.png``) -- high for the railroads/utilities and the cheap
-        high-traffic streets, the best value acquisitions."""
-        price = float(getattr(prop, "price", 0) or 0)
-        return self._expected_income(prop) / price if price else 0.0
-
-    def _dev_roi(self, prop):
-        """Expected extra rent from a full hotel per dollar sunk into houses (a
-        hotel is five house-purchases): traffic x (hotel rent - base rent) /
-        (5 x house cost). The "best set to develop" signal (``development_roi``)
-        -- peaks on the orange and light-blue groups. Zero for railroads and
-        utilities, which never build."""
-        if not isinstance(prop, StreetProperty):
-            return 0.0
-        build_cost = 5.0 * prop.house_cost()
-        rent_gain = self._traffic(prop) * (prop.rent_table[-1]
-                                           - prop.rent_table[0])
-        return rent_gain / build_cost if build_cost else 0.0
-
-    def _set_quality(self, grp):
-        """Development-ROI multiplier for a colour group (~1.0 average), used to
-        prize *completing* an efficient, cheap-to-develop set above a
-        sticker-equal but sluggish one. The average dev-ROI over the group's
-        streets, expressed against ``SET_ROI_REF`` and clamped to
-        ``SET_QUALITY_CLAMP``: >1 for the orange/light-blue money groups, <1 for
-        the pricey greens/dark-blue. Neutral (1.0) for railroad/utility groups,
-        which never build."""
-        rois = [self._dev_roi(t) for t in grp if isinstance(t, StreetProperty)]
-        if not rois:
-            return 1.0
-        lo, hi = SET_QUALITY_CLAMP
-        return max(lo, min(hi, (sum(rois) / len(rois)) / SET_ROI_REF))
-
-    def _build_bonus(self, prop):
-        """Shaped bonus for the house/hotel just added to ``prop`` (see
-        ``BUILD_BONUS_COEF``): the rent the new house adds -- its rent-table jump
-        over the previous level, weighted by the tile's landing traffic and by a
-        cost tilt (``BUILD_ROI_REF_HOUSE_COST`` / house cost) so a build dollar is
-        rewarded by the *rent it returns* -- steering limited cash to the
-        cheap-to-develop money groups (development ROI). Called after
-        :meth:`Game.build_house` has incremented ``prop.houses``."""
-        h = prop.houses
-        rent_gain = float(prop.rent_table[h] - prop.rent_table[h - 1])
-        roi_tilt = BUILD_ROI_REF_HOUSE_COST / prop.house_cost()
-        return (BUILD_BONUS_COEF * self._traffic(prop) * rent_gain
-                * roi_tilt / 1000.0)
-
-    def _on_acquire(self, player, prop, source="trade"):
-        """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
-
-        ``source`` is "buy" (bought on landing), "auction" (won at auction), or
-        "trade" (player-to-player). For the controlled agent, queue two one-time
-        shaped bonuses:
-
-        * **Acquisition** -- when the tile was taken fresh from the bank, a reward
-          scaled by its expected income, so the agent actively acquires properties
-          instead of dumping them to auction. Buying on landing earns the full
-          ``ACQUISITION_BONUS_COEF``; an auction win earns the smaller
-          ``AUCTION_ACQUISITION_BONUS_COEF`` -- so buying the tile it wants
-          outright beats declining it and sniping the cheaper auction, while
-          winning is still worth more than conceding to an opponent. Trades don't
-          earn it (they aren't the source of the passivity problem and net worth
-          already prices them).
-        * **Denial** -- when the tile was an opponent's last-missing piece,
-          blocking their monopoly (any source). The completion test ignores
-          ``prop``'s new owner, so evaluating it after the transfer is correct.
-        """
-        if player is not self.game.players[self.seat]:
-            return
-        if source in ("buy", "auction"):
-            coef = (ACQUISITION_BONUS_COEF if source == "buy"
-                    else AUCTION_ACQUISITION_BONUS_COEF)
-            self._pending_bonus += coef * self._expected_income(prop) / 1000.0
-            if source == "buy":
-                # Price-scaled premium for buying on landing (never on an auction
-                # win), sized to cancel the cheap-auction net-worth windfall so
-                # buying at list beats declining-to-snipe. See BUY_PREFERENCE_COEF.
-                self._pending_bonus += BUY_PREFERENCE_COEF * prop.price / 1000.0
-        grp = self._group_of.get(id(prop))
-        if grp is None:
-            return
-        if any(o is not player and not o.bankrupt
-               and self._completes_monopoly_for(o, prop)
-               for o in self.game.players):
-            self._pending_bonus += (DENIAL_BONUS_COEF * self.MONOPOLY_BONUS
-                                    * self._group_price(grp) / 1000.0)
 
     # -- Game construction --------------------------------------------------
     def _build_game(self):
@@ -736,31 +421,8 @@ class MonopolyEnv(_GymEnv):
             t for t in board.tiles
             if isinstance(t, (StreetProperty, Railroad, Utility))
         ]
-        self._prop_index = {id(p): i for i, p in enumerate(self.ownable)}
-        # Monopoly groups (each street colour, all railroads, all utilities),
-        # precomputed once for the completed-set reward bonus and trade logic.
-        self._groups = self._build_groups(self.ownable)
-        self._group_of = {id(t): grp for grp in self._groups for t in grp}
-        # Landing-frequency prior (share per board pos) and the board size, used
-        # to expose each tile's "traffic vs even" multiple in the observation.
-        self._land_freq = load_landing_frequencies()
-        self._board_size = board.length
-
-    @staticmethod
-    def _build_groups(ownable):
-        """Groups ownable tiles into the sets that form a monopoly, returned in
-        a stable order (by group key) so the per-group observation features line
-        up identically between the env and the GUI mirror."""
-        groups = {}
-        for t in ownable:
-            if isinstance(t, StreetProperty):
-                key = ("street", t.color)
-            elif isinstance(t, Railroad):
-                key = ("railroad", "")
-            else:
-                key = ("utility", "")
-            groups.setdefault(key, []).append(t)
-        return [groups[k] for k in sorted(groups)]
+        # Bind the observation encoder (obs, valuations, masks) to this game.
+        self.encoder.bind(game, self.ownable)
 
     def _make_roll_dice(self, game):
         """Returns a ``roll_dice`` bound to this env's private RNG."""
@@ -850,7 +512,7 @@ class MonopolyEnv(_GymEnv):
         # A trade target is offered at most once per MANAGE phase; re-proposing a
         # rejected trade changes no state, so without this the phase could spin
         # forever on a repeatedly-declined offer.
-        self._traded_this_manage = set()
+        self.encoder._traded_this_manage = set()
         while True:
             action = decide(PHASE_MANAGE)
             if action == A_END_MANAGE:
@@ -879,7 +541,7 @@ class MonopolyEnv(_GymEnv):
         if decide is None:
             return
         while payer.balance < amount:
-            if not self._has_liquidation_options(payer):
+            if not self.encoder._has_liquidation_options(payer):
                 return  # nothing left to raise; bankruptcy will follow
             action = decide(PHASE_LIQUIDATE, None, amount)
             if action == A_END_MANAGE:
@@ -898,7 +560,7 @@ class MonopolyEnv(_GymEnv):
         self._cur_phase = phase
         self._cur_prop = prop
         self._cur_amount = amount
-        self._cur_mask = self._legal_mask(phase, prop, self.seat)
+        self._cur_mask = self.encoder._legal_mask(phase, prop, self.seat)
         self._req_q.put((phase, prop, amount))
         action = self._resp_q.get()
         if action == _ABORT:
@@ -914,8 +576,8 @@ class MonopolyEnv(_GymEnv):
         Builds the mask and observation from ``seat``'s own perspective and
         clamps an illegal/invalid policy action to a safe default.
         """
-        mask = self._legal_mask(phase, prop, seat)
-        obs = self._encode_obs(seat, phase, prop)
+        mask = self.encoder._legal_mask(phase, prop, seat)
+        obs = self.encoder._encode_obs(seat, phase, prop)
         action = int(self._opponent_policy(obs, mask.astype(bool)))
         if not (0 <= action < NUM_ACTIONS and mask[action]):
             action = self._safe_default(phase)
@@ -956,154 +618,8 @@ class MonopolyEnv(_GymEnv):
             g.unmortgage_property(self.ownable[action - A_UNMORTGAGE], player)
         elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
             i = action - A_TRADE
-            self._traded_this_manage.add(i)
+            self.encoder._traded_this_manage.add(i)
             self._attempt_trade(player, self.ownable[i])
-
-    def _has_liquidation_options(self, player):
-        """Whether ``player`` has any house to sell or property to mortgage."""
-        g = self.game
-        for prop in player.properties:
-            if isinstance(prop, StreetProperty) and prop.can_sell_house(g, player):
-                return True
-            if prop.can_mortgage(g, player):
-                return True
-        return False
-
-    def _raisable_cash(self, player):
-        """Cash ``player`` could raise beyond its balance by selling every
-        house and mortgaging every property -- an upper bound used to decide
-        whether a not-yet-affordable purchase is within reach."""
-        total = 0
-        for prop in player.properties:
-            if prop.mortgaged:
-                continue
-            total += prop.mortgage_value
-            if isinstance(prop, StreetProperty):
-                total += prop.houses * (prop.house_cost() // 2)
-        return total
-
-    def _can_afford(self, player, price):
-        """Whether ``player`` can pay ``price`` now or after liquidating."""
-        return (player.balance >= price
-                or player.balance + self._raisable_cash(player) >= price)
-
-    # -- Targeted trading ---------------------------------------------------
-    def _prop_value(self, prop):
-        """List-price value of a property, discounted for an unpaid mortgage.
-
-        Mirrors ``ui/ai_player.GUIAIDecider._property_value`` so headless trades
-        and GUI trades value tiles the same way.
-        """
-        if prop.mortgaged:
-            return float(prop.price - prop.unmortgage_cost)
-        return float(prop.price)
-
-    def _trade_value(self, prop, owner):
-        """Value of ``prop`` to ``owner`` for trading purposes.
-
-        Richer than the raw list value: it adds the rent the tile is expected to
-        earn (landing traffic * nominal rent, weighted by ``TRADE_INCOME_WEIGHT``)
-        and the group's monopoly value when the tile completes ``owner``'s own
-        set, or the (weighted) blocking value when it is instead an *opponent*'s
-        last-missing piece. So a busy, set-completing tile is prized while a quiet
-        spare that helps no one is cheap to part with -- and handing an opponent
-        their final set-completer is correctly seen as expensive. Mirrors the
-        bidding valuation in :meth:`_bid_value`, plus the traffic/rent term.
-        """
-        value = self._prop_value(prop)
-        value += TRADE_INCOME_WEIGHT * self._expected_income(prop)
-        grp = self._group_of.get(id(prop))
-        if grp is None:
-            return value
-        # Completing a cheap-to-develop set (orange/light-blue) is worth more than
-        # completing a sticker-equal but sluggish one -- tilt the set value by its
-        # development ROI (:meth:`_set_quality`).
-        set_value = self.MONOPOLY_BONUS * self._group_price(grp) * self._set_quality(grp)
-        if self._completes_monopoly_for(owner, prop):
-            value += set_value
-        elif any(o is not owner and not o.bankrupt
-                 and self._completes_monopoly_for(o, prop)
-                 for o in self.game.players):
-            value += DENIAL_VALUE_WEIGHT * set_value
-        return value
-
-    def _completes_monopoly_for(self, player, target):
-        """Whether acquiring ``target`` would complete a monopoly for ``player``
-        (they already own every other tile in ``target``'s group)."""
-        grp = self._group_of.get(id(target))
-        if grp is None:
-            return False
-        return all(t.owner is player for t in grp if t is not target)
-
-    def _can_propose_trade(self, initiator, target):
-        """Whether ``initiator`` may propose a trade to acquire ``target``.
-
-        Trades are restricted to set-completing acquisitions from a solvent
-        opponent: the tile must be tradeable (no buildings in its group),
-        acquiring it must finish a monopoly for the initiator, and the initiator
-        must have a tile it can hand over in return.
-        """
-        owner = target.owner
-        if owner is None or owner is initiator or owner.bankrupt:
-            return False
-        if not self.game.can_trade_property(target):
-            return False
-        if not self._completes_monopoly_for(initiator, target):
-            return False
-        return self._choose_give_tile(initiator, owner, target) is not None
-
-    def _choose_give_tile(self, initiator, partner, target):
-        """Picks the tile ``initiator`` offers ``partner`` in a trade for
-        ``target`` (or ``None`` if it has nothing suitable to give).
-
-        Prefers parting with a *spare* -- the only tile the initiator owns in its
-        group, so the trade breaks no progress -- and, among the pool, gives up
-        the tile of least :meth:`_trade_value` to the initiator. That parts with
-        quiet, low-rent tiles first and, because a tile that would complete the
-        partner's set carries that set's blocking value, steers away from handing
-        the opponent their final set-completer unless there is nothing else.
-        """
-        g = self.game
-        target_group = self._group_of.get(id(target))
-
-        def count(owner, group):
-            return sum(1 for t in group if t.owner is owner)
-
-        tradeable = [p for p in initiator.properties
-                     if g.can_trade_property(p)
-                     and self._group_of.get(id(p)) is not target_group]
-        if not tradeable:
-            return None
-        spares = [p for p in tradeable
-                  if count(initiator, self._group_of[id(p)]) == 1]
-        pool = spares or tradeable
-        return min(pool, key=lambda p: self._trade_value(p, initiator))
-
-    def _balancing_cash(self, initiator, partner, give, receive):
-        """Cash the initiator pays the partner to balance a trade.
-
-        Valued from the *partner*'s side with :meth:`_trade_value`, so the cash
-        covers what the partner gives up (the target -- worth extra to them as
-        the initiator's set-completer they are handing over) net of what they get
-        back, factoring in traffic, rent, and any set the give-tile completes for
-        them, plus a premium for prying loose a set-completing tile. Never
-        negative -- in the T1 model only the initiator pays.
-        """
-        recv_val = sum(self._trade_value(t, partner) for t in receive)
-        give_val = sum(self._trade_value(t, partner) for t in give)
-        grp = self._group_of.get(id(receive[0])) if receive else None
-        set_price = sum(t.price for t in grp) if grp else 0
-        premium = int(round(0.25 * set_price))
-        return max(0, int(round(recv_val - give_val)) + premium)
-
-    def _formula_trade_ok(self, partner, gain, lose, cash):
-        """Baseline partner's accept rule: take the deal when it is non-negative
-        by :meth:`_trade_value` from the partner's side -- ``cash`` received plus
-        the traffic/rent/set-aware value of tiles gained minus tiles given up."""
-        value = float(cash)
-        value += sum(self._trade_value(p, partner) for p in gain)
-        value -= sum(self._trade_value(p, partner) for p in lose)
-        return value >= 0
 
     def _attempt_trade(self, initiator, target):
         """Builds and offers a set-completing trade for ``target``.
@@ -1115,13 +631,13 @@ class MonopolyEnv(_GymEnv):
         """
         g = self.game
         partner = target.owner
-        if not self._can_propose_trade(initiator, target):
+        if not self.encoder._can_propose_trade(initiator, target):
             return
-        give = self._choose_give_tile(initiator, partner, target)
+        give = self.encoder._choose_give_tile(initiator, partner, target)
         if give is None:
             return
         receive = [target]
-        cash = min(self._balancing_cash(initiator, partner, [give], receive),
+        cash = min(self.encoder._balancing_cash(initiator, partner, [give], receive),
                    initiator.balance)
         if cash < 0:
             return
@@ -1131,88 +647,17 @@ class MonopolyEnv(_GymEnv):
         if decide is not None:
             # From the partner's view they receive ``give`` plus ``cash`` and
             # part with ``target``; expose that as the response observation.
-            self._cur_trade = {"recv": give, "give": target, "cash": cash}
+            self.encoder._cur_trade = {"recv": give, "give": target, "cash": cash}
             action = decide(PHASE_TRADE_RESPOND, target, cash)
-            self._cur_trade = None
+            self.encoder._cur_trade = None
             accept = action == A_TRADE_ACCEPT
         else:
-            accept = self._formula_trade_ok(partner, [give], receive, cash)
+            accept = self.encoder._formula_trade_ok(partner, [give], receive, cash)
 
         if accept:
             g.execute_trade(initiator, partner, [give], receive, cash)
 
     # -- Legal-action masks -------------------------------------------------
-    def _legal_mask(self, phase, prop, seat):
-        mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        g = self.game
-        player = g.players[seat]
-
-        if phase == PHASE_JAIL:
-            mask[A_ROLL_JAIL] = 1
-            if player.balance >= 50:
-                mask[A_PAY_JAIL] = 1
-            if player.jail_cards:
-                mask[A_USE_CARD] = 1
-            return mask
-
-        if phase == PHASE_BUY:
-            mask[A_DECLINE] = 1
-            # Offer BUY whenever the price is reachable -- either in cash now or
-            # by mortgaging / selling first (the buy hook runs that liquidation
-            # before finalizing), so the agent can afford a set-completing tile.
-            if prop is not None and self._can_afford(player, prop.price):
-                mask[A_BUY] = 1
-            return mask
-
-        if phase == PHASE_AUCTION:
-            # Pass is always allowed; a bid bucket is legal when its dollar
-            # amount is covered by cash (auctions are settled in cash only).
-            mask[A_AUCTION_PASS] = 1
-            if prop is not None:
-                for k, frac in enumerate(BID_FRACTIONS):
-                    if player.balance >= int(round(frac * prop.price)):
-                        mask[A_AUCTION_BID + k] = 1
-            return mask
-
-        if phase == PHASE_TRADE_RESPOND:
-            mask[A_TRADE_ACCEPT] = 1
-            mask[A_TRADE_REJECT] = 1
-            return mask
-
-        # MANAGE and LIQUIDATE share the property-action masks.
-        for i, p in enumerate(self.ownable):
-            if p.owner is not player:
-                continue
-            if isinstance(p, StreetProperty):
-                if phase == PHASE_MANAGE and p.can_build_house(g, player):
-                    mask[A_BUILD + i] = 1
-                # Selling houses is only offered during forced LIQUIDATE, for
-                # the same reason as mortgaging: allowing it during voluntary
-                # MANAGE let the agent sell<->rebuild houses on a monopoly.
-                if phase == PHASE_LIQUIDATE and p.can_sell_house(g, player):
-                    mask[A_SELL + i] = 1
-            # Mortgaging is only offered during forced LIQUIDATE (raising cash
-            # the player actually needs). Allowing it during voluntary MANAGE
-            # let the agent mortgage-flip a property it just bought (and
-            # oscillate mortgage<->unmortgage), so it is masked out there.
-            if phase == PHASE_LIQUIDATE and p.can_mortgage(g, player):
-                mask[A_MORTGAGE + i] = 1
-            if phase == PHASE_MANAGE:
-                if p.can_unmortgage(g, player):
-                    mask[A_UNMORTGAGE + i] = 1
-
-        # Trade proposals target tiles owned by *other* players: offer A_TRADE+i
-        # for each opponent tile whose acquisition would complete a monopoly for
-        # this player (and hasn't already been tried this MANAGE phase).
-        if phase == PHASE_MANAGE:
-            for i, p in enumerate(self.ownable):
-                if i not in self._traded_this_manage \
-                        and self._can_propose_trade(player, p):
-                    mask[A_TRADE + i] = 1
-
-        mask[A_END_MANAGE] = 1  # always allowed to stop
-        return mask
-
     # -- Observation & reward ----------------------------------------------
     def _pump_until_request(self):
         """Waits for the next decision request (or the terminal signal)."""
@@ -1222,227 +667,15 @@ class MonopolyEnv(_GymEnv):
             self._cur_phase = PHASE_TERMINAL
             self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
             self._cur_prop = None
-            obs = self._encode_obs(self.seat, PHASE_TERMINAL, None)
+            obs = self.encoder._encode_obs(self.seat, PHASE_TERMINAL, None)
             reward = self._reward(terminal=True)
             return obs, reward, True, self._truncated, self._info(terminal=True)
 
         phase, prop, amount = item
         self._cur_phase, self._cur_prop, self._cur_amount = phase, prop, amount
-        obs = self._encode_obs(self.seat, phase, prop)
+        obs = self.encoder._encode_obs(self.seat, phase, prop)
         reward = self._reward(terminal=False)
         return obs, reward, False, False, self._info()
-
-    def _encode_obs(self, perspective, phase, prop):
-        """Builds the flat float32 observation from ``perspective``'s view.
-
-        Players are ordered starting at ``perspective`` (so the acting seat is
-        always relative player 0) and property owners are encoded by relative
-        seat. This makes the observation perspective-invariant, so one policy
-        can play any seat -- the basis for self-play.
-        """
-        g = self.game
-        n = self.num_players
-        parts = []
-
-        # Per-player block (acting seat first): balance, position, jail flag,
-        # #cards, bankrupt, expected profit per turn (net rent flow -- see
-        # PROFIT_SCALE).
-        profits = self._profits_per_turn()
-        for k in range(n):
-            idx = (perspective + k) % n
-            p = g.players[idx]
-            parts.extend([
-                p.balance / 1500.0,
-                p.pos / 39.0,
-                1.0 if p.in_jail else 0.0,
-                float(len(p.jail_cards)),
-                1.0 if p.bankrupt else 0.0,
-                profits[idx] / PROFIT_SCALE,
-            ])
-
-        # Per-property block: owner one-hot relative to perspective (slot 0 ==
-        # "mine", slot n == unowned), mortgaged, houses.
-        for p in self.ownable:
-            owner_onehot = [0.0] * (n + 1)
-            if p.owner is None:
-                owner_onehot[n] = 1.0
-            else:
-                rel = (g.players.index(p.owner) - perspective) % n
-                owner_onehot[rel] = 1.0
-            parts.extend(owner_onehot)
-            parts.append(1.0 if p.mortgaged else 0.0)
-            parts.append(getattr(p, "houses", 0) / 5.0)
-
-        # Phase one-hot and the context property index (BUY/AUCTION/LIQUIDATE),
-        # or -1 when no single property is in play.
-        phase_onehot = [0.0] * NUM_PHASES
-        phase_onehot[phase] = 1.0
-        parts.extend(phase_onehot)
-        if prop is not None:
-            parts.append(self._prop_index[id(prop)] / NUM_OWNABLE)
-        else:
-            parts.append(-1.0)
-
-        # Trade context (PHASE_TRADE_RESPOND): the tile this player would
-        # receive, the tile it would give up, and the net cash it gets, all from
-        # its own perspective; -1/-1/0 outside a trade response.
-        tc = self._cur_trade
-        if phase == PHASE_TRADE_RESPOND and tc is not None:
-            recv, give = tc["recv"], tc["give"]
-            parts.append(self._prop_index[id(recv)] / NUM_OWNABLE
-                         if recv is not None else -1.0)
-            parts.append(self._prop_index[id(give)] / NUM_OWNABLE
-                         if give is not None else -1.0)
-            parts.append(tc["cash"] / 1500.0)
-        else:
-            parts.extend([-1.0, -1.0, 0.0])
-
-        # Set-awareness. Two context flags for the property in play: does
-        # acquiring it complete *my* set, and is it an opponent's last-missing
-        # tile (completing it would finish *their* set)?
-        me = g.players[perspective]
-        opponents = [g.players[(perspective + k) % n] for k in range(1, n)]
-        parts.append(1.0 if prop is not None
-                     and self._completes_monopoly_for(me, prop) else 0.0)
-        parts.append(1.0 if prop is not None and any(
-            not o.bankrupt and self._completes_monopoly_for(o, prop)
-            for o in opponents) else 0.0)
-
-        # Per-group progress: how much of each monopoly group I own, and the
-        # most any single opponent owns -- general set-awareness for bidding,
-        # building, and trading.
-        for grp in self._groups:
-            size = len(grp)
-            parts.append(sum(1 for t in grp if t.owner is me) / size)
-            parts.append(max((sum(1 for t in grp if t.owner is o)
-                              for o in opponents), default=0) / size)
-
-        # Economics of the property in play (the tile being bought / auctioned /
-        # traded for): its price, a nominal rent, how often it is landed on
-        # relative to an average tile (1.0 == even), and two cost-normalised value
-        # signals -- buy yield (rent per $ of price) and development ROI (rent per
-        # $ of houses). Together these let the agent weigh traffic *and cost*
-        # when valuing an acquisition or trade; 0s when no single property is in
-        # play. (See BUILD_ROI_REF_HOUSE_COST for the two value signals.)
-        econ = prop
-        if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
-            econ = tc.get("recv")
-        if econ is not None:
-            parts.append(econ.price / 400.0)
-            parts.append(base_rent(econ) / 50.0)
-            parts.append(self._traffic(econ))
-            parts.append(self._buy_yield(econ) * 5.0)   # ~0.25-0.95
-            parts.append(self._dev_roi(econ))           # ~0-2.3, 0 for RR/util
-        else:
-            parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
-
-        return np.asarray(parts, dtype=np.float32)
-
-    def _net_worth(self, player):
-        """Net worth used for reward shaping.
-
-        An owned, unmortgaged property is valued at ``price * (1 +
-        ACQUISITION_PREMIUM)``: above the cash price, reflecting the rent it
-        earns, so *buying* a property is a small net gain (cash ``-price`` but
-        property ``+price*(1+premium)``) rather than net-worth-neutral. Without
-        that premium buying scores reward 0 and the policy collapses to "always
-        decline".
-
-        A mortgaged property is valued at ``price - unmortgage_cost`` (its worth
-        once the outstanding mortgage debt is cleared). Combined with the
-        ``mortgage_value`` cash a mortgage pays out, this makes forced
-        mortgaging during liquidation a clear net-worth loss -- the agent only
-        does it when it genuinely needs the cash.
-        """
-        total = float(player.balance)
-        for prop in player.properties:
-            total += (prop.price - prop.unmortgage_cost) if prop.mortgaged \
-                else prop.price * (1.0 + self.ACQUISITION_PREMIUM)
-            if isinstance(prop, StreetProperty):
-                # Value houses above cost (same premium as properties): they
-                # multiply rent, so *building* should be a small net gain, not
-                # the net-worth loss that valuing them at half-cost produced --
-                # which would teach the agent never to build.
-                total += (prop.houses * prop.house_cost()
-                          * (1.0 + self.ACQUISITION_PREMIUM))
-        # Reward holding *complete* sets: each fully-owned group adds a bonus,
-        # so the tile that finishes a monopoly is a big net-worth jump.
-        total += self.MONOPOLY_BONUS * self._owned_monopoly_value(player)
-        return total
-
-    def _owned_monopoly_value(self, player):
-        """Total list price of the monopoly groups ``player`` fully owns."""
-        total = 0.0
-        for tiles in self._groups:
-            if all(t.owner is player for t in tiles):
-                total += sum(t.price for t in tiles)
-        return total
-
-    def _decisive_winner(self):
-        """The winner even when no one was bankrupted (a turn-cap timeout).
-
-        A real end has a sole survivor; on a timeout with several survivors the
-        richest (by shaped net worth) is declared the winner. This makes every
-        episode conclusive -- without trading and with the GO salary, games
-        often reach the turn cap with everyone still solvent, which otherwise
-        leaves the agent with no win/loss signal on those games.
-        """
-        survivors = self.game.active_players()
-        if not survivors:
-            return None
-        if len(survivors) == 1:
-            return survivors[0]
-        return max(survivors, key=self._net_worth)
-
-    def _terminal_reward(self):
-        """Decisive end-of-game reward in ``[-1, +1]``.
-
-        Bankruptcy is the worst outcome (-1); a sole survivor wins outright
-        (+1). On a timeout the agent is ranked among the surviving players by
-        net worth and mapped linearly to ``[-1, +1]`` (leader +1, worst survivor
-        -1), so being ahead at the cap is rewarded and every game is decisive.
-        Ties in net worth count as neither ahead nor behind.
-        """
-        controlled = self.game.players[self.seat]
-        if controlled.bankrupt:
-            return -1.0
-        survivors = self.game.active_players()
-        if len(survivors) <= 1:
-            return 1.0  # sole survivor: outright win
-        my_nw = self._net_worth(controlled)
-        others = [p for p in survivors if p is not controlled]
-        beat = sum(self._net_worth(p) < my_nw for p in others)
-        lost = sum(self._net_worth(p) > my_nw for p in others)
-        return (beat - lost) / (len(survivors) - 1)
-
-    def _reward(self, terminal):
-        controlled = self.game.players[self.seat]
-        reward = 0.0
-        if self.reward_mode == "shaped":
-            # Shape on *relative* advantage (my net worth minus the mean
-            # opponent's), not absolute net worth. This way an opponent
-            # completing a set raises the baseline and costs me reward -- so the
-            # agent is pushed to spend to block it -- while finishing my own set
-            # still pays. It telescopes over the episode, so the decisive
-            # terminal reward is unaffected.
-            adv = self._net_worth(controlled) - self._mean_opp_networth()
-            reward += (adv - self._prev_advantage) / 1000.0
-            self._prev_advantage = adv
-            # One-time bonus for snatching an opponent's last-missing tile
-            # (denying their monopoly); credited by the on_acquire hook.
-            reward += self._pending_bonus
-            self._pending_bonus = 0.0
-        if terminal:
-            reward += self._terminal_reward()
-        return reward
-
-    def _mean_opp_networth(self):
-        """Mean net worth of the controlled seat's non-bankrupt opponents (0 if
-        none remain), the baseline for the relative shaped reward."""
-        controlled = self.game.players[self.seat]
-        others = [self._net_worth(p) for p in self.game.players
-                  if p is not controlled and not p.bankrupt]
-        return sum(others) / len(others) if others else 0.0
 
     def _info(self, terminal=False):
         info = {

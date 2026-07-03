@@ -97,7 +97,7 @@ def play_one_game(env, policy, seed, max_turns):
     env.np_random = np.random.default_rng(seed)
     env._build_game()
     g = env.game
-    groups = env._groups
+    groups = env.encoder._groups
     n = env.num_players
 
     # Route every seat through the policy (synchronous deciders), and wire the
@@ -122,7 +122,7 @@ def play_one_game(env, policy, seed, max_turns):
         ratio = bid / prop.price if prop.price else 0.0
         auction["all_ratios"].append(ratio)
         completer = next((p for p in g.players if not p.bankrupt
-                          and env._completes_monopoly_for(p, prop)), None)
+                          and env.encoder._completes_monopoly_for(p, prop)), None)
         if completer is winner:
             auction["self_complete"] += 1
             auction["self_ratios"].append(ratio)

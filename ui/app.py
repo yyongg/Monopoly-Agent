@@ -24,6 +24,7 @@ from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
 from models.tiles.property import Property
+from ui.game_stats import GameStats
 
 # Window / board geometry.
 WIDTH, HEIGHT = 1500, 950
@@ -348,7 +349,8 @@ class MonopolyApp:
         if screen is None:
             pygame.init()
             pygame.key.set_repeat(300, 40)
-            self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+            self.screen = pygame.display.set_mode(
+                (WIDTH, HEIGHT), pygame.SCALED | pygame.RESIZABLE)
         else:
             self.screen = screen
 
@@ -398,6 +400,10 @@ class MonopolyApp:
         game.on_card = self._show_card
         game.notify = self._inform
         game.on_shortfall = self._on_shortfall
+
+        # Post-game analytics: installs its own on_acquire / on_auction_end hooks
+        # and wraps declare_bankrupt, so it must be built after the hooks above.
+        self.stats = GameStats(game)
 
     # -- Helpers ----------------------------------------------------------
 
@@ -2538,12 +2544,140 @@ class MonopolyApp:
         self.game.advance_turn()
 
     def _show_result(self):
-        """Announces the outcome and lets the player start another game or quit.
-        Returns ``"restart"`` or ``"quit"``."""
+        """Announces the outcome and lets the player view stats, start another
+        game, or quit. Returns ``"restart"`` or ``"quit"``."""
         winner = self.game.winner()
         message = f"{winner.name} wins!" if winner else "Game over."
         self.add_log(message)
-        return self.ask(message, [("Play Again", "restart"), ("Quit", "quit")])
+        options = [("View Game Stats", "stats"),
+                   ("Play Again", "restart"), ("Quit", "quit")]
+        while True:
+            choice = self.ask(message, options)
+            if choice == "stats":
+                self._show_stats_screen()
+                continue
+            return choice
+
+    # ----- end-of-game stats screen --------------------------------------
+
+    def _stats_lines(self):
+        """Builds the ``(text, color, indent)`` rows for the stats overlay from
+        the game's :class:`GameStats` summary."""
+        s = self.stats.summary()
+        by_name = {p.name: p for p in self.game.players}
+        rows = []
+
+        def head(text):
+            rows.append((text, ACCENT, 0))
+
+        def line(text, color=INK, indent=1):
+            rows.append((text, color, indent))
+
+        turns = s["turns"]
+        head("Overview")
+        line(f"Game length: {turns} turns")
+        if s["winner"]:
+            wp = by_name[s["winner"]]
+            line(f"Winner: {s['winner']}", player_color(s["winner"]))
+            line(f"Winner's net worth: ${self._net_worth(wp):,}")
+            fmt = s["winner_first_monopoly_turn"]
+            line(f"Winner's first monopoly: "
+                 f"{'turn ' + str(fmt) if fmt is not None else 'none completed'}")
+        else:
+            line("No winner (turn cap reached).", MUTED)
+        line(f"Auctions won (total): {s['total_auctions_won']}")
+
+        head("Players")
+        for p in s["players"]:
+            color = MUTED if p["bankrupt"] else player_color(p["name"])
+            tag = " — bankrupt" if p["bankrupt"] else ""
+            line(f"{p['name']}{tag}", color)
+            line(f"Properties: {p['properties']}   Auctions won: "
+                 f"{p['auctions_won']}", MUTED, indent=2)
+            if p["monopolies"]:
+                fmt = p["first_monopoly_turn"]
+                when = f" (first at turn {fmt})" if fmt is not None else ""
+                line(f"Monopolies: {', '.join(p['monopolies'])}{when}",
+                     MUTED, indent=2)
+            else:
+                line("Monopolies: none", MUTED, indent=2)
+
+        head("Auction bidding")
+        sc, sr, scn = (s["set_completion_bid"], s["set_completion_ratio"],
+                       s["set_completion_count"])
+        nc, nr, ncn = (s["non_completion_bid"], s["non_completion_ratio"],
+                       s["non_completion_count"])
+        if scn:
+            line(f"Set-completers: mean ${sc:,.0f} "
+                 f"({sr * 100:.0f}% of list) over {scn} win(s)")
+        else:
+            line("Set-completers: no set-completing auction wins", MUTED)
+        if ncn:
+            line(f"Non-set-completers: mean ${nc:,.0f} "
+                 f"({nr * 100:.0f}% of list) over {ncn} win(s)")
+        else:
+            line("Non-set-completers: no such auction wins", MUTED)
+
+        head(f"Blocked sets ({len(s['blocks'])})")
+        if s["blocks"]:
+            for b in s["blocks"]:
+                verb = {"buy": "bought", "auction": "won at auction",
+                        "trade": "traded for"}.get(b["source"], "took")
+                line(f"{b['by']} {verb} {b['tile']}, denying "
+                     f"{b['victim']}'s {b['set']}")
+        else:
+            line("No sets were blocked this game.", MUTED)
+        return rows
+
+    def _show_stats_screen(self):
+        """Scrollable end-of-game statistics overlay. Returns on Back / Esc."""
+        rows = self._stats_lines()
+        scroll = [0]
+        line_h = 30
+        panel = pygame.Rect(BOARD_X + 60, BOARD_Y + 30,
+                            BOARD_PX - 120, BOARD_PX - 60)
+        view_top = panel.y + 76
+        view_bottom = panel.bottom - 70
+        visible = max(1, (view_bottom - view_top) // line_h)
+        max_scroll = max(0, len(rows) - visible)
+
+        def draw(mouse):
+            self._dim_scene()
+            scroll[0] = max(0, min(max_scroll, scroll[0] - self._modal_wheel))
+            self._panel(panel, PANEL)
+            title = self.f_title.render("Game Statistics", True, INK)
+            self.screen.blit(title, (panel.x + 24, panel.y + 20))
+            hint = self.f_small.render("scroll for more", True, MUTED)
+            self.screen.blit(hint, hint.get_rect(
+                topright=(panel.right - 24, panel.y + 28)))
+            pygame.draw.line(self.screen, EDGE, (panel.x + 20, panel.y + 64),
+                             (panel.right - 20, panel.y + 64))
+
+            y = view_top
+            for text, color, indent in rows[scroll[0]:scroll[0] + visible]:
+                font = self.f_head if indent == 0 else self.f_body
+                self.screen.blit(font.render(text, True, color),
+                                 (panel.x + 30 + indent * 22, y))
+                y += line_h
+
+            if max_scroll:
+                track_h = visible * line_h
+                sx = panel.right - 16
+                pygame.draw.rect(self.screen, EDGE,
+                                 pygame.Rect(sx, view_top, 4, track_h),
+                                 border_radius=2)
+                thumb_h = max(20, int(track_h * visible / len(rows)))
+                thumb_y = view_top + int(
+                    (track_h - thumb_h) * scroll[0] / max_scroll)
+                pygame.draw.rect(self.screen, MUTED,
+                                 pygame.Rect(sx, thumb_y, 4, thumb_h),
+                                 border_radius=2)
+
+            back = pygame.Rect(panel.centerx - 90, panel.bottom - 56, 180, 40)
+            self._draw_dialog_button("Back", back.x, back.y, back.w, mouse, ACCENT)
+            return [(back, "back")]
+
+        self._run_overlay_modal(draw)
 
     # ----- main loop -----------------------------------------------------
 
@@ -2554,6 +2688,7 @@ class MonopolyApp:
         game on the same window."""
         try:
             turns = 0
+            self.stats.snapshot(0)
             while not self.game.is_over() and turns < max_turns:
                 player = self.game.players[self.game.current_player]
                 choice = self._turn_menu(player)
@@ -2565,6 +2700,7 @@ class MonopolyApp:
                     self._post_roll_manage(player)
                 self._end_turn(player)
                 turns += 1
+                self.stats.snapshot(turns)
             return self._show_result()
         except QuitGame:
             return "quit"
@@ -2641,7 +2777,8 @@ def main():
 
     pygame.init()
     pygame.key.set_repeat(300, 40)
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    screen = pygame.display.set_mode(
+        (WIDTH, HEIGHT), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
 
     config = _run_setup(screen, clock, model_available)
