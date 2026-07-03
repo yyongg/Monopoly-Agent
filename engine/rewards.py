@@ -102,9 +102,10 @@ class RewardMixin:
                     * (1.0 + self.cfg.first_monopoly_tempo_weight * tempo))
             return
 
-        # Denial: I took an opponent's last-missing tile. Weight it up when that
-        # tile would have been their *first* set (no monopoly completed yet), so
-        # preventing an opponent from being first is worth more than a late block.
+        # Denial: I took an opponent's last-missing tile. Weight it up when the
+        # tile would have completed the *game's first* monopoly (no set owned by
+        # anyone yet), so stopping an opponent from being first to a set is worth
+        # more than a block after the race is already under way.
         if any(o is not player and not o.bankrupt
                and enc._completes_monopoly_for(o, prop)
                for o in self.game.players):

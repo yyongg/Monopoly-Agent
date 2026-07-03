@@ -50,8 +50,8 @@ class RewardConfig:
     # fast race to the first set, not just eventually completing one.
     first_monopoly_tempo_weight: float = 1.5
     first_monopoly_tempo_turns: float = 50.0
-    # Extra weight on the denial bonus when the tile taken would have been an
-    # opponent's *first* set (nobody has completed one yet): mult = 1 + weight.
+    # Extra weight on the denial bonus when the tile taken would have completed
+    # the *game's first* monopoly (no set owned by anyone yet): mult = 1 + weight.
     first_denial_weight: float = 0.5
     # Reward for acquiring an unowned tile from the bank, scaled by expected
     # income. Buying on landing earns the full coef; an auction win earns the
