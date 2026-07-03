@@ -33,6 +33,82 @@ SIDE_X = 920
 SIDE_W = WIDTH - SIDE_X - 20
 TOKEN_PX = 40
 
+
+class _ScaledDisplay:
+    """A fixed logical canvas scaled to a freely-resizable window.
+
+    All UI code draws to ``self.canvas`` at the fixed 1500x950 design
+    resolution. Each frame the canvas is uniformly scaled (aspect preserved)
+    and blitted, centered, onto the real OS window — so dragging any corner
+    grows or shrinks every graphic together. Mouse coordinates coming back
+    from the window are mapped into canvas space so all the hard-coded
+    hit-test rectangles keep working unchanged.
+    """
+
+    def __init__(self, logical_size, window_size=None, flags=pygame.RESIZABLE):
+        self.logical = logical_size
+        self.canvas = pygame.Surface(logical_size)
+        self._flags = flags
+        self.window = pygame.display.set_mode(
+            window_size or logical_size, flags)
+        self._recompute()
+
+    def _recompute(self):
+        ww, wh = self.window.get_size()
+        cw, ch = self.logical
+        self.scale = min(ww / cw, wh / ch)
+        self._dest = (max(1, int(cw * self.scale)),
+                      max(1, int(ch * self.scale)))
+        self.offset = ((ww - self._dest[0]) // 2, (wh - self._dest[1]) // 2)
+
+    def present(self):
+        """Scale the logical canvas onto the window and flip."""
+        scaled = pygame.transform.smoothscale(self.canvas, self._dest)
+        self.window.fill((0, 0, 0))
+        self.window.blit(scaled, self.offset)
+        pygame.display.flip()
+
+    def to_canvas(self, pos):
+        ox, oy = self.offset
+        s = self.scale or 1.0
+        return (int((pos[0] - ox) / s), int((pos[1] - oy) / s))
+
+    def mouse(self):
+        return self.to_canvas(pygame.mouse.get_pos())
+
+    def events(self):
+        """Drain events, remapping mouse positions into canvas space and
+        keeping the window surface in sync with any resize."""
+        out = []
+        for e in pygame.event.get():
+            if e.type == pygame.VIDEORESIZE:
+                self.window = pygame.display.set_mode(e.size, self._flags)
+                self._recompute()
+            elif e.type == pygame.WINDOWSIZECHANGED:
+                self._recompute()
+            if hasattr(e, "pos"):
+                e = pygame.event.Event(
+                    e.type, {**e.dict, "pos": self.to_canvas(e.pos)})
+            out.append(e)
+        return out
+
+
+# Set once by whichever entry point creates the display (``main`` or the
+# standalone ``MonopolyApp`` constructor). Every draw loop presents through it.
+_DISPLAY = None
+
+
+def _fit_window_size():
+    """Initial window size: the logical size shrunk (aspect preserved) to fit
+    within the desktop, so the whole board and its resize corner are always
+    on-screen even on smaller displays. The window is freely resizable after."""
+    try:
+        dw, dh = pygame.display.get_desktop_sizes()[0]
+    except Exception:
+        return (WIDTH, HEIGHT)
+    s = min((dw * 0.92) / WIDTH, (dh * 0.90) / HEIGHT, 1.0)
+    return (max(1, int(WIDTH * s)), max(1, int(HEIGHT * s)))
+
 # Palette.
 BG = (11, 76, 47)
 PANEL = (247, 246, 241)
@@ -159,7 +235,7 @@ def _run_setup(screen, clock, model_available):
     py = HEIGHT // 2 - ph // 2 - 20
 
     while True:
-        mouse = pygame.mouse.get_pos()
+        mouse = _DISPLAY.mouse()
         screen.fill(BG)
 
         # Panel card.
@@ -259,9 +335,9 @@ def _run_setup(screen, clock, model_available):
         screen.blit(surf, surf.get_rect(center=start_btn.center))
         hot.append((start_btn, ("start", None)))
 
-        pygame.display.flip()
+        _DISPLAY.present()
 
-        for event in pygame.event.get():
+        for event in _DISPLAY.events():
             if event.type == pygame.QUIT:
                 return None
             if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
@@ -301,8 +377,8 @@ def _show_error(screen, clock, lines):
         pygame.draw.rect(screen, BTN, btn, border_radius=8)
         surf = font_body.render("Continue", True, BTN_INK)
         screen.blit(surf, surf.get_rect(center=btn.center))
-        pygame.display.flip()
-        for event in pygame.event.get():
+        _DISPLAY.present()
+        for event in _DISPLAY.events():
             if event.type == pygame.QUIT:
                 return
             if event.type in (pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN):
@@ -346,11 +422,12 @@ class MonopolyApp:
         self.vpos = {p.name: float(p.pos) for p in game.players}
         self.hop = {p.name: 0.0 for p in game.players}
 
+        global _DISPLAY
         if screen is None:
             pygame.init()
             pygame.key.set_repeat(300, 40)
-            self.screen = pygame.display.set_mode(
-                (WIDTH, HEIGHT), pygame.SCALED | pygame.RESIZABLE)
+            _DISPLAY = _ScaledDisplay((WIDTH, HEIGHT), _fit_window_size())
+            self.screen = _DISPLAY.canvas
         else:
             self.screen = screen
 
@@ -940,11 +1017,11 @@ class MonopolyApp:
         """
         self._modal_wheel = 0
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             buttons = draw(mouse)
-            pygame.display.flip()
+            _DISPLAY.present()
             self._modal_wheel = 0
-            for event in pygame.event.get():
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
@@ -1341,7 +1418,7 @@ class MonopolyApp:
 
     def render(self):
         self._draw_scene()
-        pygame.display.flip()
+        _DISPLAY.present()
 
     # ----- input ---------------------------------------------------------
 
@@ -1350,10 +1427,10 @@ class MonopolyApp:
         if self._auto is not None:
             return self._auto(question, options)
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             buttons, player_rects = self._draw_scene(question, options, mouse)
-            pygame.display.flip()
-            for event in pygame.event.get():
+            _DISPLAY.present()
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
@@ -1377,7 +1454,7 @@ class MonopolyApp:
     def _frame(self):
         skip = False
         board_rect = pygame.Rect(BOARD_X, BOARD_Y, BOARD_PX, BOARD_PX)
-        for event in pygame.event.get():
+        for event in _DISPLAY.events():
             if event.type == pygame.QUIT:
                 raise QuitGame
             # Only a click *on the board* skips animations -- clicks elsewhere
@@ -1402,7 +1479,7 @@ class MonopolyApp:
                             self._inv_scroll = 0
                             break
         self._draw_scene()
-        pygame.display.flip()
+        _DISPLAY.present()
         self.clock.tick(60)
         return skip
 
@@ -1758,12 +1835,12 @@ class MonopolyApp:
         a jail exit or ``None`` when the player is done managing."""
         scroll = 0
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             hot, max_scroll = self._draw_manage_panel(
                 player, jail_exit, scroll, mouse)
-            pygame.display.flip()
+            _DISPLAY.present()
             scroll = max(0, min(scroll, max_scroll))
-            for event in pygame.event.get():
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
@@ -1823,10 +1900,10 @@ class MonopolyApp:
         build/sell/mortgage buttons. Stays open so the player can build several
         houses and watch the rent climb; Esc or Close returns to the grid."""
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             hot = self._draw_manage_detail(player, prop, mouse)
-            pygame.display.flip()
-            for event in pygame.event.get():
+            _DISPLAY.present()
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.KEYDOWN \
@@ -2016,14 +2093,14 @@ class MonopolyApp:
             "scroll_recv": 0,
         }
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             hot = self._draw_trade_dialog(player, partners, state, mouse)
-            pygame.display.flip()
-            for event in pygame.event.get():
+            _DISPLAY.present()
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
-                    self._scroll_trade_columns(state, pygame.mouse.get_pos(),
+                    self._scroll_trade_columns(state, _DISPLAY.mouse(),
                                                event.y)
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if self._handle_trade_click(player, state, hot, event.pos):
@@ -2253,12 +2330,12 @@ class MonopolyApp:
         or remove it from ``target_set`` (a set of tiles in the trade)."""
         scroll = 0
         while True:
-            mouse = pygame.mouse.get_pos()
+            mouse = _DISPLAY.mouse()
             hot, max_scroll = self._draw_inventory_browser(
                 owner, target_set, title, scroll, mouse)
-            pygame.display.flip()
+            _DISPLAY.present()
             scroll = max(0, min(scroll, max_scroll))
-            for event in pygame.event.get():
+            for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
                 if event.type == pygame.MOUSEWHEEL:
@@ -2777,8 +2854,9 @@ def main():
 
     pygame.init()
     pygame.key.set_repeat(300, 40)
-    screen = pygame.display.set_mode(
-        (WIDTH, HEIGHT), pygame.SCALED | pygame.RESIZABLE)
+    global _DISPLAY
+    _DISPLAY = _ScaledDisplay((WIDTH, HEIGHT), _fit_window_size())
+    screen = _DISPLAY.canvas
     clock = pygame.time.Clock()
 
     config = _run_setup(screen, clock, model_available)
