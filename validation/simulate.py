@@ -6,8 +6,10 @@ survivor, or a turn-cap timeout) over many random seeds, and the script reports
 what winning play looks like:
 
 * **Seat win rate** -- does turn order (first-move) matter?
-* **Winning monopolies** -- which colour sets do winners tend to hold, and which
-  sets most predict a win (P(win | the player ever completed that set))?
+* **Winning monopolies** -- which colour sets do winners tend to hold, which
+  sets most predict a win (P(win | the player ever completed that set)), and
+  which *first* set most predicts a win (P(win | the player's first completed
+  monopoly was that set)) -- a joint set-choice + tempo signal.
 * **Winning properties** -- the individual tiles most often held by the winner.
 * **Tempo** -- how early the winner completed their first monopoly.
 * **Why winners win** -- winners' vs losers' monopoly counts and net worth.
@@ -156,6 +158,7 @@ def play_one_game(env, policy, seed, max_turns):
 
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n
+    first_monopoly_set = [None] * n
     peak_net_worth = [0.0] * n
     peak_properties = [0] * n
 
@@ -169,6 +172,7 @@ def play_one_game(env, policy, seed, max_turns):
                     ever_monopolies[s].add(label)
                     if first_monopoly_turn[s] is None:
                         first_monopoly_turn[s] = turn
+                        first_monopoly_set[s] = label
             peak_net_worth[s] = max(peak_net_worth[s], liquidation_net_worth(p))
             peak_properties[s] = max(peak_properties[s], len(p.properties))
 
@@ -198,6 +202,7 @@ def play_one_game(env, policy, seed, max_turns):
             "ever_monopolies": sorted(ever_monopolies[s]),
             "num_ever_monopolies": len(ever_monopolies[s]),
             "first_monopoly_turn": first_monopoly_turn[s],
+            "first_monopoly_set": first_monopoly_set[s],
             "properties": props,
             "houses": houses,
             "hotels": hotels,
@@ -258,12 +263,23 @@ def aggregate(records, num_players):
     group_ever = Counter()
     group_ever_win = Counter()
 
+    # For each group, restricted to the player-games where it was the *first*
+    # monopoly completed: how many, and how many won -> P(win | first set was X).
+    # A joint set-choice + tempo signal (which opening set best predicts a win).
+    first_set_count = Counter()
+    first_set_win = Counter()
+
     for r in records:
         for p in r["players"]:
             for label in p["ever_monopolies"]:
                 group_ever[label] += 1
                 if p["won"]:
                     group_ever_win[label] += 1
+            fs = p["first_monopoly_set"]
+            if fs is not None:
+                first_set_count[fs] += 1
+                if p["won"]:
+                    first_set_win[fs] += 1
             if not p["won"]:
                 loser_num_monopolies.append(p["num_ever_monopolies"])
                 loser_peak_net_worths.append(p["peak_net_worth"])
@@ -285,6 +301,10 @@ def aggregate(records, num_players):
     group_win_rate = {
         label: group_ever_win[label] / group_ever[label]
         for label in group_ever
+    }
+    first_set_win_rate = {
+        label: first_set_win[label] / first_set_count[label]
+        for label in first_set_count
     }
 
     # Auction aggression / blocking analytics (across all games).
@@ -308,6 +328,8 @@ def aggregate(records, num_players):
         "winner_property_freq": winner_property_freq,
         "group_ever": group_ever,
         "group_win_rate": group_win_rate,
+        "first_set_count": first_set_count,
+        "first_set_win_rate": first_set_win_rate,
         "mean_winner_net_worth": float(np.mean(winner_net_worths)) if winner_net_worths else 0.0,
         "mean_winner_monopolies": float(np.mean(winner_num_monopolies)) if winner_num_monopolies else 0.0,
         "mean_loser_monopolies": float(np.mean(loser_num_monopolies)) if loser_num_monopolies else 0.0,
@@ -374,6 +396,15 @@ def print_report(stats):
                     key=lambda kv: kv[1], reverse=True)
     for label, wr in ranked:
         n = stats["group_ever"][label]
+        bar = "#" * int(round(wr * 40))
+        print(f"  {label:<12} {wr * 100:5.1f}%  (n={n:>4})  {bar}")
+
+    print("\nFirst sets that most predict a win  "
+          "(P(win | player's first completed monopoly was this set)):")
+    ranked = sorted(stats["first_set_win_rate"].items(),
+                    key=lambda kv: kv[1], reverse=True)
+    for label, wr in ranked:
+        n = stats["first_set_count"][label]
         bar = "#" * int(round(wr * 40))
         print(f"  {label:<12} {wr * 100:5.1f}%  (n={n:>4})  {bar}")
 
@@ -491,8 +522,8 @@ def write_csv(records, path):
         w = csv.writer(f)
         w.writerow(["game", "length", "timeout", "seat", "won", "bankrupt",
                     "final_net_worth", "peak_net_worth", "num_ever_monopolies",
-                    "first_monopoly_turn", "properties", "houses", "hotels",
-                    "final_monopolies"])
+                    "first_monopoly_turn", "first_monopoly_set", "properties",
+                    "houses", "hotels", "final_monopolies"])
         for gi, r in enumerate(records):
             for p in r["players"]:
                 w.writerow([
@@ -500,7 +531,8 @@ def write_csv(records, path):
                     int(p["won"]), int(p["bankrupt"]),
                     f"{p['final_net_worth']:.0f}", f"{p['peak_net_worth']:.0f}",
                     p["num_ever_monopolies"], p["first_monopoly_turn"],
-                    p["properties"], p["houses"], p["hotels"],
+                    p["first_monopoly_set"] or "", p["properties"],
+                    p["houses"], p["hotels"],
                     "|".join(p["final_monopolies"]),
                 ])
 
