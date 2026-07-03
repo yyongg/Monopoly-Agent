@@ -20,7 +20,7 @@ from engine.rl_env import (
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
     NUM_PHASES, NUM_ACTIONS, NUM_OWNABLE, NUM_GROUPS,
     NUM_BID_LEVELS, BID_FRACTIONS, BID_CEILING_MULT, DENIAL_VALUE_WEIGHT,
-    TRADE_INCOME_WEIGHT, SET_ROI_REF, SET_QUALITY_CLAMP,
+    TRADE_INCOME_WEIGHT, SET_ROI_REF, SET_QUALITY_CLAMP, PROFIT_SCALE,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
@@ -153,12 +153,47 @@ class GUIAIDecider:
             value += DENIAL_VALUE_WEIGHT * MONOPOLY_BONUS * self._group_price(grp)
         return value
 
+    def _traffic(self, prop):
+        """How often ``prop`` is landed on, as a multiple of an average tile
+        (1.0 == even). Mirrors the env."""
+        uniform = 1.0 / self._board_size
+        return self._land_freq.get(prop.pos, uniform) * self._board_size
+
     def _expected_income(self, prop):
         """Proxy for the rent ``prop`` earns its owner: landing traffic (vs an
         average tile) times its nominal rent. Mirrors the env."""
-        uniform = 1.0 / self._board_size
-        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
-        return traffic * base_rent(prop)
+        return self._traffic(prop) * base_rent(prop)
+
+    def _developed_rent(self, prop):
+        """The rent ``prop`` collects as developed right now (current houses,
+        monopoly double, railroad count, expected 7-pip utility roll; mortgaged
+        tiles collect nothing). Mirrors the env."""
+        if prop.owner is None or prop.mortgaged:
+            return 0.0
+        if isinstance(prop, Utility):
+            count = sum(isinstance(p, Utility) for p in prop.owner.properties)
+            return (4.0 if count == 1 else 10.0) * 7.0
+        return float(prop.get_rent(self.game, None))
+
+    def _profits_per_turn(self):
+        """Each player's expected net rent flow per full board round (income x
+        live opponents - opponent-tile flow), aligned with ``game.players``;
+        0.0 for bankrupt seats. Mirrors the env."""
+        g = self.game
+        n = len(g.players)
+        income = [0.0] * n
+        total = 0.0
+        for prop in self.ownable:
+            owner = prop.owner
+            if owner is None or owner.bankrupt:
+                continue
+            flow = self._traffic(prop) * self._developed_rent(prop)
+            income[g.players.index(owner)] += flow
+            total += flow
+        n_live = sum(1 for p in g.players if not p.bankrupt)
+        return [0.0 if p.bankrupt
+                else (n_live - 1) * income[i] - (total - income[i])
+                for i, p in enumerate(g.players)]
 
     def _buy_yield(self, prop):
         """Expected rent per dollar of purchase price. Mirrors the env."""
@@ -170,10 +205,9 @@ class GUIAIDecider:
         house-purchases); zero for railroads/utilities. Mirrors the env."""
         if not isinstance(prop, StreetProperty):
             return 0.0
-        uniform = 1.0 / self._board_size
-        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         build_cost = 5.0 * prop.house_cost()
-        rent_gain = traffic * (prop.rent_table[-1] - prop.rent_table[0])
+        rent_gain = self._traffic(prop) * (prop.rent_table[-1]
+                                           - prop.rent_table[0])
         return rent_gain / build_cost if build_cost else 0.0
 
     def _set_quality(self, grp):
@@ -250,14 +284,17 @@ class GUIAIDecider:
         g = self.game
         n = self.num_players
         parts = []
+        profits = self._profits_per_turn()
         for k in range(n):
-            p = g.players[(perspective + k) % n]
+            idx = (perspective + k) % n
+            p = g.players[idx]
             parts.extend([
                 p.balance / 1500.0,
                 p.pos / 39.0,
                 1.0 if p.in_jail else 0.0,
                 float(len(p.jail_cards)),
                 1.0 if p.bankrupt else 0.0,
+                profits[idx] / PROFIT_SCALE,
             ])
         for p in self.ownable:
             owner_onehot = [0.0] * (n + 1)
@@ -311,10 +348,9 @@ class GUIAIDecider:
         if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
             econ = tc.get("recv")
         if econ is not None:
-            uniform = 1.0 / self._board_size
             parts.append(econ.price / 400.0)
             parts.append(base_rent(econ) / 50.0)
-            parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+            parts.append(self._traffic(econ))
             parts.append(self._buy_yield(econ) * 5.0)
             parts.append(self._dev_roi(econ))
         else:

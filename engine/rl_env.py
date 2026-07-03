@@ -137,7 +137,7 @@ NUM_BID_LEVELS = 6
 # ones. The absolute bid is still bounded by ``BID_CEILING_MULT`` * list price
 # and by cash (see ``_make_bid_hook``).
 BID_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-BID_CEILING_MULT = 3.0   # hard ceiling on any bid, as a multiple of list price
+BID_CEILING_MULT = 4.0   # hard ceiling on any bid, as a multiple of list price
 DENIAL_VALUE_WEIGHT = 1.0  # weight on the blocking (deny-opponent) value term
 # How many turns of expected rent to fold into a tile's trade value. Trade
 # valuation starts from list price and adds ``TRADE_INCOME_WEIGHT`` times the
@@ -219,6 +219,17 @@ BUILD_BONUS_COEF = 0.5
 BUILD_ROI_REF_HOUSE_COST = 95.0
 SET_ROI_REF = 1.3
 SET_QUALITY_CLAMP = (0.75, 1.25)
+# **Expected profit per turn** (one observation feature per seat): each player's
+# net rent *flow* -- the cash-flow complement to the balance/net-worth *stock*
+# features. Per full board round every live opponent passes a player's tiles
+# once (income x live opponents) while the player passes every opponent tile
+# once itself (loss x 1), so income scales up with the field and shrinks as it
+# thins. Flow per pass is landing traffic x *developed* rent (current houses,
+# the unimproved-monopoly double, railroad count, expected utility roll;
+# mortgaged tiles collect nothing) -- unlike the static base-rent features this
+# climbs as sets develop, telling the agent who owns a money engine and who is
+# bleeding. ``PROFIT_SCALE`` divides the dollar figure into feature range.
+PROFIT_SCALE = 1000.0
 NUM_ACTIONS = A_AUCTION_BID + NUM_BID_LEVELS  # 155
 
 # --- Landing-frequency prior ----------------------------------------------
@@ -351,7 +362,8 @@ class MonopolyEnv(_GymEnv):
         assert len(self._build_groups(self._ownable_template)) == NUM_GROUPS
 
         self.action_space = Discrete(NUM_ACTIONS)
-        obs_len = (5 * num_players
+        obs_len = (6 * num_players  # balance, pos, jail, cards, bankrupt,
+                                    # expected profit/turn
                    + NUM_OWNABLE * (num_players + 3)
                    + NUM_PHASES + 1
                    + 3               # trade context: recv tile, give tile, cash
@@ -566,12 +578,52 @@ class MonopolyEnv(_GymEnv):
                       * self._group_price(grp))
         return value
 
+    def _traffic(self, prop):
+        """How often ``prop`` is landed on, as a multiple of an average tile
+        (1.0 == an even 1/board share)."""
+        uniform = 1.0 / self._board_size
+        return self._land_freq.get(prop.pos, uniform) * self._board_size
+
     def _expected_income(self, prop):
         """A proxy for the rent ``prop`` will earn its owner: how often it is
         landed on (traffic vs an average tile) times its nominal rent."""
-        uniform = 1.0 / self._board_size
-        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
-        return traffic * base_rent(prop)
+        return self._traffic(prop) * base_rent(prop)
+
+    def _developed_rent(self, prop):
+        """The rent ``prop`` collects *as developed right now* (unlike
+        ``base_rent``'s nominal undeveloped figure): the street's rent table at
+        its current house count (with the unimproved-monopoly double),
+        railroads at the owner's count, utilities at the expected 7-pip roll.
+        Mortgaged tiles collect nothing."""
+        if prop.owner is None or prop.mortgaged:
+            return 0.0
+        if isinstance(prop, Utility):
+            count = sum(isinstance(p, Utility) for p in prop.owner.properties)
+            return (4.0 if count == 1 else 10.0) * 7.0
+        return float(prop.get_rent(self.game, None))
+
+    def _profits_per_turn(self):
+        """Each player's expected net cash flow per full board round (see
+        ``PROFIT_SCALE``): every live opponent passes the player's tiles once a
+        round (income x live opponents) while the player passes every
+        opponent-owned tile once itself (loss x 1). Flow per pass is landing
+        traffic x developed rent. Returns a list aligned with
+        ``game.players``; 0.0 for bankrupt seats."""
+        g = self.game
+        n = len(g.players)
+        income = [0.0] * n
+        total = 0.0
+        for prop in self.ownable:
+            owner = prop.owner
+            if owner is None or owner.bankrupt:
+                continue
+            flow = self._traffic(prop) * self._developed_rent(prop)
+            income[g.players.index(owner)] += flow
+            total += flow
+        n_live = sum(1 for p in g.players if not p.bankrupt)
+        return [0.0 if p.bankrupt
+                else (n_live - 1) * income[i] - (total - income[i])
+                for i, p in enumerate(g.players)]
 
     def _buy_yield(self, prop):
         """Expected rent per dollar of purchase price: ``_expected_income`` /
@@ -589,10 +641,9 @@ class MonopolyEnv(_GymEnv):
         utilities, which never build."""
         if not isinstance(prop, StreetProperty):
             return 0.0
-        uniform = 1.0 / self._board_size
-        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         build_cost = 5.0 * prop.house_cost()
-        rent_gain = traffic * (prop.rent_table[-1] - prop.rent_table[0])
+        rent_gain = self._traffic(prop) * (prop.rent_table[-1]
+                                           - prop.rent_table[0])
         return rent_gain / build_cost if build_cost else 0.0
 
     def _set_quality(self, grp):
@@ -617,12 +668,11 @@ class MonopolyEnv(_GymEnv):
         rewarded by the *rent it returns* -- steering limited cash to the
         cheap-to-develop money groups (development ROI). Called after
         :meth:`Game.build_house` has incremented ``prop.houses``."""
-        uniform = 1.0 / self._board_size
-        traffic = self._land_freq.get(prop.pos, uniform) * self._board_size
         h = prop.houses
         rent_gain = float(prop.rent_table[h] - prop.rent_table[h - 1])
         roi_tilt = BUILD_ROI_REF_HOUSE_COST / prop.house_cost()
-        return BUILD_BONUS_COEF * traffic * rent_gain * roi_tilt / 1000.0
+        return (BUILD_BONUS_COEF * self._traffic(prop) * rent_gain
+                * roi_tilt / 1000.0)
 
     def _on_acquire(self, player, prop, source="trade"):
         """``Game.on_acquire`` hook: ``prop`` just transferred to ``player``.
@@ -1195,15 +1245,19 @@ class MonopolyEnv(_GymEnv):
         parts = []
 
         # Per-player block (acting seat first): balance, position, jail flag,
-        # #cards, bankrupt.
+        # #cards, bankrupt, expected profit per turn (net rent flow -- see
+        # PROFIT_SCALE).
+        profits = self._profits_per_turn()
         for k in range(n):
-            p = g.players[(perspective + k) % n]
+            idx = (perspective + k) % n
+            p = g.players[idx]
             parts.extend([
                 p.balance / 1500.0,
                 p.pos / 39.0,
                 1.0 if p.in_jail else 0.0,
                 float(len(p.jail_cards)),
                 1.0 if p.bankrupt else 0.0,
+                profits[idx] / PROFIT_SCALE,
             ])
 
         # Per-property block: owner one-hot relative to perspective (slot 0 ==
@@ -1274,10 +1328,9 @@ class MonopolyEnv(_GymEnv):
         if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
             econ = tc.get("recv")
         if econ is not None:
-            uniform = 1.0 / self._board_size
             parts.append(econ.price / 400.0)
             parts.append(base_rent(econ) / 50.0)
-            parts.append(self._land_freq.get(econ.pos, uniform) * self._board_size)
+            parts.append(self._traffic(econ))
             parts.append(self._buy_yield(econ) * 5.0)   # ~0.25-0.95
             parts.append(self._dev_roi(econ))           # ~0-2.3, 0 for RR/util
         else:
