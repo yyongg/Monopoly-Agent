@@ -981,14 +981,16 @@ class MonopolyApp:
             cx += 11
         return cx + 1
 
-    def _draw_property_chip(self, prop, x, y):
+    def _draw_property_chip(self, prop, x, y, max_w=None):
         color = self._property_color(prop)
-        tw = self.f_small.size(prop.name)[0]
+        name = prop.name if max_w is None else \
+            self._truncate(prop.name, self.f_small, max_w)
+        tw = self.f_small.size(name)[0]
         chip = pygame.Rect(x - 4, y - 2, tw + 12, self.f_small.get_height() + 4)
         pygame.draw.rect(self.screen, color, chip, border_radius=4)
         pygame.draw.rect(self.screen, (0, 0, 0), chip, 1, border_radius=4)
         self.screen.blit(
-            self.f_small.render(prop.name, True, contrast_text(color)),
+            self.f_small.render(name, True, contrast_text(color)),
             (x + 2, y))
 
     # ----- card popups & modals ------------------------------------------
@@ -2347,17 +2349,18 @@ class MonopolyApp:
         house/hotel/mortgage icons, current rent and cash worth, and a +/check
         button. Clicking a (tradeable) row toggles it into ``target_set``.
         Returns ``(rows, max_scroll)`` of ``(rect, prop)`` hit-boxes."""
-        self._text(header, (x, y), self.f_head, INK)
         props = self._sorted_props(owner.properties)
-        list_top = y + 34
-        row_h = 50
+        # Header, then the property count on its own line beneath it.
+        self._text(header, (x, y), self.f_head, INK)
+        list_top = y + 56
+        row_h = 58
         rows_fit = max(1, (bottom - list_top) // row_h)
         max_scroll = max(0, len(props) - rows_fit)
         scroll = max(0, min(scroll, max_scroll))
         count = f"{len(props)} propert" + ("y" if len(props) == 1 else "ies")
         if max_scroll:
             count += "  ·  scroll"
-        self._text(count, (x + self.f_head.size(header)[0] + 10, y + 6),
+        self._text(self._truncate(count, self.f_small, w), (x, y + 30),
                    self.f_small, MUTED)
 
         hot = []
@@ -2366,7 +2369,7 @@ class MonopolyApp:
             return hot, 0
         ry = list_top
         for prop in props[scroll:scroll + rows_fit]:
-            row = pygame.Rect(x, ry, w, row_h - 6)
+            row = pygame.Rect(x, ry, w, row_h - 8)
             selected = prop in target_set
             tradeable = self.game.can_trade_property(prop)
             pygame.draw.rect(self.screen,
@@ -2374,20 +2377,21 @@ class MonopolyApp:
                              border_radius=6)
             pygame.draw.rect(self.screen, ACCENT if selected else EDGE, row,
                              2 if selected else 1, border_radius=6)
-            # Line 1: colour-chipped property name.
-            self._draw_property_chip(prop, row.x + 8, row.y + 5)
-            # Line 2: building icons, then rent and cash worth.
-            cy2 = row.y + 30
+            # +/check button on the right, vertically centred.
+            br = pygame.Rect(row.right - 34, row.centery - 13, 26, 26)
+            # Line 1: colour-chipped property name (truncated so it never runs
+            # under the button).
+            self._draw_property_chip(prop, row.x + 8, row.y + 7,
+                                     max_w=br.x - (row.x + 8) - 12)
+            # Line 2 (clearly below the name): building icons, then rent + worth.
+            cy2 = row.y + 36
             endx = self._draw_buildings(prop, row.x + 8, cy2)
+            startx = endx + 6 if endx > row.x + 8 else row.x + 8
             _, rent = self._rent_line(prop)
             infof = self._font(13)
-            info = f"{rent}  ·  ${self._property_worth(prop)}"
-            info = self._truncate(info, infof, row.right - 42 - (endx + 4))
-            self.screen.blit(infof.render(info, True, MUTED),
-                             (endx + 4 if endx > row.x + 8 else row.x + 8,
-                              cy2 - 8))
-            # +/check button on the right.
-            br = pygame.Rect(row.right - 34, row.centery - 13, 26, 26)
+            info = self._truncate(f"{rent}  ·  ${self._property_worth(prop)}",
+                                  infof, br.x - 6 - startx)
+            self.screen.blit(infof.render(info, True, MUTED), (startx, cy2 - 8))
             pygame.draw.rect(self.screen, POS_GREEN if selected else BTN, br,
                              border_radius=6)
             self._draw_icon("check" if selected else "plus", BTN_INK,

@@ -88,12 +88,45 @@ class RewardMixin:
         grp = enc._group_of.get(id(prop))
         if grp is None:
             return
+
+        # First-to-a-set: I just completed this group and no monopoly exists
+        # anywhere yet -> reward being the game's first monopolist, weighted up
+        # the earlier it happens (a fast race, not just eventual completion).
+        if all(t.owner is player for t in grp):
+            if self._count_complete_sets(exclude=grp) == 0:
+                horizon = max(1.0, self.cfg.first_monopoly_tempo_turns)
+                tempo = max(0.0, 1.0 - self._turn / horizon)
+                self._pending_bonus += (
+                    self.cfg.first_monopoly_bonus_coef * self.cfg.monopoly_bonus
+                    * enc._group_price(grp) / 1000.0
+                    * (1.0 + self.cfg.first_monopoly_tempo_weight * tempo))
+            return
+
+        # Denial: I took an opponent's last-missing tile. Weight it up when that
+        # tile would have been their *first* set (no monopoly completed yet), so
+        # preventing an opponent from being first is worth more than a late block.
         if any(o is not player and not o.bankrupt
                and enc._completes_monopoly_for(o, prop)
                for o in self.game.players):
+            mult = (1.0 + self.cfg.first_denial_weight
+                    if self._count_complete_sets() == 0 else 1.0)
             self._pending_bonus += (self.cfg.denial_bonus_coef
                                     * self.cfg.monopoly_bonus
-                                    * enc._group_price(grp) / 1000.0)
+                                    * enc._group_price(grp) / 1000.0 * mult)
+
+    def _count_complete_sets(self, exclude=None):
+        """Number of colour groups fully owned by a single non-bankrupt player,
+        ignoring ``exclude`` -- used to test whether *any other* set already
+        exists (i.e. whether a just-completed or just-denied set is the first)."""
+        count = 0
+        for tiles in self.encoder._groups:
+            if tiles is exclude:
+                continue
+            owner = tiles[0].owner
+            if owner is not None and not owner.bankrupt \
+                    and all(t.owner is owner for t in tiles):
+                count += 1
+        return count
 
     # -- Terminal reward ----------------------------------------------------
     def _decisive_winner(self):

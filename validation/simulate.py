@@ -269,6 +269,12 @@ def aggregate(records, num_players):
     first_set_count = Counter()
     first_set_win = Counter()
 
+    # Across decisive games in which anyone completed a monopoly: how many, and
+    # in how many the player who completed the *first* monopoly of the game went
+    # on to win -> % of games won by whoever got the first monopoly.
+    first_monopolist_games = 0
+    first_monopolist_wins = 0
+
     for r in records:
         for p in r["players"]:
             for label in p["ever_monopolies"]:
@@ -296,6 +302,15 @@ def aggregate(records, num_players):
         winner_num_monopolies.append(w["num_ever_monopolies"])
         if w["first_monopoly_turn"] is not None:
             winner_first_monopoly_turns.append(w["first_monopoly_turn"])
+
+        # The player who completed the earliest monopoly this game; did they win?
+        # (Ties on the same turn count as a win if the winner was among them.)
+        first_turn = min((p["first_monopoly_turn"] for p in r["players"]
+                          if p["first_monopoly_turn"] is not None), default=None)
+        if first_turn is not None:
+            first_monopolist_games += 1
+            if w["first_monopoly_turn"] == first_turn:
+                first_monopolist_wins += 1
 
     n_decisive = max(1, len(decisive))
     group_win_rate = {
@@ -330,6 +345,9 @@ def aggregate(records, num_players):
         "group_win_rate": group_win_rate,
         "first_set_count": first_set_count,
         "first_set_win_rate": first_set_win_rate,
+        "first_monopolist_games": first_monopolist_games,
+        "first_monopolist_win_rate": (first_monopolist_wins / first_monopolist_games
+                                      if first_monopolist_games else 0.0),
         "mean_winner_net_worth": float(np.mean(winner_net_worths)) if winner_net_worths else 0.0,
         "mean_winner_monopolies": float(np.mean(winner_num_monopolies)) if winner_num_monopolies else 0.0,
         "mean_loser_monopolies": float(np.mean(loser_num_monopolies)) if loser_num_monopolies else 0.0,
@@ -379,6 +397,9 @@ def print_report(stats):
     if stats["mean_winner_first_monopoly_turn"] is not None:
         print(f"  winner's first monopoly     : turn "
               f"{stats['mean_winner_first_monopoly_turn']:.0f} (mean)")
+    print(f"  first monopolist wins       : "
+          f"{stats['first_monopolist_win_rate'] * 100:.1f}%  "
+          f"(of {stats['first_monopolist_games']} games where a set was completed)")
     print(f"  winner net worth            : ${stats['mean_winner_net_worth']:,.0f} (mean)")
 
     print("\nAuction play (aggression & blocking):")

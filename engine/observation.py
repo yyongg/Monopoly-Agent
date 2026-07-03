@@ -93,8 +93,10 @@ def observation_length(num_players):
             + 3               # trade context: recv tile, give tile, cash
             + 2               # context flags: completes mine / opp's set
             + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
-            + 5)              # context prop economics: price, rent, traffic,
+            + 5               # context prop economics: price, rent, traffic,
                               # buy-yield, dev-ROI
+            + 4)              # race awareness: any set done, my/best-opp set
+                              # count, am-I-first
 
 
 def safe_default(phase):
@@ -546,5 +548,19 @@ class ObsEncoder:
             parts.append(self._dev_roi(econ))           # ~0-2.3, 0 for RR/util
         else:
             parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # Race awareness: how the monopoly race stands, so the policy can value
+        # being *first* to a set and denying opponents the same. "am I first" is
+        # true when I hold a set and no opponent does yet.
+        n_groups = len(self._groups)
+        my_sets = sum(1 for grp in self._groups
+                      if all(t.owner is me for t in grp))
+        opp_sets = max((sum(1 for grp in self._groups
+                            if all(t.owner is o for t in grp))
+                        for o in opponents), default=0)
+        parts.append(1.0 if (my_sets or opp_sets) else 0.0)
+        parts.append(my_sets / n_groups)
+        parts.append(opp_sets / n_groups)
+        parts.append(1.0 if my_sets > 0 and opp_sets == 0 else 0.0)
 
         return np.asarray(parts, dtype=np.float32)

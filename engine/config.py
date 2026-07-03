@@ -41,6 +41,18 @@ class RewardConfig:
     # -- One-time shaped bonuses -------------------------------------------
     denial_bonus_coef: float = 0.5     # reward for taking an opponent's last tile,
     #                                    as a fraction of the denied set's value
+    # -- Monopoly-race shaping (being FIRST to a set, and denying that) ----
+    # One-time bonus when the agent completes the *game's first* monopoly (no
+    # set owned by anyone yet), as a fraction of the completed set's value.
+    first_monopoly_bonus_coef: float = 0.5
+    # Early-completion multiplier on that bonus: 1 + tempo_weight * tempo, where
+    # tempo decays 1 -> 0 over ``first_monopoly_tempo_turns`` turns. Rewards a
+    # fast race to the first set, not just eventually completing one.
+    first_monopoly_tempo_weight: float = 1.5
+    first_monopoly_tempo_turns: float = 50.0
+    # Extra weight on the denial bonus when the tile taken would have been an
+    # opponent's *first* set (nobody has completed one yet): mult = 1 + weight.
+    first_denial_weight: float = 0.5
     # Reward for acquiring an unowned tile from the bank, scaled by expected
     # income. Buying on landing earns the full coef; an auction win earns the
     # smaller auction coef. See the extended note that used to sit in rl_env.
@@ -86,6 +98,10 @@ MONOPOLY_BONUS = DEFAULT_REWARD_CONFIG.monopoly_bonus
 DENIAL_VALUE_WEIGHT = DEFAULT_REWARD_CONFIG.denial_value_weight
 TRADE_INCOME_WEIGHT = DEFAULT_REWARD_CONFIG.trade_income_weight
 DENIAL_BONUS_COEF = DEFAULT_REWARD_CONFIG.denial_bonus_coef
+FIRST_MONOPOLY_BONUS_COEF = DEFAULT_REWARD_CONFIG.first_monopoly_bonus_coef
+FIRST_MONOPOLY_TEMPO_WEIGHT = DEFAULT_REWARD_CONFIG.first_monopoly_tempo_weight
+FIRST_MONOPOLY_TEMPO_TURNS = DEFAULT_REWARD_CONFIG.first_monopoly_tempo_turns
+FIRST_DENIAL_WEIGHT = DEFAULT_REWARD_CONFIG.first_denial_weight
 ACQUISITION_BONUS_COEF = DEFAULT_REWARD_CONFIG.acquisition_bonus_coef
 AUCTION_ACQUISITION_BONUS_COEF = DEFAULT_REWARD_CONFIG.auction_acquisition_bonus_coef
 BUY_PREFERENCE_COEF = DEFAULT_REWARD_CONFIG.buy_preference_coef

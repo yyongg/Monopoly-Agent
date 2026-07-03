@@ -233,6 +233,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self.encoder._traded_this_manage = set()  # trade targets tried this MANAGE phase
         self._prev_advantage = 0.0  # last relative-advantage potential (shaping)
         self._pending_bonus = 0.0   # denial reward queued by the on_acquire hook
+        self._turn = 0              # turns played this episode (tempo shaping)
         self._truncated = False
         self.game = None
         self.ownable = []
@@ -449,6 +450,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         try:
             while (not g.is_over() and not controlled.bankrupt
                    and turns < self.max_turns):
+                self._turn = turns  # current turn, read by tempo shaping
                 seat = g.current_player
                 if seat in self._deciders:
                     self._play_turn(g.players[seat], self._deciders[seat])
