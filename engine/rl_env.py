@@ -31,30 +31,31 @@ blocks; ``step`` consumes it, reads state while the worker is blocked, then
 unblocks the worker) means only one thread ever touches game state at a time, so
 no locking is required.
 
-Action space (``Discrete(154)``)
+Action space (``Discrete(211)``)
 --------------------------------
 A single flat action id, interpreted against the per-step ``action_mask`` in
 ``info`` (and :meth:`MonopolyEnv.legal_actions`). Property-targeted actions are
 indexed by the 28 ownable tiles in board order::
 
-    0  PAY_JAIL          pay the $50 fine to leave jail
-    1  USE_JAIL_CARD     spend a Get Out of Jail Free card
-    2  ROLL_JAIL         roll for doubles to leave jail
-    3  BUY               buy the property just landed on
-    4  DECLINE           decline the offered property (it then goes to auction)
-    5  END_MANAGE        finish managing / stop liquidating
-    6  +i  BUILD i       build a house/hotel on ownable tile i
-    34 +i  SELL i        sell a house/hotel from tile i
-    62 +i  MORTGAGE i    mortgage tile i
-    90 +i  UNMORTGAGE i  lift the mortgage on tile i
-    118+i  TRADE i       propose to acquire ownable tile i from its owner (only
-                         legal when acquiring i completes a monopoly for the
-                         agent); the engine builds the balancing give + cash
-                         offer and the partner accepts/rejects it.
-    146    TRADE_ACCEPT  accept a trade another player has offered me
-    147    TRADE_REJECT  reject a trade another player has offered me
-    148    AUCTION_PASS  bid nothing in the current auction
-    149+k  AUCTION_BID k bid BID_FRACTIONS[k] * price for the auctioned property
+    0  PAY_JAIL              pay the $50 fine to leave jail
+    1  USE_JAIL_CARD         spend a Get Out of Jail Free card
+    2  ROLL_JAIL             roll for doubles to leave jail
+    3  BUY                   buy the property just landed on
+    4  DECLINE               decline the offered property (goes to auction)
+    5  END_MANAGE            finish managing / stop liquidating
+    6  +i   BUILD i          build a house/hotel on ownable tile i
+    34 +i   SELL i           sell a house/hotel from tile i
+    62 +i   MORTGAGE i       mortgage tile i
+    90 +i   UNMORTGAGE i     lift the mortgage on tile i
+    118+3i+t TRADE i,t       propose to acquire tile i from its owner at cash
+                             tier t in {0,1,2} (0.75/1.0/1.25x the balancing
+                             cash). Legal when acquiring i completes the agent's
+                             monopoly OR denies the owner one they are cornering;
+                             the engine builds the give + tiered cash offer.
+    202    TRADE_ACCEPT      accept a trade another player has offered me
+    203    TRADE_REJECT      reject a trade another player has offered me
+    204    AUCTION_PASS      bid nothing in the current auction
+    205+k  AUCTION_BID k     bid BID_FRACTIONS[k] * value for the auctioned tile
 
 Illegal actions (those not set in the mask) are clamped to a safe default rather
 than raising, and reported via ``info["illegal"]``.
@@ -84,8 +85,8 @@ from engine.constants import (
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS,
-    BID_FRACTIONS, BID_CEILING_MULT,
+    NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS, NUM_TRADE_TIERS,
+    TRADE_CASH_TIERS, BID_FRACTIONS, BID_CEILING_MULT, decode_trade_action,
 )
 from engine.config import (
     RewardConfig, DEFAULT_REWARD_CONFIG,
@@ -147,16 +148,24 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             outcome). The terminal outcome is win/loss by net-worth rank so that
             turn-cap timeouts are still decisive -- see :meth:`_terminal_reward`.
         seed (int | None): Seed for the dice RNG (also settable via ``reset``).
-        opponent_policy (callable | None): A fixed opponent policy
-            ``(observation, action_mask_bool) -> action_index`` used to drive
-            *every* opponent seat. ``None`` keeps the engine baseline (opponents
-            play their whole turn via ``Game.step``). Observations handed to the
-            policy are from that opponent's own perspective (it always sees
-            itself as relative player 0), so a single policy can play any seat.
+        opponent_policy (callable | object | list | dict | None): The opponent
+            spec driving the non-agent seats. It may be a plain
+            ``(observation, action_mask_bool) -> action_index`` callable (a
+            network policy, applied to every opponent seat), a **state-aware**
+            object with a ``decide(seat, phase, prop, amount, mask)`` method (and
+            optional ``bind(game, ownable)``) such as a hand-crafted baseline
+            agent, a **list/tuple** of policies dealt round-robin across the
+            opponent seats (heterogeneous opponents, e.g. an FP-A/B/C trio), or a
+            **dict** ``{seat: policy}`` for explicit per-seat control. ``None``
+            keeps the engine baseline (opponents play via ``Game.step``).
+            Network-policy observations are from that opponent's own perspective
+            (it always sees itself as relative player 0), so one policy plays any
+            seat.
         opponent_provider (callable | None): A zero-arg callable sampled at each
-            ``reset`` that returns an opponent policy (or ``None`` for baseline).
-            Used for self-play, where opponents are sampled from a snapshot pool
-            each episode. Takes precedence over ``opponent_policy``.
+            ``reset`` that returns an opponent spec (any form accepted by
+            ``opponent_policy``, or ``None`` for baseline). Used for self-play,
+            where opponents are sampled from a snapshot pool each episode. Takes
+            precedence over ``opponent_policy``.
     """
 
     metadata = {"render_modes": []}
@@ -198,7 +207,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         # opponent policy (synchronous), and is rebuilt each reset.
         self._opponent_policy_fixed = opponent_policy
         self._opponent_provider = opponent_provider
-        self._opponent_policy = None
+        self._opponent_policies = {}  # resolved per opponent seat, each episode
         self._deciders = {}
 
         # The 28 ownable tiles, fixed by board order, give every property a
@@ -257,12 +266,12 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._shutdown_worker()
         self._build_game()
 
-        # Pick this episode's opponent policy (a provider, if any, is sampled
-        # fresh each episode for self-play; otherwise the fixed policy).
-        if self._opponent_provider is not None:
-            self._opponent_policy = self._opponent_provider()
-        else:
-            self._opponent_policy = self._opponent_policy_fixed
+        # Pick this episode's opponent spec (a provider, if any, is sampled
+        # fresh each episode for self-play; otherwise the fixed policy) and
+        # resolve it to a per-opponent-seat policy map.
+        chosen = (self._opponent_provider() if self._opponent_provider is not None
+                  else self._opponent_policy_fixed)
+        self._opponent_policies = self._resolve_opponents(chosen)
         self._wire_deciders()
 
         controlled = self.game.players[self.seat]
@@ -324,21 +333,50 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._opponent_provider = None
 
     # -- Per-seat decision routing ------------------------------------------
+    def _resolve_opponents(self, chosen):
+        """Maps the sampled opponent spec to a ``{opponent_seat: policy}`` dict.
+
+        ``chosen`` may be:
+
+        * ``None`` -- engine baseline on every opponent seat (empty map);
+        * a single policy -- a plain ``(obs, mask) -> action`` callable or a
+          state-aware object (see :meth:`_policy_decide`) -- applied to *every*
+          opponent seat;
+        * a list/tuple -- a pool dealt round-robin across the opponent seats
+          (so ``[FP_A, FP_B, FP_C]`` fills the three non-agent seats regardless
+          of which seat the agent drew);
+        * a dict ``{absolute_seat: policy}`` -- explicit per-seat control; a seat
+          mapped to ``None`` (or omitted) keeps the baseline.
+
+        The agent's own seat is always skipped.
+        """
+        seats = [s for s in range(self.num_players) if s != self.seat]
+        if chosen is None:
+            return {}
+        if isinstance(chosen, dict):
+            return {s: chosen[s] for s in seats
+                    if chosen.get(s) is not None}
+        if isinstance(chosen, (list, tuple)):
+            return {s: chosen[k % len(chosen)] for k, s in enumerate(seats)
+                    if chosen[k % len(chosen)] is not None}
+        return {s: chosen for s in seats}
+
     def _wire_deciders(self):
         """Builds the seat -> decider map for the current episode.
 
         The agent seat is always routed to :meth:`_agent_decide` (which blocks
-        for an external action via the queue). When an opponent policy is set,
-        every other seat is routed to :meth:`_policy_decide` (synchronous, no
-        queue). Each routed seat also gets its ``decide_purchase`` hook wired so
-        nested purchase offers (e.g. from a Chance "Advance to" card) reach the
-        same decider. Seats with no decider keep the engine baseline.
+        for an external action via the queue). Each opponent seat that has a
+        resolved policy is routed to :meth:`_policy_decide` (synchronous, no
+        queue); a state-aware opponent is ``bind``-ed to the fresh game first.
+        Each routed seat also gets its ``decide_purchase`` / ``decide_bid`` hooks
+        wired so nested purchase / auction offers reach the same decider. Seats
+        with no policy keep the engine baseline.
         """
         self._deciders = {self.seat: self._agent_decide}
-        if self._opponent_policy is not None:
-            for s in range(self.num_players):
-                if s != self.seat:
-                    self._deciders[s] = self._make_policy_decider(s)
+        for s, policy in self._opponent_policies.items():
+            if hasattr(policy, "bind"):
+                policy.bind(self.game, self.ownable)
+            self._deciders[s] = self._make_policy_decider(s)
         for s, decide in self._deciders.items():
             self.game.players[s].decide_purchase = self._make_buy_hook(s, decide)
             self.game.players[s].decide_bid = self._make_bid_hook(s, decide)
@@ -573,14 +611,27 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         return action
 
     def _policy_decide(self, seat, phase, prop=None, amount=0):
-        """An opponent's decider: queries the opponent policy synchronously.
+        """An opponent's decider: queries that seat's policy synchronously.
 
-        Builds the mask and observation from ``seat``'s own perspective and
-        clamps an illegal/invalid policy action to a safe default.
+        Two kinds of policy are supported and dispatched by duck typing:
+
+        * a **state-aware** opponent (has ``.decide``) is handed the full
+          decision context ``decide(seat, phase, prop, amount, mask)`` -- used by
+          the hand-crafted baseline agents, which read live game state;
+        * a plain **network policy** ``(obs, mask) -> action`` is handed the
+          encoded observation from ``seat``'s perspective (self-play snapshots).
+
+        Either way an illegal/invalid action is clamped to a safe default.
         """
+        policy = self._opponent_policies[seat]
         mask = self.encoder._legal_mask(phase, prop, seat)
-        obs = self.encoder._encode_obs(seat, phase, prop)
-        action = int(self._opponent_policy(obs, mask.astype(bool)))
+        if hasattr(policy, "decide"):
+            action = int(policy.decide(seat, phase, prop, amount,
+                                       mask.astype(bool),
+                                       offer=self.encoder._cur_trade))
+        else:
+            obs = self.encoder._encode_obs(seat, phase, prop)
+            action = int(policy(obs, mask.astype(bool)))
         if not (0 <= action < NUM_ACTIONS and mask[action]):
             action = self._safe_default(phase)
         return action
@@ -618,15 +669,16 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             g.mortgage_property(self.ownable[action - A_MORTGAGE], player)
         elif A_UNMORTGAGE <= action < A_UNMORTGAGE + NUM_OWNABLE:
             g.unmortgage_property(self.ownable[action - A_UNMORTGAGE], player)
-        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
-            i = action - A_TRADE
+        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE * NUM_TRADE_TIERS:
+            i, tier = decode_trade_action(action)
             self.encoder._traded_this_manage.add(i)
-            self._attempt_trade(player, self.ownable[i])
+            self._attempt_trade(player, self.ownable[i], tier)
 
-    def _attempt_trade(self, initiator, target):
-        """Builds and offers a set-completing trade for ``target``.
+    def _attempt_trade(self, initiator, target, tier=1):
+        """Builds and offers a trade to acquire ``target`` at cash ``tier``.
 
-        The engine constructs the give-tile + balancing cash; the partner's
+        The engine constructs the give-tile + a balancing cash figure, scaled by
+        ``TRADE_CASH_TIERS[tier]`` (lowball / fair / generous). The partner's
         decider (agent via the queue, opponent policy synchronously, or a
         baseline via :meth:`_formula_trade_ok`) accepts or rejects. On acceptance
         the swap runs through :meth:`Game.execute_trade`.
@@ -639,7 +691,8 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         if give is None:
             return
         receive = [target]
-        cash = min(self.encoder._balancing_cash(initiator, partner, [give], receive),
+        balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
+        cash = min(int(round(balancing * TRADE_CASH_TIERS[tier])),
                    initiator.balance)
         if cash < 0:
             return

@@ -103,8 +103,10 @@ def play_one_game(env, policy, seed, max_turns):
     n = env.num_players
 
     # Route every seat through the policy (synchronous deciders), and wire the
-    # nested purchase / shortfall hooks the same way reset() would.
-    env._opponent_policy = policy
+    # nested purchase / shortfall hooks the same way reset() would. The env now
+    # keeps a per-seat opponent map (``_opponent_policies``) that
+    # ``_policy_decide`` reads; point every seat at this policy.
+    env._opponent_policies = {s: policy for s in range(n)}
     env._deciders = {s: env._make_policy_decider(s) for s in range(n)}
     for s, decide in env._deciders.items():
         g.players[s].decide_purchase = env._make_buy_hook(s, decide)

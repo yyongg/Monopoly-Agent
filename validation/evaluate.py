@@ -262,8 +262,9 @@ def main():
     parser.add_argument("--stochastic", action="store_true",
                         help="sample actions instead of taking the argmax")
     parser.add_argument("--opponent", default=None,
-                        help="path to a model that drives the opponent seats "
-                             "(default: engine baseline opponents)")
+                        help="opponent seats: a model path, the literal 'fp' "
+                             "for the hand-crafted FP-A/B/C trio, or omitted "
+                             "for the trivial engine baseline")
     parser.add_argument("--plot", nargs="?", const="auto", default=None,
                         help="render a dashboard PNG (optionally give a path; "
                              "default: runs/eval_<model>.png)")
@@ -274,7 +275,10 @@ def main():
     from sb3_contrib import MaskablePPO  # imported lazily; heavy dependency
 
     opponent_policy = None
-    if args.opponent is not None:
+    if args.opponent == "fp":
+        from training.baselines import make_baseline_trio
+        opponent_policy = make_baseline_trio()
+    elif args.opponent is not None:
         from training.selfplay import policy_from_model
         opponent_policy = policy_from_model(MaskablePPO.load(args.opponent))
 

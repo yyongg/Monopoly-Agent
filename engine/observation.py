@@ -27,7 +27,8 @@ from engine.constants import (
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, BID_FRACTIONS,
+    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, NUM_TRADE_TIERS, BID_FRACTIONS,
+    trade_action,
 )
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
@@ -294,16 +295,32 @@ class ObsEncoder:
             return False
         return all(t.owner is player for t in grp if t is not target)
 
+    def _denies_monopoly(self, initiator, partner, target):
+        """Whether acquiring ``target`` from ``partner`` would break up a set the
+        ``partner`` is cornering. True when ``target``'s whole group is split
+        between just ``initiator`` and ``partner`` and the partner holds at least
+        two of it -- a real grip -- so prying ``target`` loose blocks (or breaks)
+        the partner's monopoly. Serves the same monopoly-race motive as the
+        denial reward, but through trades rather than only bank/auction buys."""
+        grp = self._group_of.get(id(target))
+        if grp is None:
+            return False
+        partner_count = sum(1 for t in grp if t.owner is partner)
+        controlled = all(t.owner is partner or t.owner is initiator for t in grp)
+        return controlled and partner_count >= 2
+
     def _can_propose_trade(self, initiator, target):
-        """Whether ``initiator`` may propose a trade to acquire ``target``:
-        a set-completing acquisition from a solvent opponent, of a tradeable
-        tile, with something to hand over in return."""
+        """Whether ``initiator`` may propose a trade to acquire ``target`` from a
+        solvent opponent: a tradeable tile, with something to hand over, that
+        either **completes the initiator's own set** or **denies the partner** a
+        set they are cornering (see :meth:`_denies_monopoly`)."""
         owner = target.owner
         if owner is None or owner is initiator or owner.bankrupt:
             return False
         if not self.game.can_trade_property(target):
             return False
-        if not self._completes_monopoly_for(initiator, target):
+        if not (self._completes_monopoly_for(initiator, target)
+                or self._denies_monopoly(initiator, owner, target)):
             return False
         return self._choose_give_tile(initiator, owner, target) is not None
 
@@ -320,7 +337,8 @@ class ObsEncoder:
 
         tradeable = [p for p in initiator.properties
                      if g.can_trade_property(p)
-                     and self._group_of.get(id(p)) is not target_group]
+                     and self._group_of.get(id(p)) is not target_group
+                     and not self._completes_monopoly_for(partner, p)]
         if not tradeable:
             return None
         spares = [p for p in tradeable
@@ -436,14 +454,17 @@ class ObsEncoder:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
 
-        # Trade proposals target tiles owned by *other* players: offer A_TRADE+i
-        # for each opponent tile whose acquisition would complete a monopoly for
-        # this player (and hasn't already been tried this MANAGE phase).
+        # Trade proposals target tiles owned by *other* players. For each
+        # proposable opponent tile (not already tried this MANAGE phase), offer
+        # all NUM_TRADE_TIERS cash tiers so the agent picks how generous the
+        # offer is. A tile is tried at most once per phase (any tier), which
+        # keeps the manage loop from spinning on a repeatedly-declined target.
         if phase == PHASE_MANAGE:
             for i, p in enumerate(self.ownable):
                 if i not in self._traded_this_manage \
                         and self._can_propose_trade(player, p):
-                    mask[A_TRADE + i] = 1
+                    for tier in range(NUM_TRADE_TIERS):
+                        mask[trade_action(i, tier)] = 1
 
         mask[A_END_MANAGE] = 1  # always allowed to stop
         return mask

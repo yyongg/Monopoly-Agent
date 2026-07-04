@@ -61,7 +61,11 @@ def main():
     parser.add_argument("--pool-size", type=int, default=10,
                         help="max snapshots kept (newest win)")
     parser.add_argument("--baseline-prob", type=float, default=0.2,
-                        help="probability an episode uses baseline opponents")
+                        help="probability an episode uses the trivial engine "
+                             "baseline opponents")
+    parser.add_argument("--fp-prob", type=float, default=0.3,
+                        help="probability an episode uses the hand-crafted "
+                             "FP-A/B/C trio as opponents")
     parser.add_argument("--opp-deterministic", action="store_true",
                         help="sampled opponents act greedily")
     # I/O.
@@ -76,7 +80,7 @@ def main():
     venv = SubprocVecEnv([
         make_selfplay_env(i, args.seed, args.seat, args.reward_mode,
                           args.max_turns, args.pool_dir, args.baseline_prob,
-                          args.opp_deterministic)
+                          args.opp_deterministic, fp_prob=args.fp_prob)
         for i in range(args.n_envs)
     ])
     venv = VecMonitor(venv)
@@ -118,14 +122,18 @@ def main():
     print(f"Saved model to {args.save_path}.zip")
     venv.close()
 
-    # Final evaluation against the fixed baseline (a stationary yardstick).
+    # Final evaluation against the hand-crafted FP-A/B/C trio -- a strong,
+    # stationary yardstick (the trivial engine baseline is too weak to be
+    # informative).
     from validation.evaluate import run_evaluation
+    from training.baselines import make_baseline_trio
 
     eval_env = MonopolyEnv(seat=0, reward_mode=args.reward_mode,
-                           seed=args.seed + 10_000)
+                           seed=args.seed + 10_000,
+                           opponent_policy=make_baseline_trio())
     stats = run_evaluation(model, eval_env, episodes=args.eval_episodes)
     eval_env.close()
-    print(f"Final win rate vs baseline: {stats['win_rate'] * 100:.1f}% "
+    print(f"Final win rate vs FP trio: {stats['win_rate'] * 100:.1f}% "
           f"({stats['wins']}/{stats['episodes']}), "
           f"mean return {stats['mean_return']:+.2f}")
 

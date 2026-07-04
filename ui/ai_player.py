@@ -20,11 +20,12 @@ import numpy as np
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
-    NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, BID_FRACTIONS, BID_CEILING_MULT,
+    NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, NUM_TRADE_TIERS, TRADE_CASH_TIERS,
+    BID_FRACTIONS, BID_CEILING_MULT,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
-    A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
+    A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID, decode_trade_action,
 )
 from engine.observation import ObsEncoder
 
@@ -179,16 +180,18 @@ class GUIAIDecider:
             if g.unmortgage_property(prop, player):
                 self.log(f"{player.name} [AI] lifted the mortgage on "
                          f"{prop.name} for ${cost}.")
-        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE:
-            i = action - A_TRADE
+        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE * NUM_TRADE_TIERS:
+            i, tier = decode_trade_action(action)
             self.encoder._traded_this_manage.add(i)
-            self._attempt_trade(player, self.ownable[i])
+            self._attempt_trade(player, self.ownable[i], tier)
 
-    # --- Trade initiation (proposing a set-completing trade) ---------------
+    # --- Trade initiation (proposing a trade) ------------------------------
 
-    def _attempt_trade(self, initiator, target):
-        """Builds a set-completing offer and asks the partner (via the app's
-        arbiter, or the valuation formula when none is set)."""
+    def _attempt_trade(self, initiator, target, tier=1):
+        """Builds an offer to acquire ``target`` at cash ``tier`` and asks the
+        partner (via the app's arbiter, or the valuation formula when none is
+        set). The tier scales the engine's balancing cash, but is still capped at
+        our own break-even so we never propose a trade we would reject."""
         partner = target.owner
         if not self.encoder._can_propose_trade(initiator, target):
             return
@@ -210,7 +213,8 @@ class GUIAIDecider:
         if self_value <= 0:
             return
         break_even = int(np.ceil(self_value)) - 1  # max cash keeping value > 0
-        cash = min(self.encoder._balancing_cash(initiator, partner, [give], receive),
+        balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
+        cash = min(int(round(balancing * TRADE_CASH_TIERS[tier])),
                    break_even, initiator.balance)
         if cash < 0:
             return

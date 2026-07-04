@@ -2,14 +2,16 @@
 
 Chains the three stages that are normally run by hand:
 
-    PYTHONPATH=. python training/train_selfplay.py --timesteps ... --n-envs ...
-    PYTHONPATH=. python -m validation.evaluate  <model> --episodes ... --plot
+    PYTHONPATH=. python training/train_selfplay.py --timesteps ... --n-envs ... --fp-prob ...
+    PYTHONPATH=. python -m validation.evaluate  <model> --episodes ... --opponent fp --plot
     PYTHONPATH=. python -m validation.simulate  <model> --games    ... --plot
 
 The knobs that change between runs are exposed as flags -- ``--n-envs`` (train),
-``--episodes`` (evaluate) and ``--games`` (simulate) -- while ``--timesteps`` and
-the shared model path round out the common case. Any stage can be skipped so you
-can, e.g., re-run just evaluation against an already-trained model.
+``--episodes`` (evaluate) and ``--games`` (simulate) -- while ``--timesteps``,
+``--fp-prob`` and the shared model path round out the common case. Evaluation runs
+against the hand-crafted FP-A/B/C trio (a meaningful yardstick; the trivial engine
+baseline is too weak to be informative). Any stage can be skipped so you can, e.g.,
+re-run just evaluation against an already-trained model.
 
 Usage:
     python training_pipeline.py --n-envs 64 --episodes 200 --games 100
@@ -56,6 +58,9 @@ def main():
     # Rounding out the common case.
     parser.add_argument("--timesteps", type=int, default=2_000_000,
                         help="training timesteps")
+    parser.add_argument("--fp-prob", type=float, default=0.3,
+                        help="probability an episode trains against the FP-A/B/C "
+                             "trio (passed through to train_selfplay.py)")
     parser.add_argument("--model", default="runs/monopoly_ppo",
                         help="model path: train writes here, eval/sim read it")
     # Let any stage be skipped so stages can be re-run independently.
@@ -71,13 +76,17 @@ def main():
             py, "training/train_selfplay.py",
             "--timesteps", str(args.timesteps),
             "--n-envs", str(args.n_envs),
+            "--fp-prob", str(args.fp_prob),
             "--save-path", args.model,
         ])
 
     if not args.skip_evaluate:
+        # Evaluate against the hand-crafted FP-A/B/C trio -- a meaningful
+        # stationary yardstick (the trivial engine baseline is too weak).
         run_stage("evaluate", [
             py, "-m", "validation.evaluate", args.model,
             "--episodes", str(args.episodes),
+            "--opponent", "fp",
             "--plot",
         ])
 
