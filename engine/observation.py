@@ -277,8 +277,15 @@ class ObsEncoder:
         grp = self._group_of.get(id(prop))
         if grp is None:
             return value
+        # A monopoly earns many times its sticker price over a game, so trade
+        # valuations prize completing/denying a set at ``trade_monopoly_mult`` x
+        # the sticker premium (auction bidding keeps the plain premium so its
+        # economics stay near retail). The game's *first* monopoly is a decisive
+        # tempo edge, so it is worth even more to secure -- or refuse to sell.
         set_value = (self.cfg.monopoly_bonus * self._group_price(grp)
-                     * self._set_quality(grp))
+                     * self._set_quality(grp) * self.cfg.trade_monopoly_mult)
+        if not self._any_monopoly_exists(exclude=grp):
+            set_value *= (1.0 + self.cfg.trade_first_monopoly_weight)
         if self._completes_monopoly_for(owner, prop):
             value += set_value
         elif any(o is not owner and not o.bankrupt
@@ -294,6 +301,20 @@ class ObsEncoder:
         if grp is None:
             return False
         return all(t.owner is player for t in grp if t is not target)
+
+    def _any_monopoly_exists(self, exclude=None):
+        """Whether any solvent player already owns a complete colour group
+        (optionally ignoring ``exclude``). Used to price the *first*-monopoly
+        tempo premium into trade valuations, mirroring the first-monopolist
+        reward in :mod:`engine.rewards`."""
+        for grp in self._groups:
+            if grp is exclude:
+                continue
+            owner = grp[0].owner
+            if (owner is not None and not owner.bankrupt
+                    and all(t.owner is owner for t in grp)):
+                return True
+        return False
 
     def _denies_monopoly(self, initiator, partner, target):
         """Whether acquiring ``target`` from ``partner`` would break up a set the
@@ -326,36 +347,65 @@ class ObsEncoder:
 
     def _choose_give_tile(self, initiator, partner, target):
         """Picks the tile ``initiator`` offers ``partner`` for ``target`` (or
-        ``None``). Prefers a *spare* (its group's lone tile, so the trade breaks
-        no progress) and, among the pool, the tile of least :meth:`_trade_value`
-        to the initiator."""
+        ``None``).
+
+        Prefers a *spare* (its group's lone tile, so the trade breaks no
+        progress) of least :meth:`_trade_value` to the initiator. But when
+        acquiring ``target`` completes the initiator's own set and it holds a
+        spare that would complete the *partner*'s set, it offers that instead --
+        a fair, accept-worthy set-for-set swap -- provided the set it gains is
+        worth at least the set it hands over (net-positive by its own valuation;
+        cash then settles the fairness gap, see :meth:`_balancing_cash`).
+        Otherwise it never hands the partner a monopoly."""
         g = self.game
         target_group = self._group_of.get(id(target))
 
         def count(owner, group):
             return sum(1 for t in group if t.owner is owner)
 
-        tradeable = [p for p in initiator.properties
-                     if g.can_trade_property(p)
-                     and self._group_of.get(id(p)) is not target_group
-                     and not self._completes_monopoly_for(partner, p)]
-        if not tradeable:
+        candidates = [p for p in initiator.properties
+                      if g.can_trade_property(p)
+                      and self._group_of.get(id(p)) is not target_group]
+        if not candidates:
             return None
-        spares = [p for p in tradeable
+        spares = [p for p in candidates
                   if count(initiator, self._group_of[id(p)]) == 1]
-        pool = spares or tradeable
-        return min(pool, key=lambda p: self._trade_value(p, initiator))
+
+        # Mutual set-for-set: a spare that completes the partner's set, offered
+        # only when the set we gain is worth at least the one we give up. Among
+        # such tiles, hand over the one cheapest to us.
+        if self._completes_monopoly_for(initiator, target):
+            mutual = [p for p in spares
+                      if self._completes_monopoly_for(partner, p)]
+            if mutual:
+                best = min(mutual, key=lambda p: self._trade_value(p, initiator))
+                if (self._trade_value(target, initiator)
+                        >= self._trade_value(best, initiator)):
+                    return best
+
+        # Otherwise never gift the partner a monopoly.
+        non_gift = [p for p in (spares or candidates)
+                    if not self._completes_monopoly_for(partner, p)]
+        if not non_gift:
+            return None
+        return min(non_gift, key=lambda p: self._trade_value(p, initiator))
 
     def _balancing_cash(self, initiator, partner, give, receive):
-        """Cash the initiator pays the partner to balance a trade, valued from
-        the *partner*'s side with :meth:`_trade_value`, plus a premium for prying
-        loose a set-completing tile. Never negative (only the initiator pays)."""
+        """Net cash the initiator offers to balance a trade, valued from the
+        *partner*'s side with :meth:`_trade_value`, plus a premium for prying
+        loose a set-completing tile.
+
+        Signed: positive means the initiator pays the partner (the usual case --
+        buying a wanted tile); negative means the initiator *requests* cash,
+        which arises in a mutual set-for-set where the tile it gives completes
+        the partner's set (worth more to the partner than the target given up).
+        ``execute_trade`` handles either direction."""
         recv_val = sum(self._trade_value(t, partner) for t in receive)
         give_val = sum(self._trade_value(t, partner) for t in give)
         grp = self._group_of.get(id(receive[0])) if receive else None
         set_price = sum(t.price for t in grp) if grp else 0
         premium = int(round(0.25 * set_price))
-        return max(0, int(round(recv_val - give_val)) + premium)
+        return int(round(recv_val - give_val)) + premium
 
     def _formula_trade_ok(self, partner, gain, lose, cash):
         """Baseline partner's accept rule: take the deal when it is non-negative

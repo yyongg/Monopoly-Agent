@@ -37,6 +37,19 @@ class RewardConfig:
     # Turns of expected rent folded into a tile's trade value (list price +
     # trade_income_weight * landing-traffic * nominal rent).
     trade_income_weight: float = 3.0
+    # A completed monopoly earns *far* more over a game than its group sticker
+    # price, so in *trade* valuations (only -- auction bidding via _bid_value is
+    # deliberately left at the sticker premium to keep auction economics near
+    # retail) we prize completing/denying a set at this multiple of its base
+    # ``monopoly_bonus * group_price`` value. Stops opponents cheaply buying a
+    # set-completer out of the agent for a small cash premium.
+    trade_monopoly_mult: float = 3.0
+    # Extra weight, in trade valuations, on completing/denying a set that would
+    # be the *game's first* monopoly (none owned by anyone yet): the set value is
+    # scaled by ``1 + trade_first_monopoly_weight``. Being first to a set (or
+    # denying the opponent that) is a decisive tempo edge, so the agent should
+    # both refuse to sell into it and pay up to secure it.
+    trade_first_monopoly_weight: float = 1.0
 
     # -- One-time shaped bonuses -------------------------------------------
     denial_bonus_coef: float = 0.5     # reward for taking an opponent's last tile,

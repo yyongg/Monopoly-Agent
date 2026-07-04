@@ -692,10 +692,14 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             return
         receive = [target]
         balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
-        cash = min(int(round(balancing * TRADE_CASH_TIERS[tier])),
-                   initiator.balance)
-        if cash < 0:
-            return
+        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
+        # Positive: we pay the partner (clamp to our balance). Negative: we
+        # request cash in a mutual set-for-set, so the partner pays -- clamp the
+        # request to *their* balance so the swap can actually settle.
+        if raw >= 0:
+            cash = min(raw, initiator.balance)
+        else:
+            cash = -min(-raw, partner.balance)
 
         partner_seat = g.players.index(partner)
         decide = self._deciders.get(partner_seat)

@@ -214,10 +214,15 @@ class GUIAIDecider:
             return
         break_even = int(np.ceil(self_value)) - 1  # max cash keeping value > 0
         balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
-        cash = min(int(round(balancing * TRADE_CASH_TIERS[tier])),
-                   break_even, initiator.balance)
-        if cash < 0:
-            return
+        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
+        # Positive: we pay the partner, capped at our break-even (never propose a
+        # deal we'd reject) and our balance. Negative: a mutual set-for-set where
+        # we request cash -- the partner pays, clamped to their balance; this
+        # only improves the deal for us, so break-even never binds.
+        if raw >= 0:
+            cash = min(raw, break_even, initiator.balance)
+        else:
+            cash = -min(-raw, partner.balance)
         if self.trade_arbiter is not None:
             accepted = self.trade_arbiter(
                 initiator, partner, [give], receive, cash)
@@ -292,14 +297,22 @@ class GUIAIDecider:
                 return False
             return tile.owner is player
 
+        enc = self.encoder
         swing = 0.0
-        for tiles in self.encoder._groups:
+        for tiles in enc._groups:
             before = all(t.owner is player for t in tiles)
             after = all(owns_after(t) for t in tiles)
             # Weight a completed/broken set by its development ROI, so gaining an
             # efficient money group (orange/light-blue) counts for more than a
-            # sticker-equal but sluggish one -- consistent with _trade_value.
-            set_price = sum(t.price for t in tiles) * self.encoder._set_quality(tiles)
+            # sticker-equal but sluggish one. Scaled by ``trade_monopoly_mult``
+            # (a monopoly is worth far more than its sticker price) and, when no
+            # monopoly exists yet, the first-monopoly tempo premium -- kept in
+            # step with :meth:`ObsEncoder._trade_value` so the AI won't sell a
+            # (first) set-completer for a small cash premium.
+            set_price = (sum(t.price for t in tiles) * enc._set_quality(tiles)
+                         * enc.cfg.trade_monopoly_mult)
+            if not enc._any_monopoly_exists(exclude=tiles):
+                set_price *= (1.0 + enc.cfg.trade_first_monopoly_weight)
             if after and not before:
                 swing += set_price   # completed a monopoly
             elif before and not after:
