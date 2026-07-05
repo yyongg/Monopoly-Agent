@@ -78,6 +78,20 @@ class RewardConfig:
     # jump * landing traffic), tilted toward cheap-to-develop groups.
     build_bonus_coef: float = 0.5
 
+    # -- Solvency / liquidity ----------------------------------------------
+    # Net worth prices a dollar of cash exactly like a dollar of property, and
+    # acquisition_premium makes converting cash into assets a net gain -- so
+    # nothing counters the agent spending itself broke. These two knobs add a
+    # per-step penalty for letting cash fall below a cushion sized to the
+    # board's live rent threat (expected rent outflow per board round, from
+    # opponent-owned developed tiles). The penalty is 0 above the cushion and
+    # rises linearly to solvency_penalty_coef at zero cash, making liquidity
+    # itself valuable and directly countering the self-bankruptcy failure mode.
+    # solvency_penalty_coef is the primary tuning knob: too small and the agent
+    # still plays broke; too large and it hoards cash instead of developing.
+    solvency_cushion_turns: float = 3.0
+    solvency_penalty_coef: float = 0.02
+
     # -- Cost-normalised strategy signals ----------------------------------
     # House cost at which the build tilt (ref / house_cost) is 1.0 -- the groups'
     # harmonic-mean house cost, so the *average* build bonus is unchanged and

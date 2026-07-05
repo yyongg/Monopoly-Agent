@@ -157,6 +157,37 @@ class RewardMixin:
         lost = sum(self._net_worth(p) > my_nw for p in others)
         return (beat - lost) / (len(survivors) - 1)
 
+    def _rent_exposure(self, player):
+        """Expected rent ``player`` pays per board round: for each tile owned by
+        a live opponent, landing traffic times the rent it collects *as
+        developed now*. A proxy for how hard the board can hit the agent's cash
+        -- the size its liquid cushion should cover so a bad landing does not
+        bankrupt it."""
+        enc = self.encoder
+        total = 0.0
+        for prop in enc.ownable:
+            owner = prop.owner
+            if owner is None or owner is player or owner.bankrupt:
+                continue
+            total += enc._traffic(prop) * enc._developed_rent(prop)
+        return total
+
+    def _solvency_penalty(self, player):
+        """Per-step drag for holding less liquid cash than the board's rent
+        threat warrants. Zero once cash covers ``solvency_cushion_turns`` rounds
+        of expected rent outflow; rises linearly to ``solvency_penalty_coef`` as
+        cash falls to zero. Net worth alone prices cash and property alike, so
+        without this the agent spends itself broke to bank shaped acquisition
+        reward and only survives against opponents too weak to punish it."""
+        coef = self.cfg.solvency_penalty_coef
+        if coef <= 0.0:
+            return 0.0
+        cushion = self.cfg.solvency_cushion_turns * self._rent_exposure(player)
+        if cushion <= 0.0:
+            return 0.0
+        deficit = max(0.0, cushion - player.balance) / cushion  # 0 .. 1
+        return coef * deficit
+
     def _reward(self, terminal):
         controlled = self.game.players[self.seat]
         reward = 0.0
@@ -170,6 +201,10 @@ class RewardMixin:
             self._prev_advantage = adv
             reward += self._pending_bonus
             self._pending_bonus = 0.0
+            # Solvency: make liquidity itself valuable so converting cash into
+            # assets is not "free" when it leaves the agent unable to absorb a
+            # bad landing (the direct counter to self-bankruptcy vs the FP bots).
+            reward -= self._solvency_penalty(controlled)
         if terminal:
             reward += self._terminal_reward()
         return reward
