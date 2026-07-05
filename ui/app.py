@@ -217,8 +217,9 @@ class QuitGame(Exception):
 def _run_setup(screen, clock, model_available):
     """Shows the player-setup dialog before the game starts.
 
-    Returns ``{"types": {name: "human"|"ai"}, "randomize": bool}`` or ``None``
-    if the user closed the window.
+    Returns ``{"types": {name: "human"|"ai"|"fp"}, "randomize": bool}`` or
+    ``None`` if the user closed the window. ``"ai"`` is the trained model (gated
+    on ``model_available``); ``"fp"`` is an FP heuristic bot (always available).
     """
     font_title = pygame.font.SysFont("dejavusans,arial,helvetica", 44, bold=True)
     font_head  = pygame.font.SysFont("dejavusans,arial,helvetica", 28, bold=True)
@@ -269,10 +270,12 @@ def _run_setup(screen, clock, model_available):
             surf = font_body.render(name, True, INK)
             screen.blit(surf, surf.get_rect(midleft=(px + 58, ry + row_h // 2)))
 
-            # Human / AI toggle buttons (right side of row).
-            for j, (label, ptype) in enumerate([("Human", "human"), ("AI", "ai")]):
-                bw, bh = 86, 34
-                bx = px + pw - 24 - (2 - j) * (bw + 8)
+            # Human / AI / FP toggle buttons (right side of row). "AI" is the
+            # trained model (disabled without one); "FP" is an FP heuristic bot.
+            opts = [("Human", "human"), ("AI", "ai"), ("FP", "fp")]
+            for j, (label, ptype) in enumerate(opts):
+                bw, bh = 78, 34
+                bx = px + pw - 24 - (len(opts) - 1 - j) * (bw + 8)
                 by = ry + (row_h - bh) // 2
                 btn = pygame.Rect(bx, by, bw, bh)
                 is_selected = types[name] == ptype
@@ -2766,9 +2769,13 @@ class MonopolyApp:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _new_match(config, model, ai_names, deterministic, seed):
-    """Seeds every RNG for one match and builds a fresh ``Game`` plus a
-    ``GUIAIDecider`` for each AI seat (all sharing ``model``).
+def _new_match(config, model, ai_names, fp_names, deterministic, seed):
+    """Seeds every RNG for one match and builds a fresh ``Game`` plus a decider
+    for each AI seat: a ``GUIAIDecider`` (trained model) for ``ai_names`` and an
+    ``FPBaselineDecider`` (FP heuristic bot) for ``fp_names``.
+
+    FP seats are dealt the FP-A/B/C priority profiles round-robin (so three FP
+    seats become exactly the trio, matching the training/eval opponent set).
 
     Seeds dice and card shuffles (stdlib ``random``), the turn-order shuffle,
     and the AI's policy sampling (torch), then prints the seed so the game can
@@ -2800,6 +2807,18 @@ def _new_match(config, model, ai_names, deterministic, seed):
         for name in ai_names:
             ai_deciders[name] = GUIAIDecider(
                 num_players=4, model=model, deterministic=deterministic)
+
+    if fp_names:
+        from ui.ai_player import FPBaselineDecider
+        from training.baselines import (
+            FP_A_PRIORITIES, FP_B_PRIORITIES, FP_C_PRIORITIES)
+        fp_profiles = [("FP-A", FP_A_PRIORITIES), ("FP-B", FP_B_PRIORITIES),
+                       ("FP-C", FP_C_PRIORITIES)]
+        for k, name in enumerate(sorted(fp_names)):
+            label, priorities = fp_profiles[k % len(fp_profiles)]
+            ai_deciders[name] = FPBaselineDecider(
+                num_players=4, priorities=priorities, name=label)
+
     return game, ai_deciders
 
 
@@ -2843,10 +2862,12 @@ def main():
         pygame.quit()
         return
 
-    # Determine which players are AI.
+    # Determine which players are trained-model AI vs FP heuristic bots.
     ai_names = {name for name, t in config["types"].items() if t == "ai"}
+    fp_names = {name for name, t in config["types"].items() if t == "fp"}
 
-    # Load the model once if any AI player was chosen.
+    # Load the model once if any trained-AI player was chosen (FP bots need no
+    # model, so an all-FP or human+FP game loads nothing).
     model = None
     if ai_names and model_path:
         try:
@@ -2881,7 +2902,7 @@ def main():
                 else random.SystemRandom().randrange(2 ** 31))
         next_seed = None  # any restart is a fresh, differently-seeded game
         game, ai_deciders = _new_match(
-            config, model, ai_names, args.deterministic, seed)
+            config, model, ai_names, fp_names, args.deterministic, seed)
         result = MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
         if result != "restart":
             break

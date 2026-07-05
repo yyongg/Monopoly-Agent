@@ -28,6 +28,7 @@ from engine.constants import (
     A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID, decode_trade_action,
 )
 from engine.observation import ObsEncoder
+from training.baselines import HeuristicAgent
 
 
 class GUIAIDecider:
@@ -329,3 +330,61 @@ def _safe_default(phase):
     if phase == PHASE_TRADE_RESPOND:
         return A_TRADE_REJECT
     return A_END_MANAGE
+
+
+class FPBaselineDecider(GUIAIDecider):
+    """A GUI AI seat driven by an FP heuristic bot instead of the trained model.
+
+    Lets the user watch the trained agent play against the FP-A/B/C trio: seat
+    the agent in one chair and ``FPBaselineDecider`` bots in the others. It
+    subclasses :class:`GUIAIDecider` so it reuses every decision method
+    (``jail_choice`` / ``purchase_decision`` / ``bid_choice`` / ``manage_loop`` /
+    ``liquidate_loop``) and the app wiring unchanged; only the per-decision
+    *source* is swapped from ``model.predict`` to a
+    :class:`~training.baselines.HeuristicAgent`, which already emits action ids
+    in the same flat scheme and shares the :class:`ObsEncoder` valuations.
+    """
+
+    def __init__(self, num_players, priorities=None, name="FP", log=None):
+        # No model: _decide is overridden below to consult the FP bot, and
+        # _attempt_trade uses evaluate_trade (not the model), so model=None is
+        # safe. deterministic is irrelevant (the bot is a fixed policy).
+        super().__init__(num_players, model=None, deterministic=True, log=log)
+        self._bot = HeuristicAgent(priorities=priorities, name=name)
+
+    def bind(self, game, ownable):
+        super().bind(game, ownable)  # binds self.encoder
+        # Share the SAME encoder as GUIAIDecider so per-manage state
+        # (``_traded_this_manage``) and the offer being judged (``_cur_trade``)
+        # stay consistent between manage_loop and the FP bot's decisions.
+        self._bot.game = game
+        self._bot.ownable = ownable
+        self._bot.encoder = self.encoder
+
+    def _decide(self, seat, phase, prop=None):
+        # Source the action from the FP bot instead of the model. amount is 0:
+        # HeuristicAgent._decide_liquidate ignores it. offer feeds trade-respond,
+        # which the GUI routes through evaluate_trade instead, so it's moot here.
+        mask = self.encoder._legal_mask(phase, prop, seat)
+        action = int(self._bot.decide(seat, phase, prop, 0,
+                                      mask.astype(bool),
+                                      offer=self.encoder._cur_trade))
+        if not (0 <= action < NUM_ACTIONS and mask[action]):
+            action = _safe_default(phase)
+        return action
+
+    def evaluate_trade(self, me, other, gain, lose, cash_delta):
+        """Faithful FP trade response: accept iff the swap is non-negative by
+        ``ObsEncoder._trade_value`` from ``me``'s side -- exactly
+        :meth:`HeuristicAgent._decide_trade_respond` /
+        :meth:`ObsEncoder._formula_trade_ok`, so the GUI FP bot judges offers
+        identically to the training/eval FP bot. Returns ``(accepted, value)``
+        (the numeric value keeps the inherited ``_attempt_trade`` break-even
+        capping working when this bot *proposes* a trade)."""
+        if cash_delta < 0 and me.balance < -cash_delta:
+            return False, float("-inf")
+        enc = self.encoder
+        value = float(cash_delta)
+        value += sum(enc._trade_value(p, me) for p in gain)
+        value -= sum(enc._trade_value(p, me) for p in lose)
+        return value >= 0, value
