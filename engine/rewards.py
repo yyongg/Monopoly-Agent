@@ -158,19 +158,11 @@ class RewardMixin:
         return (beat - lost) / (len(survivors) - 1)
 
     def _rent_exposure(self, player):
-        """Expected rent ``player`` pays per board round: for each tile owned by
-        a live opponent, landing traffic times the rent it collects *as
-        developed now*. A proxy for how hard the board can hit the agent's cash
-        -- the size its liquid cushion should cover so a bad landing does not
-        bankrupt it."""
-        enc = self.encoder
-        total = 0.0
-        for prop in enc.ownable:
-            owner = prop.owner
-            if owner is None or owner is player or owner.bankrupt:
-                continue
-            total += enc._traffic(prop) * enc._developed_rent(prop)
-        return total
+        """Expected rent ``player`` pays per board round -- the board's rent
+        threat that sizes the liquid cushion. Defined once on the shared
+        :class:`~engine.observation.ObsEncoder` (also used by the trade surplus
+        cap), so reward and trade valuations agree on the cushion."""
+        return self.encoder._rent_exposure(player)
 
     def _solvency_penalty(self, player):
         """Per-step drag for holding less liquid cash than the board's rent

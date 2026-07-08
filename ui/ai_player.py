@@ -55,6 +55,11 @@ class GUIAIDecider:
         # proposes to other players.
         self.encoder = ObsEncoder()
         self.trade_arbiter = None
+        # Learned policy: when completing its own monopoly it spends *surplus*
+        # cash (above the rent-sized reserve) to secure the contested tile,
+        # overriding the conservative break-even cap. FP bots set this False to
+        # stay the fixed benchmark (see FPBaselineDecider).
+        self._overpay_sets = True
 
     def bind(self, game, ownable):
         """Attach to a live game instance. Must be called before any decisions."""
@@ -216,12 +221,21 @@ class GUIAIDecider:
         break_even = int(np.ceil(self_value)) - 1  # max cash keeping value > 0
         balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
         raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
-        # Positive: we pay the partner, capped at our break-even (never propose a
-        # deal we'd reject) and our balance. Negative: a mutual set-for-set where
-        # we request cash -- the partner pays, clamped to their balance; this
-        # only improves the deal for us, so break-even never binds.
+        # Positive: we pay the partner. Normally capped at our break-even (never
+        # propose a deal we'd reject) and our balance. But when this completes our
+        # own monopoly and we're a learned policy, we instead spend *surplus* cash
+        # (balance above the rent-sized reserve) even past break-even -- idle cash
+        # is worth little, a set is worth much -- so a rich agent actually pays the
+        # contested ask. Kept byte-identical to the env path (rl_env._attempt_trade).
+        # Negative: a mutual set-for-set where we request cash -- the partner pays,
+        # clamped to their balance; this only improves the deal for us.
         if raw >= 0:
-            cash = min(raw, break_even, initiator.balance)
+            if self._overpay_sets and self.encoder._completes_monopoly_for(
+                    initiator, target):
+                cash = min(raw, max(0, int(initiator.balance
+                                           - self.encoder._cash_reserve(initiator))))
+            else:
+                cash = min(raw, break_even, initiator.balance)
         else:
             cash = -min(-raw, partner.balance)
         if self.trade_arbiter is not None:
@@ -350,6 +364,9 @@ class FPBaselineDecider(GUIAIDecider):
         # _attempt_trade uses evaluate_trade (not the model), so model=None is
         # safe. deterministic is irrelevant (the bot is a fixed policy).
         super().__init__(num_players, model=None, deterministic=True, log=log)
+        # Keep FP the fixed benchmark: no surplus-overpay, so its trade offers
+        # stay at the conservative break-even/fair cap (matches training).
+        self._overpay_sets = False
         self._bot = HeuristicAgent(priorities=priorities, name=name)
 
     def bind(self, game, ownable):

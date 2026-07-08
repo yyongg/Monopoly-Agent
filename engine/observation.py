@@ -390,6 +390,27 @@ class ObsEncoder:
             return None
         return min(non_gift, key=lambda p: self._trade_value(p, initiator))
 
+    def _rent_exposure(self, player):
+        """Expected rent ``player`` pays per board round: for each tile owned by
+        a live opponent, landing traffic times the rent it collects *as developed
+        now*. A proxy for how hard the board can hit ``player``'s cash -- the size
+        its liquid cushion should cover so a bad landing does not bankrupt it.
+        Shared by the solvency reward (:mod:`engine.rewards`) and the trade
+        surplus cap below, so both size the cushion identically."""
+        total = 0.0
+        for prop in self.ownable:
+            owner = prop.owner
+            if owner is None or owner is player or owner.bankrupt:
+                continue
+            total += self._traffic(prop) * self._developed_rent(prop)
+        return total
+
+    def _cash_reserve(self, player):
+        """Liquid cash ``player`` should keep against the board's rent threat:
+        ``solvency_cushion_turns`` rounds of expected rent outflow. Cash *above*
+        this reserve is surplus the agent can pour into completing a monopoly."""
+        return self.cfg.solvency_cushion_turns * self._rent_exposure(player)
+
     def _balancing_cash(self, initiator, partner, give, receive):
         """Net cash the initiator offers to balance a trade, valued from the
         *partner*'s side with :meth:`_trade_value`, plus a premium for prying

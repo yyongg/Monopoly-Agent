@@ -674,6 +674,21 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             self.encoder._traded_this_manage.add(i)
             self._attempt_trade(player, self.ownable[i], tier)
 
+    def _overpay_for_set(self, initiator, target):
+        """Whether ``initiator`` may spend surplus cash (above its reserve) to
+        complete its own monopoly by acquiring ``target``.
+
+        Gated to *learned* policies only -- the agent seat and self-play
+        snapshots -- so the hand-crafted FP baselines stay the fixed benchmark:
+        a seat driven by a ``HeuristicAgent`` (has ``.decide``) keeps its
+        conservative ``min(raw, balance)`` cap. An opponent seat with no policy
+        (trivial baseline) never proposes trades, so it never reaches here."""
+        seat = self.game.players.index(initiator)
+        pol = self._opponent_policies.get(seat)
+        if hasattr(pol, "decide"):          # FP heuristic opponent: unchanged
+            return False
+        return self.encoder._completes_monopoly_for(initiator, target)
+
     def _attempt_trade(self, initiator, target, tier=1):
         """Builds and offers a trade to acquire ``target`` at cash ``tier``.
 
@@ -697,7 +712,16 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         # request cash in a mutual set-for-set, so the partner pays -- clamp the
         # request to *their* balance so the swap can actually settle.
         if raw >= 0:
-            cash = min(raw, initiator.balance)
+            if self._overpay_for_set(initiator, target):
+                # Rich agent completing its own monopoly: spend *surplus* cash
+                # (balance above the rent-sized reserve) to secure the contested
+                # set-completer, keeping the cushion so it stays solvent. A
+                # cash-tight agent (surplus < ask) offers less and is refused,
+                # rather than bankrupting itself buying a set before rent hits.
+                cash = min(raw, max(0, int(initiator.balance
+                                           - self.encoder._cash_reserve(initiator))))
+            else:
+                cash = min(raw, initiator.balance)
         else:
             cash = -min(-raw, partner.balance)
 

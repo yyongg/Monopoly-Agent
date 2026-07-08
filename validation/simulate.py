@@ -158,6 +158,33 @@ def play_one_game(env, policy, seed, max_turns):
     # inherited flag; bankruptcy inheritance doesn't fire this hook.
     g.on_acquire = lambda player, prop, source="trade": inherited_ids.discard(id(prop))
 
+    # Trade analytics: count every proposal actually *offered* to a partner and
+    # whether it was accepted (the swap executed, so the target changed hands) or
+    # rejected. Wrap the env's trade builder; ``_attempt_trade`` returns early
+    # without offering anything when it can't propose or has no tile to give, so
+    # those non-offers are not counted.
+    trades = {"accepted": 0, "rejected": 0, "accepted_set_completing": 0}
+    class_attempt = type(env)._attempt_trade
+
+    def counting_attempt(initiator, target, tier=1):
+        enc = env.encoder
+        offered = (enc._can_propose_trade(initiator, target)
+                   and enc._choose_give_tile(initiator, target.owner, target) is not None)
+        # Whether acquiring ``target`` would finish a monopoly for the initiator
+        # (checked *before* the swap, while it still lacks the tile).
+        completes = offered and enc._completes_monopoly_for(initiator, target)
+        before = target.owner
+        class_attempt(env, initiator, target, tier)
+        if offered:
+            if target.owner is not before:
+                trades["accepted"] += 1
+                if completes:
+                    trades["accepted_set_completing"] += 1
+            else:
+                trades["rejected"] += 1
+
+    env._attempt_trade = counting_attempt
+
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n
     first_monopoly_set = [None] * n
@@ -216,6 +243,7 @@ def play_one_game(env, policy, seed, max_turns):
         "timeout": winner_seat is None,
         "players": players,
         "auction": auction,
+        "trades": trades,
     }
 
 
@@ -255,7 +283,8 @@ def aggregate(records, num_players):
     winner_monopoly_freq = Counter()   # sets held by the winner at game end
     winner_property_freq = Counter()   # tiles held by the winner at game end
     winner_net_worths = []
-    winner_num_monopolies = []
+    winner_num_monopolies = []        # distinct sets the winner *ever* completed
+    winner_final_num_monopolies = []  # sets the winner still holds at game end
     winner_first_monopoly_turns = []
     loser_num_monopolies = []
     loser_peak_net_worths = []
@@ -302,6 +331,7 @@ def aggregate(records, num_players):
             winner_property_freq[name] += 1
         winner_net_worths.append(w["final_net_worth"])
         winner_num_monopolies.append(w["num_ever_monopolies"])
+        winner_final_num_monopolies.append(len(w["final_monopolies"]))
         if w["first_monopoly_turn"] is not None:
             winner_first_monopoly_turns.append(w["first_monopoly_turn"])
 
@@ -331,6 +361,13 @@ def aggregate(records, num_players):
     all_ratios = [x for r in records for x in r["auction"]["all_ratios"]]
     self_ratios = [x for r in records for x in r["auction"]["self_ratios"]]
 
+    # Trade analytics (across all games): how many proposals were offered and how
+    # many the partner accepted vs rejected.
+    trades_accepted = sum(r["trades"]["accepted"] for r in records)
+    trades_rejected = sum(r["trades"]["rejected"] for r in records)
+    trades_setcomplete = sum(r["trades"]["accepted_set_completing"] for r in records)
+    trades_offered = trades_accepted + trades_rejected
+
     return {
         "games": games,
         "decisive": len(decisive),
@@ -338,6 +375,8 @@ def aggregate(records, num_players):
         "num_players": num_players,
         "mean_length": float(np.mean([r["length"] for r in records])) if records else 0.0,
         "median_length": float(np.median([r["length"] for r in records])) if records else 0.0,
+        "min_length": int(np.min([r["length"] for r in records])) if records else 0,
+        "max_length": int(np.max([r["length"] for r in records])) if records else 0,
         "seat_wins": dict(seat_wins),
         "seat_win_rate": {s: seat_wins.get(s, 0) / n_decisive
                           for s in range(num_players)},
@@ -352,6 +391,8 @@ def aggregate(records, num_players):
                                       if first_monopolist_games else 0.0),
         "mean_winner_net_worth": float(np.mean(winner_net_worths)) if winner_net_worths else 0.0,
         "mean_winner_monopolies": float(np.mean(winner_num_monopolies)) if winner_num_monopolies else 0.0,
+        "mean_winner_final_monopolies": (float(np.mean(winner_final_num_monopolies))
+                                         if winner_final_num_monopolies else 0.0),
         "mean_loser_monopolies": float(np.mean(loser_num_monopolies)) if loser_num_monopolies else 0.0,
         "mean_winner_first_monopoly_turn": (float(np.mean(winner_first_monopoly_turns))
                                             if winner_first_monopoly_turns else None),
@@ -365,6 +406,14 @@ def aggregate(records, num_players):
         "mean_bid_price_ratio": float(np.mean(all_ratios)) if all_ratios else 0.0,
         "mean_set_completion_bid_ratio": (float(np.mean(self_ratios))
                                           if self_ratios else 0.0),
+        "trades_accepted": trades_accepted,
+        "trades_rejected": trades_rejected,
+        "trades_set_completing": trades_setcomplete,
+        "accepted_trades_per_game": trades_accepted / max(1, games),
+        "rejected_trades_per_game": trades_rejected / max(1, games),
+        "set_completing_trades_per_game": trades_setcomplete / max(1, games),
+        "trade_accept_rate": trades_accepted / max(1, trades_offered),
+        "set_completing_share_of_accepted": trades_setcomplete / max(1, trades_accepted),
         "winner_net_worths": winner_net_worths,
         "winner_num_monopolies": winner_num_monopolies,
         "loser_num_monopolies": loser_num_monopolies,
@@ -382,7 +431,8 @@ def print_report(stats):
           f"({stats['num_players']} seats, all driven by the model)")
     print(f"  decisive games : {stats['decisive']}  |  timeouts: {stats['timeouts']}")
     print(f"  game length    : mean {stats['mean_length']:.0f}, "
-          f"median {stats['median_length']:.0f} turns")
+          f"median {stats['median_length']:.0f} turns "
+          f"(range {stats['min_length']}-{stats['max_length']})")
 
     print("\nSeat win rate (first player is seat 0):")
     for s in range(stats["num_players"]):
@@ -392,8 +442,13 @@ def print_report(stats):
         print(f"  seat {s}: {wr * 100:5.1f}%  ({wins:>3})  {bar}")
 
     print("\nWhy winners win:")
-    print(f"  mean monopolies : winner {stats['mean_winner_monopolies']:.2f}  "
-          f"vs loser {stats['mean_loser_monopolies']:.2f}")
+    print(f"  monopolies ever completed   : winner {stats['mean_winner_monopolies']:.2f}  "
+          f"vs loser {stats['mean_loser_monopolies']:.2f}  "
+          f"(cumulative; a set counts even if later traded away or re-completed "
+          f"by another player)")
+    print(f"  monopolies held at game end : winner "
+          f"{stats['mean_winner_final_monopolies']:.2f}  "
+          f"(what the winner still owns when the game ends)")
     print(f"  winners holding >=1 monopoly : "
           f"{stats['frac_winners_with_monopoly'] * 100:.1f}%")
     if stats["mean_winner_first_monopoly_turn"] is not None:
@@ -413,6 +468,17 @@ def print_report(stats):
     print(f"  own-set-completion wins : {stats['set_completion_wins']}")
     print(f"  mean winning bid / price: {stats['mean_bid_price_ratio']:.2f}  "
           f"(set-completers {stats['mean_set_completion_bid_ratio']:.2f})")
+
+    print("\nTrades (proposals offered to a partner):")
+    print(f"  accepted : {stats['accepted_trades_per_game']:.2f}/game "
+          f"({stats['trades_accepted']} total)")
+    print(f"  rejected : {stats['rejected_trades_per_game']:.2f}/game "
+          f"({stats['trades_rejected']} total)")
+    print(f"  accept rate : {stats['trade_accept_rate'] * 100:.1f}%")
+    print(f"  set-completing (accepted) : "
+          f"{stats['set_completing_trades_per_game']:.2f}/game "
+          f"({stats['trades_set_completing']} total, "
+          f"{stats['set_completing_share_of_accepted'] * 100:.1f}% of accepted)")
 
     print("\nSets that most predict a win  (P(win | player ever completed the set)):")
     ranked = sorted(stats["group_win_rate"].items(),
