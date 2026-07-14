@@ -49,8 +49,14 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     # The three knobs the user asked to vary, one per stage.
-    parser.add_argument("--n-envs", type=int, default=64,
-                        help="parallel envs for training")
+    # 32, not 64: each env is a worker *process* holding its own torch runtime and
+    # its own cache of loaded opponent snapshots, and training runs under a 32 GB
+    # cgroup cap. At 64 the workers get OOM-killed once the snapshot pool fills,
+    # which surfaces as an opaque BrokenPipeError with no traceback. See the note
+    # in training/selfplay.py::make_selfplay_env.
+    parser.add_argument("--n-envs", type=int, default=32,
+                        help="parallel envs for training (memory-bound: see "
+                             "training/selfplay.py)")
     parser.add_argument("--episodes", type=int, default=200,
                         help="episodes for evaluation")
     parser.add_argument("--games", type=int, default=100,

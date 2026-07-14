@@ -32,7 +32,7 @@ from training.baselines import make_baseline_trio
 
 
 def policy_from_model(model, deterministic=False):
-    """Wraps a MaskablePPO ``model`` as an env opponent policy callable.
+    """Wraps a MaskablePPO ``model`` (or a bare policy) as an opponent callable.
 
     Returns ``(observation, action_mask_bool) -> action_index``. Opponents
     default to sampling (``deterministic=False``) for behavioural variety.
@@ -43,6 +43,31 @@ def policy_from_model(model, deterministic=False):
             observation, action_masks=action_mask, deterministic=deterministic)
         return int(action)
 
+    return policy
+
+
+def load_opponent_policy(path):
+    """Loads a snapshot as an inference-only policy, and *nothing else*.
+
+    An opponent never learns, so everything ``MaskablePPO.load`` builds around the
+    network -- above all the Adam optimizer's state -- is dead weight that every
+    one of the (up to 64) env worker processes would otherwise hold in memory for
+    every cached snapshot. Training runs under a **32 GB cgroup cap** here, and
+    the torch runtime alone costs a few hundred MB per worker, so this is not a
+    micro-optimisation: keeping the whole algorithm object is what pushed the
+    workers over the cap and got them OOM-killed mid-run.
+
+    Returns the policy (it has the ``.predict(obs, action_masks=...)`` that
+    :func:`policy_from_model` needs), or raises if the zip can't be read.
+    """
+    from sb3_contrib import MaskablePPO
+
+    model = MaskablePPO.load(path, device="cpu")
+    policy = model.policy
+    policy.set_training_mode(False)
+    policy.optimizer = None      # inference only: drop the optimizer state
+    model.policy = None          # break the cycle so the algorithm object is freed
+    del model
     return policy
 
 
@@ -120,7 +145,7 @@ class OpponentPool:
         return policy_from_model(model, self.deterministic)
 
     def _load(self, path):
-        """Loads (and LRU-caches) a snapshot; ``None`` if it can't be read.
+        """Loads (and LRU-caches) a snapshot policy; ``None`` if it can't be read.
 
         A snapshot may be pruned by the callback between the directory scan and
         the load, so failures fall back to the baseline rather than crash.
@@ -129,24 +154,23 @@ class OpponentPool:
             self._cache.move_to_end(path)
             return self._cache[path]
         try:
-            from sb3_contrib import MaskablePPO
-            model = MaskablePPO.load(path, device="cpu")
+            policy = load_opponent_policy(path)
         except Exception:
             return None
         obs_mismatch = (self.expected_obs_shape is not None
-                        and tuple(model.observation_space.shape)
+                        and tuple(policy.observation_space.shape)
                         != self.expected_obs_shape)
         act_mismatch = (self.expected_action_n is not None
-                        and model.action_space.n != self.expected_action_n)
+                        and policy.action_space.n != self.expected_action_n)
         if obs_mismatch or act_mismatch:
             # Stale snapshot from an older obs/action space: cache the rejection
             # (as None) so we don't reload it every episode, and fall back to
             # baseline this time.
-            model = None
-        self._cache[path] = model
+            policy = None
+        self._cache[path] = policy
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
-        return model
+        return policy
 
 
 class SelfPlayCallback(BaseCallback):
@@ -247,14 +271,21 @@ def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
         env = MonopolyEnv(seat=seat, reward_mode=reward_mode,
                           max_turns=max_turns, seed=seed + rank, gamma=gamma,
                           cfg=cfg)
-        # Per-worker LRU cache of loaded snapshots. An episode now draws an
-        # opponent *per seat*, so up to three distinct snapshots are live at
-        # once; a cache of 2 would reload from disk almost every episode. The
-        # models are small, so hold a few.
+        # Per-worker LRU cache of loaded snapshot policies.
+        #
+        # MEMORY IS THE BINDING CONSTRAINT HERE, not disk. Training runs under a
+        # 32 GB cgroup cap (a SLURM allocation -- ``free`` shows the whole host
+        # and will happily lie to you), and there is one of these caches per env
+        # *worker process*. At --n-envs 64 that is 64 copies, on top of a few
+        # hundred MB of torch runtime each. Raising this to 6 is what OOM-killed
+        # the workers mid-run: the parent then dies with an opaque
+        # BrokenPipeError/EOFError and no traceback, because the kernel SIGKILLs
+        # the child. 3 == one per opponent seat, so an episode that draws three
+        # distinct snapshots still never reloads within itself.
         pool = OpponentPool(pool_dir, baseline_prob=baseline_prob,
                             fp_prob=fp_prob,
                             deterministic=opp_deterministic, seed=seed + rank,
-                            cache_size=6,
+                            cache_size=3,
                             expected_obs_shape=env.observation_space.shape,
                             expected_action_n=env.action_space.n)
         # Read at each reset (see MonopolyEnv.reset); safe to set post-init.
