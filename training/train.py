@@ -27,6 +27,7 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
 
 import argparse
 import importlib.util
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -53,21 +54,49 @@ def make_env(rank, seed, seat, reward_mode, max_turns):
 
 
 class WinRateCallback(BaseCallback):
-    """Logs the rolling win rate over recent finished episodes to TensorBoard."""
+    """Rolling episode statistics to TensorBoard.
+
+    Beyond the overall win rate, this splits the win rate **by opponent type**
+    (``info["opponents"]``): FP heuristics, self-play snapshots and the trivial
+    engine baseline are wildly different bars, and one blended number cannot say
+    which of them a rise came from. It also surfaces two signals the env already
+    computes and used to throw away:
+
+    * ``timeout_rate`` -- episodes cut off by the turn cap rather than decided,
+      the symptom of games stalling with nobody able to finish a set;
+    * ``illegal_rate`` -- decisions where the policy picked a masked-out action
+      and was silently clamped to a safe default. It should be ~0; if it is not,
+      a mask is wrong and the clamp is hiding it.
+    """
 
     def __init__(self, window=200):
         super().__init__()
         self.window = window
-        self._results = []
+        self._results = deque(maxlen=window)
+        self._timeouts = deque(maxlen=window)
+        self._by_opponent = defaultdict(lambda: deque(maxlen=window))
+        self._illegal = deque(maxlen=window * 20)   # one entry per *step*
 
     def _on_step(self):
         for done, info in zip(self.locals["dones"], self.locals["infos"]):
+            self._illegal.append(1.0 if info.get("illegal") else 0.0)
             if done and "won" in info:
-                self._results.append(1.0 if info["won"] else 0.0)
-                if len(self._results) > self.window:
-                    self._results.pop(0)
+                won = 1.0 if info["won"] else 0.0
+                self._results.append(won)
+                self._timeouts.append(1.0 if info.get("timeout") else 0.0)
+                self._by_opponent[info.get("opponents", "unknown")].append(won)
+
         if self._results:
             self.logger.record("rollout/win_rate", float(np.mean(self._results)))
+            self.logger.record("rollout/timeout_rate",
+                               float(np.mean(self._timeouts)))
+        if self._illegal:
+            self.logger.record("rollout/illegal_rate",
+                               float(np.mean(self._illegal)))
+        for kind, results in self._by_opponent.items():
+            if results:
+                self.logger.record(f"rollout/win_rate_vs_{kind}",
+                                   float(np.mean(results)))
         return True
 
 

@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# The project imports absolutely from the repo root (``from engine.rl_env import
+# ...``) with no packaging, which is why every documented command is prefixed
+# with ``PYTHONPATH=.``. Teach pytest the same root so ``pytest`` just works.
+pythonpath = ["."]
+testpaths = ["tests"]

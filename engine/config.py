@@ -16,7 +16,10 @@ existing ``from engine.rl_env import TRADE_INCOME_WEIGHT`` style imports keep
 working; new code should read fields off a ``RewardConfig`` instance.
 """
 
-from dataclasses import dataclass
+import json
+import os
+import subprocess
+from dataclasses import asdict, dataclass, fields
 
 
 @dataclass(frozen=True)
@@ -139,3 +142,56 @@ SET_QUALITY_CLAMP = DEFAULT_REWARD_CONFIG.set_quality_clamp
 PROFIT_SCALE = DEFAULT_REWARD_CONFIG.profit_scale
 SET_BONUS = DEFAULT_REWARD_CONFIG.set_bonus
 KEEP_PREMIUM = DEFAULT_REWARD_CONFIG.keep_premium
+
+
+# --- Run metadata: tying a saved model to the knobs it was trained with -----
+# ``model.save(path)`` writes only the weights, so a checkpoint used to carry no
+# record of the coefficients (or the code) behind it -- and these defaults have
+# churned across commits. The sidecar below travels with the zip so evaluation
+# and the GUI can rebuild the *training* economics instead of silently applying
+# today's defaults to yesterday's model.
+
+def config_sidecar_path(model_path):
+    """The metadata file that pairs with a saved model zip."""
+    base = model_path[:-4] if model_path.endswith(".zip") else model_path
+    return base + ".meta.json"
+
+
+def _git_sha():
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5,
+                             cwd=os.path.dirname(os.path.abspath(__file__)))
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def save_run_metadata(model_path, cfg, args=None):
+    """Writes ``<model>.meta.json``: the reward config, the CLI args, the git SHA."""
+    meta = {
+        "reward_config": asdict(cfg),
+        "git_sha": _git_sha(),
+        "args": vars(args) if args is not None else None,
+    }
+    path = config_sidecar_path(model_path)
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+    return path
+
+
+def load_run_config(model_path):
+    """The :class:`RewardConfig` a model was trained with, or the current
+    defaults when the model predates the sidecar (with no way to know better)."""
+    try:
+        with open(config_sidecar_path(model_path)) as f:
+            saved = json.load(f)["reward_config"]
+    except (OSError, ValueError, KeyError):
+        return RewardConfig()
+    known = {f.name: f.type for f in fields(RewardConfig)}
+    kwargs = {}
+    for name, value in saved.items():
+        if name not in known:
+            continue  # a coefficient this version of the code no longer has
+        kwargs[name] = tuple(value) if isinstance(value, list) else value
+    return RewardConfig(**kwargs)

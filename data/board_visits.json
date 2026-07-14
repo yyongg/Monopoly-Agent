@@ -1,0 +1,413 @@
+{
+  "meta": {
+    "games": 6000,
+    "turns_per_game": 200,
+    "players": 4,
+    "jail_strategy": "roll",
+    "seed": 0,
+    "board_size": 40,
+    "total_landings": 1378671
+  },
+  "tiles": [
+    {
+      "pos": 0,
+      "name": "GO",
+      "type": "Go",
+      "price": null,
+      "color": null,
+      "total_visits": 42665,
+      "avg_visits_per_game": 7.110833333333333,
+      "frequency": 0.030946469462257493
+    },
+    {
+      "pos": 1,
+      "name": "Mediterranean Avenue",
+      "type": "street",
+      "price": 60,
+      "color": "brown",
+      "total_visits": 26455,
+      "avg_visits_per_game": 4.409166666666667,
+      "frequency": 0.019188769474370607
+    },
+    {
+      "pos": 2,
+      "name": "Community Chest",
+      "type": "CommunityChest",
+      "price": null,
+      "color": null,
+      "total_visits": 27707,
+      "avg_visits_per_game": 4.6178333333333335,
+      "frequency": 0.02009689041112782
+    },
+    {
+      "pos": 3,
+      "name": "Baltic Avenue",
+      "type": "street",
+      "price": 60,
+      "color": "brown",
+      "total_visits": 28255,
+      "avg_visits_per_game": 4.7091666666666665,
+      "frequency": 0.020494374655011964
+    },
+    {
+      "pos": 4,
+      "name": "Income Tax",
+      "type": "Tax",
+      "price": null,
+      "color": null,
+      "total_visits": 32323,
+      "avg_visits_per_game": 5.387166666666666,
+      "frequency": 0.02344504236326143
+    },
+    {
+      "pos": 5,
+      "name": "Reading Railroad",
+      "type": "railroad",
+      "price": 200,
+      "color": null,
+      "total_visits": 39462,
+      "avg_visits_per_game": 6.577,
+      "frequency": 0.028623217576927346
+    },
+    {
+      "pos": 6,
+      "name": "Oriental Avenue",
+      "type": "street",
+      "price": 100,
+      "color": "light_blue",
+      "total_visits": 32319,
+      "avg_visits_per_game": 5.3865,
+      "frequency": 0.02344214101841556
+    },
+    {
+      "pos": 7,
+      "name": "Chance",
+      "type": "ChanceCard",
+      "price": null,
+      "color": null,
+      "total_visits": 33778,
+      "avg_visits_per_game": 5.629666666666667,
+      "frequency": 0.024500406550946527
+    },
+    {
+      "pos": 8,
+      "name": "Vermont Avenue",
+      "type": "street",
+      "price": 100,
+      "color": "light_blue",
+      "total_visits": 33341,
+      "avg_visits_per_game": 5.5568333333333335,
+      "frequency": 0.024183434626535265
+    },
+    {
+      "pos": 9,
+      "name": "Connecticut Avenue",
+      "type": "street",
+      "price": 120,
+      "color": "light_blue",
+      "total_visits": 32639,
+      "avg_visits_per_game": 5.4398333333333335,
+      "frequency": 0.023674248606085135
+    },
+    {
+      "pos": 10,
+      "name": "Jail",
+      "type": "Jail",
+      "price": null,
+      "color": null,
+      "total_visits": 31808,
+      "avg_visits_per_game": 5.301333333333333,
+      "frequency": 0.023071494214355708
+    },
+    {
+      "pos": 11,
+      "name": "St. Charles Place",
+      "type": "street",
+      "price": 140,
+      "color": "pink",
+      "total_visits": 39704,
+      "avg_visits_per_game": 6.617333333333334,
+      "frequency": 0.02879874894010246
+    },
+    {
+      "pos": 12,
+      "name": "Electric Company",
+      "type": "utility",
+      "price": 150,
+      "color": null,
+      "total_visits": 34142,
+      "avg_visits_per_game": 5.690333333333333,
+      "frequency": 0.024764428931920667
+    },
+    {
+      "pos": 13,
+      "name": "States Avenue",
+      "type": "street",
+      "price": 140,
+      "color": "pink",
+      "total_visits": 31429,
+      "avg_visits_per_game": 5.238166666666666,
+      "frequency": 0.022796591790209556
+    },
+    {
+      "pos": 14,
+      "name": "Virginia Avenue",
+      "type": "street",
+      "price": 160,
+      "color": "pink",
+      "total_visits": 35330,
+      "avg_visits_per_game": 5.888333333333334,
+      "frequency": 0.025626128351143963
+    },
+    {
+      "pos": 15,
+      "name": "Pennsylvania Railroad",
+      "type": "railroad",
+      "price": 200,
+      "color": null,
+      "total_visits": 34185,
+      "avg_visits_per_game": 5.6975,
+      "frequency": 0.024795618389013768
+    },
+    {
+      "pos": 16,
+      "name": "St. James Place",
+      "type": "street",
+      "price": 180,
+      "color": "orange",
+      "total_visits": 38766,
+      "avg_visits_per_game": 6.461,
+      "frequency": 0.02811838357374602
+    },
+    {
+      "pos": 17,
+      "name": "Community Chest",
+      "type": "CommunityChest",
+      "price": null,
+      "color": null,
+      "total_visits": 37950,
+      "avg_visits_per_game": 6.325,
+      "frequency": 0.027526509225188605
+    },
+    {
+      "pos": 18,
+      "name": "Tennessee Avenue",
+      "type": "street",
+      "price": 180,
+      "color": "orange",
+      "total_visits": 40616,
+      "avg_visits_per_game": 6.769333333333333,
+      "frequency": 0.02946025556496075
+    },
+    {
+      "pos": 19,
+      "name": "New York Avenue",
+      "type": "street",
+      "price": 200,
+      "color": "orange",
+      "total_visits": 40074,
+      "avg_visits_per_game": 6.679,
+      "frequency": 0.029067123338345408
+    },
+    {
+      "pos": 20,
+      "name": "Free Parking",
+      "type": "FreeParking",
+      "price": null,
+      "color": null,
+      "total_visits": 39927,
+      "avg_visits_per_game": 6.6545,
+      "frequency": 0.028960498915259696
+    },
+    {
+      "pos": 21,
+      "name": "Kentucky Avenue",
+      "type": "street",
+      "price": 220,
+      "color": "red",
+      "total_visits": 36288,
+      "avg_visits_per_game": 6.048,
+      "frequency": 0.026321000441729754
+    },
+    {
+      "pos": 22,
+      "name": "Chance",
+      "type": "ChanceCard",
+      "price": null,
+      "color": null,
+      "total_visits": 38635,
+      "avg_visits_per_game": 6.439166666666667,
+      "frequency": 0.02802336453004379
+    },
+    {
+      "pos": 23,
+      "name": "Indiana Avenue",
+      "type": "street",
+      "price": 220,
+      "color": "red",
+      "total_visits": 35924,
+      "avg_visits_per_game": 5.987333333333333,
+      "frequency": 0.02605697806075561
+    },
+    {
+      "pos": 24,
+      "name": "Illinois Avenue",
+      "type": "street",
+      "price": 240,
+      "color": "red",
+      "total_visits": 44028,
+      "avg_visits_per_game": 7.338,
+      "frequency": 0.03193510271848759
+    },
+    {
+      "pos": 25,
+      "name": "B&O Railroad",
+      "type": "railroad",
+      "price": 200,
+      "color": null,
+      "total_visits": 35177,
+      "avg_visits_per_game": 5.862833333333334,
+      "frequency": 0.025515151910789447
+    },
+    {
+      "pos": 26,
+      "name": "Atlantic Avenue",
+      "type": "street",
+      "price": 260,
+      "color": "yellow",
+      "total_visits": 35521,
+      "avg_visits_per_game": 5.920166666666667,
+      "frequency": 0.02576466756753424
+    },
+    {
+      "pos": 27,
+      "name": "Ventnor Avenue",
+      "type": "street",
+      "price": 260,
+      "color": "yellow",
+      "total_visits": 35228,
+      "avg_visits_per_game": 5.871333333333333,
+      "frequency": 0.025552144057574288
+    },
+    {
+      "pos": 28,
+      "name": "Water Works",
+      "type": "utility",
+      "price": 150,
+      "color": null,
+      "total_visits": 34030,
+      "avg_visits_per_game": 5.671666666666667,
+      "frequency": 0.02468319127623632
+    },
+    {
+      "pos": 29,
+      "name": "Marvin Gardens",
+      "type": "street",
+      "price": 280,
+      "color": "yellow",
+      "total_visits": 33789,
+      "avg_visits_per_game": 5.6315,
+      "frequency": 0.02450838524927267
+    },
+    {
+      "pos": 30,
+      "name": "Go to Jail",
+      "type": "GoJail",
+      "price": null,
+      "color": null,
+      "total_visits": 34269,
+      "avg_visits_per_game": 5.7115,
+      "frequency": 0.02485654663077703
+    },
+    {
+      "pos": 31,
+      "name": "Pacific Avenue",
+      "type": "street",
+      "price": 300,
+      "color": "green",
+      "total_visits": 34054,
+      "avg_visits_per_game": 5.675666666666666,
+      "frequency": 0.024700599345311536
+    },
+    {
+      "pos": 32,
+      "name": "North Carolina Avenue",
+      "type": "street",
+      "price": 300,
+      "color": "green",
+      "total_visits": 33427,
+      "avg_visits_per_game": 5.571166666666667,
+      "frequency": 0.024245813540721462
+    },
+    {
+      "pos": 33,
+      "name": "Community Chest",
+      "type": "CommunityChest",
+      "price": null,
+      "color": null,
+      "total_visits": 34857,
+      "avg_visits_per_game": 5.8095,
+      "frequency": 0.025283044323119876
+    },
+    {
+      "pos": 34,
+      "name": "Pennsylvania Avenue",
+      "type": "street",
+      "price": 320,
+      "color": "green",
+      "total_visits": 31306,
+      "avg_visits_per_game": 5.217666666666666,
+      "frequency": 0.022707375436199065
+    },
+    {
+      "pos": 35,
+      "name": "Short Line",
+      "type": "railroad",
+      "price": 200,
+      "color": null,
+      "total_visits": 30396,
+      "avg_visits_per_game": 5.066,
+      "frequency": 0.022047319483763712
+    },
+    {
+      "pos": 36,
+      "name": "Chance",
+      "type": "ChanceCard",
+      "price": null,
+      "color": null,
+      "total_visits": 28841,
+      "avg_visits_per_game": 4.8068333333333335,
+      "frequency": 0.02091942167493187
+    },
+    {
+      "pos": 37,
+      "name": "Park Place",
+      "type": "street",
+      "price": 350,
+      "color": "dark_blue",
+      "total_visits": 27217,
+      "avg_visits_per_game": 4.5361666666666665,
+      "frequency": 0.019741475667508782
+    },
+    {
+      "pos": 38,
+      "name": "Luxury Tax",
+      "type": "Tax",
+      "price": null,
+      "color": null,
+      "total_visits": 27366,
+      "avg_visits_per_game": 4.561,
+      "frequency": 0.019849550763017428
+    },
+    {
+      "pos": 39,
+      "name": "Boardwalk",
+      "type": "street",
+      "price": 400,
+      "color": "dark_blue",
+      "total_visits": 35443,
+      "avg_visits_per_game": 5.907166666666667,
+      "frequency": 0.025708091343039783
+    }
+  ]
+}

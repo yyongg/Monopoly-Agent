@@ -3,8 +3,9 @@
 ``RewardMixin`` holds everything that turns game state into the scalar reward:
 the shaped net-worth valuation, the one-time acquisition / denial / build
 bonuses, and the decisive terminal reward. It is mixed into ``MonopolyEnv`` and
-uses the env's per-episode state (``seat``, ``reward_mode``, ``_pending_bonus``,
-``_prev_advantage``) and its :class:`~engine.observation.ObsEncoder`
+uses the env's per-episode state (``seat``, ``reward_mode``, ``gamma``,
+``_pending_bonus``, ``_prev_potential``) and its
+:class:`~engine.observation.ObsEncoder`
 (``self.encoder``) for tile/set valuations -- so reward and observation share one
 definition of a tile's worth.
 """
@@ -95,7 +96,7 @@ class RewardMixin:
         if all(t.owner is player for t in grp):
             if self._count_complete_sets(exclude=grp) == 0:
                 horizon = max(1.0, self.cfg.first_monopoly_tempo_turns)
-                tempo = max(0.0, 1.0 - self._turn / horizon)
+                tempo = max(0.0, 1.0 - self.game.turn / horizon)
                 self._pending_bonus += (
                     self.cfg.first_monopoly_bonus_coef * self.cfg.monopoly_bonus
                     * enc._group_price(grp) / 1000.0
@@ -180,31 +181,73 @@ class RewardMixin:
         deficit = max(0.0, cushion - player.balance) / cushion  # 0 .. 1
         return coef * deficit
 
-    def _reward(self, terminal):
+    def _potential(self):
+        """The shaping potential: the agent's *relative* net-worth advantage
+        (mine minus the mean opponent's), in thousands. Relative, not absolute,
+        so an opponent completing a set costs the agent reward."""
+        controlled = self.game.players[self.seat]
+        return (self._net_worth(controlled) - self._mean_opp_networth()) / 1000.0
+
+    def _reward(self, terminal, truncated=False):
+        """The step reward. ``terminal`` marks the last step of the episode;
+        ``truncated`` says it ended because the *turn cap* cut off a live game
+        rather than because the game actually finished.
+
+        The distinction matters twice over. A truncated episode stops at an
+        ordinary state, so its potential is real (not zero) and the learner
+        bootstraps ``V(s')`` there -- adding a made-up final payoff on top would
+        count the rest of the game twice.
+        """
+        real_end = terminal and not truncated
         controlled = self.game.players[self.seat]
         reward = 0.0
         if self.reward_mode == "shaped":
-            # Shape on *relative* advantage (my net worth minus the mean
-            # opponent's), not absolute net worth, so an opponent completing a
-            # set costs me reward. It telescopes over the episode, leaving the
-            # decisive terminal reward unaffected.
-            adv = self._net_worth(controlled) - self._mean_opp_networth()
-            reward += (adv - self._prev_advantage) / 1000.0
-            self._prev_advantage = adv
+            # Potential-based shaping, done properly: ``gamma * phi(s') -
+            # phi(s)``, with **phi = 0 at a true terminal**. Both details matter.
+            #
+            # The discount factor has to be here or the shaping is not the
+            # policy-invariant transform it claims to be (Ng et al.). And zeroing
+            # the potential at the end is what stops the *last* step paying out
+            # the agent's whole accumulated net worth: ``_mean_opp_networth``
+            # collapses to 0 once the last opponent is bankrupt, so the old code
+            # emitted a +5..+12 spike there, dwarfing the +-1 that actually says
+            # who won. The agent was being trained to end the game rich, not to
+            # win it. Telescoped over the episode, what survives now is the
+            # terminal reward -- the shaping only redistributes it in time.
+            phi = 0.0 if real_end else self._potential()
+            reward += self.gamma * phi - self._prev_potential
+            self._prev_potential = phi
+
             reward += self._pending_bonus
             self._pending_bonus = 0.0
-            # Solvency: make liquidity itself valuable so converting cash into
+
+            # Solvency: make liquidity itself valuable, so converting cash into
             # assets is not "free" when it leaves the agent unable to absorb a
-            # bad landing (the direct counter to self-bankruptcy vs the FP bots).
-            reward -= self._solvency_penalty(controlled)
-        if terminal:
+            # bad landing. Charged once per *turn*, not once per decision: the
+            # number of decisions in a turn is the agent's own choice, so a
+            # per-decision drag could be shrunk by simply doing less -- a
+            # gradient toward passivity exactly when it needs to act.
+            if self.game.turn != self._penalty_turn:
+                self._penalty_turn = self.game.turn
+                reward -= self._solvency_penalty(controlled)
+        if real_end:
             reward += self._terminal_reward()
         return reward
 
     def _mean_opp_networth(self):
-        """Mean net worth of the controlled seat's non-bankrupt opponents (0 if
-        none remain), the baseline for the relative shaped reward."""
+        """Mean net worth of the controlled seat's opponents.
+
+        Averaged over a **fixed** denominator -- every opponent the game started
+        with -- not just the survivors. A bankrupt player is worth exactly 0
+        (``declare_bankrupt`` zeroes their balance and strips their property), so
+        this is the same number while everyone is alive and, unlike a
+        survivors-only mean, it does not *jump* when someone is eliminated.
+
+        With the old survivors-only mean, knocking out the poorest opponent
+        raised the average of those left, which lowered the agent's advantage and
+        paid it a **negative** shaped reward for a strictly good outcome.
+        """
         controlled = self.game.players[self.seat]
         others = [self._net_worth(p) for p in self.game.players
-                  if p is not controlled and not p.bankrupt]
+                  if p is not controlled]
         return sum(others) / len(others) if others else 0.0

@@ -8,24 +8,23 @@ tile/trade valuations, and legal masks all come from a shared
 training env uses -- so the model can never be fed inputs that drift from what it
 was trained on.
 
-The AI never *initiates* trades via the model (trade actions are masked out,
-matching the trained policy) but does propose set-completing trades heuristically
-(:meth:`_attempt_trade`). When a human proposes a trade to the AI,
-``evaluate_trade`` scores the offer with a dollar-valued formula and accepts only
-if it comes out ahead -- see that method for the formula.
+Trades run through the encoder too: :meth:`GUIAIDecider._attempt_trade` asks
+``ObsEncoder.build_offer`` for the offer (the same call the training env makes),
+and :meth:`GUIAIDecider.evaluate_trade` puts a one-for-one offer to the model as
+a ``PHASE_TRADE_RESPOND`` decision -- the same question training asks -- falling
+back to ``ObsEncoder.accepts`` for offer shapes the observation cannot encode.
 """
-
-import numpy as np
 
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
-    NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, NUM_TRADE_TIERS, TRADE_CASH_TIERS,
+    NUM_ACTIONS, NUM_OWNABLE, NUM_BID_LEVELS, NUM_TRADE_TIERS,
     BID_FRACTIONS, BID_CEILING_MULT,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL,
     A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
-    A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID, decode_trade_action,
+    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
+    decode_trade_action,
 )
 from engine.observation import ObsEncoder
 from training.baselines import HeuristicAgent
@@ -38,7 +37,8 @@ class GUIAIDecider:
     public methods at each decision point during the turn loop.
     """
 
-    def __init__(self, num_players, model, deterministic=False, log=None):
+    def __init__(self, num_players, model, deterministic=False, log=None,
+                 cfg=None):
         self.num_players = num_players
         self.model = model
         self.deterministic = deterministic
@@ -51,9 +51,11 @@ class GUIAIDecider:
         # Observation encoder: the single shared implementation of obs
         # encoding, tile/trade valuations, and legal masks (also used by the
         # training env), so the GUI can never drift from what the policy was
-        # trained on. The app sets ``trade_arbiter`` to resolve trades this AI
-        # proposes to other players.
-        self.encoder = ObsEncoder()
+        # trained on. ``cfg`` is the model's *training* RewardConfig (read from
+        # its metadata sidecar by the app) rather than today's defaults, so the
+        # economics it plays under are the ones it learned. The app sets
+        # ``trade_arbiter`` to resolve trades this AI proposes to other players.
+        self.encoder = ObsEncoder(cfg)
         self.trade_arbiter = None
         # Learned policy: when completing its own monopoly it spends *surplus*
         # cash (above the rent-sized reserve) to secure the contested tile,
@@ -111,7 +113,7 @@ class GUIAIDecider:
         it, otherwise it drops out.
         """
         seat = self.game.players.index(player)
-        action = self._decide(seat, PHASE_AUCTION, prop)
+        action = self._decide(seat, PHASE_AUCTION, prop, min_bid)
         k = action - A_AUCTION_BID
         if 0 <= k < NUM_BID_LEVELS:
             value = self.encoder._bid_value(player, prop)
@@ -147,15 +149,17 @@ class GUIAIDecider:
                 return
             if not self.encoder._has_liquidation_options(player):
                 return
-            action = self._decide(seat, PHASE_LIQUIDATE)
+            # The debt is what the decision is *about*: pass it so the policy
+            # sees the same shortfall the training env shows it.
+            action = self._decide(seat, PHASE_LIQUIDATE, None, amount)
             if action == A_END_MANAGE:
                 return
             self._apply_manage_action(player, action)
 
     # --- Internal helpers ---
 
-    def _decide(self, seat, phase, prop=None):
-        obs = self.encoder._encode_obs(seat, phase, prop)
+    def _decide(self, seat, phase, prop=None, amount=0):
+        obs = self.encoder._encode_obs(seat, phase, prop, amount)
         mask = self.encoder._legal_mask(phase, prop, seat)
         action, _ = self.model.predict(
             obs, action_masks=mask.astype(bool), deterministic=self.deterministic)
@@ -194,54 +198,25 @@ class GUIAIDecider:
     # --- Trade initiation (proposing a trade) ------------------------------
 
     def _attempt_trade(self, initiator, target, tier=1):
-        """Builds an offer to acquire ``target`` at cash ``tier`` and asks the
-        partner (via the app's arbiter, or the valuation formula when none is
-        set). The tier scales the engine's balancing cash, but is still capped at
-        our own break-even so we never propose a trade we would reject."""
-        partner = target.owner
-        if not self.encoder._can_propose_trade(initiator, target):
-            return
-        give = self.encoder._choose_give_tile(initiator, partner, target)
-        if give is None:
-            return
-        receive = [target]
+        """Offers a trade to acquire ``target`` at cash ``tier``.
 
-        # Never propose a trade we would ourselves reject. ``evaluate_trade`` is
-        # what decides every offer *we* receive, and it is linear in cash (slope
-        # -1), so our value of this swap paying nothing is the most cash we could
-        # add and still come out ahead. If even paying nothing is a loss for us
-        # (the tile we'd give is worth more to us than the one we'd get), the
-        # deal is bad regardless of price and we don't propose it. Otherwise we
-        # cap the cash we offer at that break-even, so the identical deal handed
-        # back to us always clears -- the two valuation paths can no longer
-        # disagree.
-        _, self_value = self.evaluate_trade(initiator, partner, receive, [give], 0)
-        if self_value <= 0:
+        The offer is built by :meth:`ObsEncoder.build_offer` -- the same call the
+        training env makes -- so the AI proposes in the GUI exactly the deal it
+        was trained to propose. The partner then answers via the app's arbiter
+        (a modal for a human, :meth:`evaluate_trade` for an AI), or via
+        ``evaluate_trade`` directly when running headless.
+        """
+        partner = target.owner
+        offer = self.encoder.build_offer(initiator, target, tier,
+                                         overpay=self._overpay_sets)
+        if offer is None:
             return
-        break_even = int(np.ceil(self_value)) - 1  # max cash keeping value > 0
-        balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
-        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
-        # Positive: we pay the partner. Normally capped at our break-even (never
-        # propose a deal we'd reject) and our balance. But when this completes our
-        # own monopoly and we're a learned policy, we instead spend *surplus* cash
-        # (balance above the rent-sized reserve) even past break-even -- idle cash
-        # is worth little, a set is worth much -- so a rich agent actually pays the
-        # contested ask. Kept byte-identical to the env path (rl_env._attempt_trade).
-        # Negative: a mutual set-for-set where we request cash -- the partner pays,
-        # clamped to their balance; this only improves the deal for us.
-        if raw >= 0:
-            if self._overpay_sets and self.encoder._completes_monopoly_for(
-                    initiator, target):
-                cash = min(raw, max(0, int(initiator.balance
-                                           - self.encoder._cash_reserve(initiator))))
-            else:
-                cash = min(raw, break_even, initiator.balance)
-        else:
-            cash = -min(-raw, partner.balance)
+        give, receive, cash = offer
+
         if self.trade_arbiter is not None:
             accepted = self.trade_arbiter(
                 initiator, partner, [give], receive, cash)
-        else:  # headless fallback: the partner's own valuation formula
+        else:  # headless fallback: ask the partner directly
             accepted, _ = self.evaluate_trade(
                 partner, initiator, [give], receive, cash)
         if not accepted:
@@ -251,88 +226,39 @@ class GUIAIDecider:
             self.log(f"{initiator.name} [AI] traded {give.name} + ${cash} to "
                      f"{partner.name} for {target.name}.")
 
-    # --- Trade evaluation (responding to a human's proposal) ---------------
+    # --- Trade evaluation (responding to a proposal) -----------------------
 
     def evaluate_trade(self, me, other, gain, lose, cash_delta):
-        """Estimates the dollar value to ``me`` of a trade and decides on it.
+        """Decides whether ``me`` accepts a trade, and what it is worth to them.
 
-        From ``me``'s perspective the trade hands ``me`` the properties in
-        ``gain`` and ``cash_delta`` dollars, and takes away the properties in
-        ``lose`` (which go to ``other``). The value is::
+        From ``me``'s perspective the deal hands over the properties in ``lose``
+        (to ``other``) and brings back the properties in ``gain`` plus
+        ``cash_delta`` dollars.
 
-            value =  cash_delta
-                   + sum(prop_value(p) for p in gain)
-                   - sum(prop_value(p) * (1 + cfg.keep_premium) for p in lose)
-                   + cfg.trade_income_weight * (expected income gained - lost)
-                   + cfg.set_bonus * (group price of any monopoly this completes
-                                      for ``me``, minus any it breaks for ``me``)
-                   - cfg.set_bonus * (group price of any monopoly this hands to
-                                      ``other``, minus any it strips from ``other``)
+        A **one-for-one** offer is the shape the policy was trained on, so it is
+        put to the *model* as a ``PHASE_TRADE_RESPOND`` decision -- the same
+        question, encoded the same way, that the training env asks. Anything else
+        (a human stacking several tiles into one offer, which training never
+        produced and the observation cannot even encode) falls back to the
+        engine's dollar valuation, :meth:`ObsEncoder.accepts`.
 
-        where a property is valued at its list price, less the outstanding
-        unmortgage cost if it is mortgaged. On top of that each tile carries a
-        few turns of its expected rent (landing traffic * nominal rent), so a
-        busy tile is worth more to take and dearer to give up than a quiet one.
-        Property the AI gives up also carries the ``KEEP_PREMIUM``, reflecting
-        the rent and set potential lost, so it will not surrender a tile for a
-        marginal cash gain. ``me`` accepts only when the value is strictly
-        positive (and it can afford any cash it owes).
-
-        Returns ``(accepted: bool, value: float)``.
+        Returns ``(accepted: bool, value: float)`` -- the value is the engine's
+        appraisal either way, so the GUI can show it in the log.
         """
-        # Can't accept a trade whose cash ``me`` cannot cover.
-        if cash_delta < 0 and me.balance < -cash_delta:
-            return False, float("-inf")
+        accepted, value = self.encoder.accepts(me, gain, lose, cash_delta)
+        if value == float("-inf"):
+            return False, value  # can't cover the cash it owes
+        if self.model is None or len(gain) != 1 or len(lose) != 1:
+            return accepted, value
 
-        value = float(cash_delta)
-        value += sum(self.encoder._prop_value(p) for p in gain)
-        value -= sum(self.encoder._prop_value(p) * (1.0 + self.encoder.cfg.keep_premium)
-                     for p in lose)
-
-        # Traffic/rent: value a few turns of each tile's expected income.
-        value += self.encoder.cfg.trade_income_weight * sum(self.encoder._expected_income(p) for p in gain)
-        value -= self.encoder.cfg.trade_income_weight * sum(self.encoder._expected_income(p) for p in lose)
-
-        # Strategic set synergy. Only ``me`` and ``other`` change holdings.
-        value += self.encoder.cfg.set_bonus * self._set_swing(me, gain, lose)
-        value -= self.encoder.cfg.set_bonus * self._set_swing(other, lose, gain)
-
-        return value > 0, value
-
-    def _set_swing(self, player, gained, lost):
-        """Net group-price value of the monopolies ``player`` gains minus those
-        it loses, if it were to receive ``gained`` and give up ``lost``."""
-        gained_ids = {id(t) for t in gained}
-        lost_ids = {id(t) for t in lost}
-
-        def owns_after(tile):
-            if id(tile) in gained_ids:
-                return True
-            if id(tile) in lost_ids:
-                return False
-            return tile.owner is player
-
-        enc = self.encoder
-        swing = 0.0
-        for tiles in enc._groups:
-            before = all(t.owner is player for t in tiles)
-            after = all(owns_after(t) for t in tiles)
-            # Weight a completed/broken set by its development ROI, so gaining an
-            # efficient money group (orange/light-blue) counts for more than a
-            # sticker-equal but sluggish one. Scaled by ``trade_monopoly_mult``
-            # (a monopoly is worth far more than its sticker price) and, when no
-            # monopoly exists yet, the first-monopoly tempo premium -- kept in
-            # step with :meth:`ObsEncoder._trade_value` so the AI won't sell a
-            # (first) set-completer for a small cash premium.
-            set_price = (sum(t.price for t in tiles) * enc._set_quality(tiles)
-                         * enc.cfg.trade_monopoly_mult)
-            if not enc._any_monopoly_exists(exclude=tiles):
-                set_price *= (1.0 + enc.cfg.trade_first_monopoly_weight)
-            if after and not before:
-                swing += set_price   # completed a monopoly
-            elif before and not after:
-                swing -= set_price   # broke a monopoly
-        return swing
+        seat = self.game.players.index(me)
+        self.encoder._cur_trade = {"recv": gain[0], "give": lose[0],
+                                   "cash": cash_delta}
+        try:
+            action = self._decide(seat, PHASE_TRADE_RESPOND, lose[0])
+        finally:
+            self.encoder._cur_trade = None
+        return action == A_TRADE_ACCEPT, value
 
 def _safe_default(phase):
     if phase == PHASE_JAIL:
@@ -359,11 +285,15 @@ class FPBaselineDecider(GUIAIDecider):
     in the same flat scheme and shares the :class:`ObsEncoder` valuations.
     """
 
-    def __init__(self, num_players, priorities=None, name="FP", log=None):
+    def __init__(self, num_players, priorities=None, name="FP", log=None,
+                 cfg=None):
         # No model: _decide is overridden below to consult the FP bot, and
-        # _attempt_trade uses evaluate_trade (not the model), so model=None is
-        # safe. deterministic is irrelevant (the bot is a fixed policy).
-        super().__init__(num_players, model=None, deterministic=True, log=log)
+        # evaluate_trade falls through to the encoder, so model=None is safe.
+        # deterministic is irrelevant (the bot is a fixed policy). ``cfg`` is the
+        # match's economics -- in training the FP opponents share the env's one
+        # encoder, so they judge trades under the same config the agent does.
+        super().__init__(num_players, model=None, deterministic=True, log=log,
+                         cfg=cfg)
         # Keep FP the fixed benchmark: no surplus-overpay, so its trade offers
         # stay at the conservative break-even/fair cap (matches training).
         self._overpay_sets = False
@@ -378,30 +308,19 @@ class FPBaselineDecider(GUIAIDecider):
         self._bot.ownable = ownable
         self._bot.encoder = self.encoder
 
-    def _decide(self, seat, phase, prop=None):
-        # Source the action from the FP bot instead of the model. amount is 0:
-        # HeuristicAgent._decide_liquidate ignores it. offer feeds trade-respond,
-        # which the GUI routes through evaluate_trade instead, so it's moot here.
+    def _decide(self, seat, phase, prop=None, amount=0):
+        # Source the action from the FP bot instead of the model. ``offer`` feeds
+        # trade-respond, which the GUI routes through evaluate_trade instead, so
+        # it is moot here.
         mask = self.encoder._legal_mask(phase, prop, seat)
-        action = int(self._bot.decide(seat, phase, prop, 0,
+        action = int(self._bot.decide(seat, phase, prop, amount,
                                       mask.astype(bool),
                                       offer=self.encoder._cur_trade))
         if not (0 <= action < NUM_ACTIONS and mask[action]):
             action = _safe_default(phase)
         return action
 
-    def evaluate_trade(self, me, other, gain, lose, cash_delta):
-        """Faithful FP trade response: accept iff the swap is non-negative by
-        ``ObsEncoder._trade_value`` from ``me``'s side -- exactly
-        :meth:`HeuristicAgent._decide_trade_respond` /
-        :meth:`ObsEncoder._formula_trade_ok`, so the GUI FP bot judges offers
-        identically to the training/eval FP bot. Returns ``(accepted, value)``
-        (the numeric value keeps the inherited ``_attempt_trade`` break-even
-        capping working when this bot *proposes* a trade)."""
-        if cash_delta < 0 and me.balance < -cash_delta:
-            return False, float("-inf")
-        enc = self.encoder
-        value = float(cash_delta)
-        value += sum(enc._trade_value(p, me) for p in gain)
-        value -= sum(enc._trade_value(p, me) for p in lose)
-        return value >= 0, value
+    # ``evaluate_trade`` is inherited: with ``model is None`` it falls straight
+    # through to ``ObsEncoder.accepts``, which *is* the FP accept rule
+    # (:meth:`HeuristicAgent._decide_trade_respond` calls the same method), so
+    # the GUI's FP bot judges an offer exactly as the training/eval one does.

@@ -12,14 +12,16 @@ by early bankruptcies), players decline all purchases and are given an unlimited
 bankroll -- neither choice affects where the dice send them.
 
 The result -- per tile: total visits, average visits per game, and the share of
-all landings -- is written to ``runs/board_visits.json`` and used by the RL
-observation (``engine.rl_env.load_landing_frequencies``) so the agent can value a
-high-traffic property above a quiet one of the same price.
+all landings -- is written to ``data/board_visits.json`` and used by the RL
+observation (``engine.observation.load_landing_frequencies``) so the agent can
+value a high-traffic property above a quiet one of the same price. Regenerating
+it changes what every model sees: it is part of the observation definition, which
+is why it is tracked alongside the board rather than left in ``runs/``.
 
 Usage:
-    python -m validation.board_visits                       # 2000 games
-    python -m validation.board_visits --games 5000 --turns 250
-    python -m validation.board_visits --jail-strategy pay --out runs/visits.json
+    PYTHONPATH=. python -m validation.board_visits             # 2000 games
+    PYTHONPATH=. python -m validation.board_visits --games 5000 --turns 250
+    PYTHONPATH=. python -m validation.board_visits --jail-strategy pay
 """
 
 import argparse
@@ -39,7 +41,10 @@ from data.board_tiles import build_board_tiles
 from data.decks import build_chance_deck, build_community_deck
 
 
-DEFAULT_OUT = os.path.join("runs", "board_visits.json")
+# Tracked static data, not a run artifact: this table scales every traffic-based
+# observation feature and valuation, so it is part of the observation definition
+# and must travel with the code (see engine/observation.load_landing_frequencies).
+DEFAULT_OUT = os.path.join("data", "board_visits.json")
 _UNLIMITED = 10 ** 9  # bankroll so tax / card charges never bankrupt a mover
 
 

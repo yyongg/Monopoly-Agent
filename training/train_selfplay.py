@@ -31,6 +31,7 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
+from engine.config import RewardConfig, save_run_metadata
 from engine.rl_env import MonopolyEnv
 from training.selfplay import SelfPlayCallback, make_selfplay_env
 from training.train import WinRateCallback
@@ -53,6 +54,32 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.999)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    # Previously every one of these was left at an SB3 default and none was
+    # reachable from the CLI, so a sweep could not touch them.
+    parser.add_argument("--net-arch", type=int, nargs="+", default=[256, 256],
+                        help="hidden layer sizes for both the policy and value "
+                             "heads (SB3's default is a 64x64 tanh MLP, which is "
+                             "very small for a 265-dim obs and 211 actions)")
+    parser.add_argument("--n-epochs", type=int, default=10)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-range", type=float, default=0.2)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--target-kl", type=float, default=0.03,
+                        help="early-stop an update that moves the policy too far "
+                             "(SB3 default is None: no limit at all)")
+    parser.add_argument("--lr-schedule", choices=["constant", "linear"],
+                        default="linear",
+                        help="decay the learning rate to 0 over the run")
+    # Reward coefficients. Anything in RewardConfig can be swept this way; these
+    # two are exposed because solvency_penalty_coef is the one uncalibrated knob.
+    parser.add_argument("--solvency-penalty-coef", type=float, default=None,
+                        help="per-turn drag for holding less cash than the "
+                             "board's rent threat warrants (default: "
+                             f"{RewardConfig().solvency_penalty_coef})")
+    parser.add_argument("--solvency-cushion-turns", type=float, default=None,
+                        help="rounds of expected rent the cash cushion should "
+                             "cover (default: "
+                             f"{RewardConfig().solvency_cushion_turns})")
     # Self-play knobs.
     parser.add_argument("--pool-dir", default="runs/sp_pool",
                         help="directory of opponent snapshots")
@@ -77,10 +104,20 @@ def main():
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
 
+    # One RewardConfig for the whole run: it reaches every worker env, and it is
+    # written to the model's metadata sidecar so the checkpoint can be tied back
+    # to the economics it learned under.
+    overrides = {k: v for k, v in (
+        ("solvency_penalty_coef", args.solvency_penalty_coef),
+        ("solvency_cushion_turns", args.solvency_cushion_turns),
+    ) if v is not None}
+    cfg = RewardConfig(**overrides)
+
     venv = SubprocVecEnv([
         make_selfplay_env(i, args.seed, args.seat, args.reward_mode,
                           args.max_turns, args.pool_dir, args.baseline_prob,
-                          args.opp_deterministic, fp_prob=args.fp_prob)
+                          args.opp_deterministic, fp_prob=args.fp_prob,
+                          gamma=args.gamma, cfg=cfg)
         for i in range(args.n_envs)
     ])
     venv = VecMonitor(venv)
@@ -91,14 +128,33 @@ def main():
               "(pip install tensorboard to enable).")
         tensorboard_log = None
 
+    # Anneal the learning rate to 0 over the run: SB3 accepts a callable of
+    # remaining progress (1 -> 0).
+    if args.lr_schedule == "linear":
+        base_lr = args.learning_rate
+
+        def learning_rate(progress_remaining):
+            return progress_remaining * base_lr
+    else:
+        learning_rate = args.learning_rate
+
     model = MaskablePPO(
         MaskableActorCriticPolicy,
         venv,
+        policy_kwargs=dict(
+            net_arch=dict(pi=list(args.net_arch), vf=list(args.net_arch)),
+            activation_fn=torch.nn.ReLU,
+        ),
         n_steps=args.n_steps,
         batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
         ent_coef=args.ent_coef,
-        learning_rate=args.learning_rate,
+        vf_coef=args.vf_coef,
+        target_kl=args.target_kl,
+        learning_rate=learning_rate,
         seed=args.seed,
         tensorboard_log=tensorboard_log,
         verbose=1,
@@ -119,7 +175,10 @@ def main():
     model.learn(total_timesteps=args.timesteps, callback=callbacks,
                 progress_bar=args.progress)
     model.save(args.save_path)
-    print(f"Saved model to {args.save_path}.zip")
+    # Record the economics this model actually learned under, so evaluation and
+    # the GUI don't silently apply today's defaults to it.
+    meta_path = save_run_metadata(args.save_path, cfg, args)
+    print(f"Saved model to {args.save_path}.zip (metadata: {meta_path})")
     venv.close()
 
     # Final evaluation against the hand-crafted FP-A/B/C trio -- a strong,
@@ -129,7 +188,7 @@ def main():
     from training.baselines import make_baseline_trio
 
     eval_env = MonopolyEnv(seat=0, reward_mode=args.reward_mode,
-                           seed=args.seed + 10_000,
+                           seed=args.seed + 10_000, gamma=args.gamma, cfg=cfg,
                            opponent_policy=make_baseline_trio())
     stats = run_evaluation(model, eval_env, episodes=args.eval_episodes)
     eval_env.close()

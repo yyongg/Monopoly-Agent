@@ -141,8 +141,8 @@ class HeuristicAgent:
         recv, give, cash = offer.get("recv"), offer.get("give"), offer.get("cash", 0)
         gain = [recv] if recv is not None else []
         lose = [give] if give is not None else []
-        if self.encoder._formula_trade_ok(player, gain, lose, cash) \
-                and mask[A_TRADE_ACCEPT]:
+        accepted, _ = self.encoder.accepts(player, gain, lose, cash)
+        if accepted and mask[A_TRADE_ACCEPT]:
             return A_TRADE_ACCEPT
         return A_TRADE_REJECT
 

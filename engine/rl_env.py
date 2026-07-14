@@ -188,7 +188,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
 
     def __init__(self, seat=None, num_players=4, names=None, max_turns=1000,
                  reward_mode="shaped", seed=None, opponent_policy=None,
-                 opponent_provider=None):
+                 opponent_provider=None, cfg=None, gamma=0.999):
         if seat is not None and not 0 <= seat < num_players:
             raise ValueError("seat must be in range(num_players)")
         self._seat_fixed = seat  # None means pick a random seat each episode
@@ -199,6 +199,10 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             raise ValueError("names must have num_players entries")
         self.max_turns = max_turns
         self.reward_mode = reward_mode
+        # Discount used by the potential-based shaping (``gamma * phi(s') -
+        # phi(s)``). It must be the *same* gamma the learner uses or the shaping
+        # stops being policy-invariant, so the trainer passes its own.
+        self.gamma = gamma
         self._seed = seed
 
         # Opponent control: a fixed policy, a per-episode provider, and the
@@ -221,11 +225,18 @@ class MonopolyEnv(RewardMixin, _GymEnv):
 
         self.action_space = Discrete(NUM_ACTIONS)
         obs_len = observation_length(num_players)
+        # Honest bounds: expected profit per turn is legitimately negative (a
+        # player bleeding rent), so the old ``low=-1.0`` was a claim the encoder
+        # did not keep. The dollar features are log-compressed (see
+        # ``observation.squash``) but still unbounded in principle.
         self.observation_space = Box(
-            low=-1.0, high=np.inf, shape=(obs_len,), dtype=np.float32)
+            low=-np.inf, high=np.inf, shape=(obs_len,), dtype=np.float32)
         self._obs_len = obs_len
-        self.cfg = RewardConfig()
-        self.encoder = ObsEncoder(self.cfg)
+        # Every reward / valuation coefficient for this run, in one frozen
+        # dataclass. Injectable so a sweep can pass ``RewardConfig(
+        # solvency_penalty_coef=...)`` instead of monkeypatching module globals.
+        self.cfg = cfg or RewardConfig()
+        self.encoder = ObsEncoder(self.cfg, max_turns=max_turns)
 
         # Cross-thread channels and per-episode worker state.
         self._req_q = queue.Queue()
@@ -240,9 +251,9 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
         self.encoder._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
         self.encoder._traded_this_manage = set()  # trade targets tried this MANAGE phase
-        self._prev_advantage = 0.0  # last relative-advantage potential (shaping)
+        self._prev_potential = 0.0  # last shaping potential (see rewards.py)
         self._pending_bonus = 0.0   # denial reward queued by the on_acquire hook
-        self._turn = 0              # turns played this episode (tempo shaping)
+        self._penalty_turn = -1     # last turn the solvency penalty was charged
         self._truncated = False
         self.game = None
         self.ownable = []
@@ -283,9 +294,9 @@ class MonopolyEnv(RewardMixin, _GymEnv):
 
         self._done = False
         self._truncated = False
-        self._prev_advantage = (self._net_worth(controlled)
-                                - self._mean_opp_networth())
+        self._prev_potential = self._potential()
         self._pending_bonus = 0.0
+        self._penalty_turn = -1     # solvency penalty is charged once per turn
         self._thread = threading.Thread(target=self._run_game, daemon=True)
         self._thread.start()
         obs, _, _, _, info = self._pump_until_request()
@@ -424,7 +435,11 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         player = self.game.players[seat]
 
         def hook(prop, min_bid=0):
-            action = decide(PHASE_AUCTION, prop)
+            # ``min_bid`` is the price to beat this round -- pass it as the
+            # decision's amount so it reaches the observation. Without it the
+            # agent re-picked a bucket every round from an identical state,
+            # unable to see how far the bidding had climbed.
+            action = decide(PHASE_AUCTION, prop, min_bid)
             k = action - A_AUCTION_BID
             if 0 <= k < NUM_BID_LEVELS:
                 value = self.encoder._bid_value(player, prop)
@@ -488,14 +503,17 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         try:
             while (not g.is_over() and not controlled.bankrupt
                    and turns < self.max_turns):
-                self._turn = turns  # current turn, read by tempo shaping
                 seat = g.current_player
                 if seat in self._deciders:
                     self._play_turn(g.players[seat], self._deciders[seat])
                 else:
                     g.step()  # baseline opponent, whole turn
                 turns += 1
-            self._truncated = turns >= self.max_turns and not g.is_over()
+            # Truncation is the *turn cap* cutting off a game that was still
+            # going. The agent's own bankruptcy is a genuine terminal for it,
+            # even if the other seats could have played on.
+            self._truncated = (turns >= self.max_turns and not g.is_over()
+                               and not controlled.bankrupt)
         except _Abort:
             return
         # Signal the end of the episode to whoever is waiting in step().
@@ -630,7 +648,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
                                        mask.astype(bool),
                                        offer=self.encoder._cur_trade))
         else:
-            obs = self.encoder._encode_obs(seat, phase, prop)
+            obs = self.encoder._encode_obs(seat, phase, prop, amount)
             action = int(policy(obs, mask.astype(bool)))
         if not (0 <= action < NUM_ACTIONS and mask[action]):
             action = self._safe_default(phase)
@@ -675,55 +693,38 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             self._attempt_trade(player, self.ownable[i], tier)
 
     def _overpay_for_set(self, initiator, target):
-        """Whether ``initiator`` may spend surplus cash (above its reserve) to
-        complete its own monopoly by acquiring ``target``.
+        """Whether ``initiator`` may spend surplus cash (above its rent reserve)
+        to complete its own monopoly -- the ``overpay`` flag of
+        :meth:`ObsEncoder.build_offer`, which applies it only to a swap that
+        actually completes a set.
 
-        Gated to *learned* policies only -- the agent seat and self-play
-        snapshots -- so the hand-crafted FP baselines stay the fixed benchmark:
-        a seat driven by a ``HeuristicAgent`` (has ``.decide``) keeps its
-        conservative ``min(raw, balance)`` cap. An opponent seat with no policy
-        (trivial baseline) never proposes trades, so it never reaches here."""
+        Gated to *learned* policies -- the agent seat and self-play snapshots --
+        so the hand-crafted FP baselines stay the fixed benchmark: a seat driven
+        by a ``HeuristicAgent`` (it has ``.decide``) keeps the conservative
+        break-even cap. An opponent seat with no policy (the trivial baseline)
+        never proposes trades, so it never reaches here."""
         seat = self.game.players.index(initiator)
         pol = self._opponent_policies.get(seat)
-        if hasattr(pol, "decide"):          # FP heuristic opponent: unchanged
-            return False
-        return self.encoder._completes_monopoly_for(initiator, target)
+        return not hasattr(pol, "decide")
 
     def _attempt_trade(self, initiator, target, tier=1):
-        """Builds and offers a trade to acquire ``target`` at cash ``tier``.
+        """Offers a trade to acquire ``target`` at cash ``tier``.
 
-        The engine constructs the give-tile + a balancing cash figure, scaled by
-        ``TRADE_CASH_TIERS[tier]`` (lowball / fair / generous). The partner's
-        decider (agent via the queue, opponent policy synchronously, or a
-        baseline via :meth:`_formula_trade_ok`) accepts or rejects. On acceptance
-        the swap runs through :meth:`Game.execute_trade`.
+        The offer itself is built by :meth:`ObsEncoder.build_offer` -- the one
+        implementation, shared with the GUI, so the deal the policy learns to
+        propose is the deal it proposes in play. The partner's decider (the agent
+        via the queue, an opponent policy synchronously, or a policy-less
+        baseline via :meth:`ObsEncoder.accepts`) then accepts or rejects, and on
+        acceptance the swap runs through :meth:`Game.execute_trade`.
         """
         g = self.game
         partner = target.owner
-        if not self.encoder._can_propose_trade(initiator, target):
+        offer = self.encoder.build_offer(
+            initiator, target, tier,
+            overpay=self._overpay_for_set(initiator, target))
+        if offer is None:
             return
-        give = self.encoder._choose_give_tile(initiator, partner, target)
-        if give is None:
-            return
-        receive = [target]
-        balancing = self.encoder._balancing_cash(initiator, partner, [give], receive)
-        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
-        # Positive: we pay the partner (clamp to our balance). Negative: we
-        # request cash in a mutual set-for-set, so the partner pays -- clamp the
-        # request to *their* balance so the swap can actually settle.
-        if raw >= 0:
-            if self._overpay_for_set(initiator, target):
-                # Rich agent completing its own monopoly: spend *surplus* cash
-                # (balance above the rent-sized reserve) to secure the contested
-                # set-completer, keeping the cushion so it stays solvent. A
-                # cash-tight agent (surplus < ask) offers less and is refused,
-                # rather than bankrupting itself buying a set before rent hits.
-                cash = min(raw, max(0, int(initiator.balance
-                                           - self.encoder._cash_reserve(initiator))))
-            else:
-                cash = min(raw, initiator.balance)
-        else:
-            cash = -min(-raw, partner.balance)
+        give, receive, cash = offer
 
         partner_seat = g.players.index(partner)
         decide = self._deciders.get(partner_seat)
@@ -735,7 +736,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             self.encoder._cur_trade = None
             accept = action == A_TRADE_ACCEPT
         else:
-            accept = self.encoder._formula_trade_ok(partner, [give], receive, cash)
+            accept, _ = self.encoder.accepts(partner, [give], receive, cash)
 
         if accept:
             g.execute_trade(initiator, partner, [give], receive, cash)
@@ -751,14 +752,39 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
             self._cur_prop = None
             obs = self.encoder._encode_obs(self.seat, PHASE_TERMINAL, None)
-            reward = self._reward(terminal=True)
-            return obs, reward, True, self._truncated, self._info(terminal=True)
+            reward = self._reward(terminal=True, truncated=self._truncated)
+            # Gymnasium semantics: an episode cut off by the turn cap is
+            # *truncated*, not *terminated*. This used to report terminated=True
+            # unconditionally, which made SB3 set ``TimeLimit.truncated=False``
+            # and so never bootstrap V(s') at the cap -- a timeout was trained as
+            # if the game had genuinely ended there, with a made-up final payoff.
+            terminated = not self._truncated
+            return (obs, reward, terminated, self._truncated,
+                    self._info(terminal=True))
 
         phase, prop, amount = item
         self._cur_phase, self._cur_prop, self._cur_amount = phase, prop, amount
-        obs = self.encoder._encode_obs(self.seat, phase, prop)
+        obs = self.encoder._encode_obs(self.seat, phase, prop, amount)
         reward = self._reward(terminal=False)
         return obs, reward, False, False, self._info()
+
+    def _opponent_label(self):
+        """What this episode's opponent seats were: ``"fp"``, ``"snapshot"``,
+        ``"baseline"``, or ``"mixed"`` when the roster was not uniform."""
+        kinds = set()
+        for seat in range(self.num_players):
+            if seat == self.seat:
+                continue
+            policy = self._opponent_policies.get(seat)
+            if policy is None:
+                kinds.add("baseline")
+            elif hasattr(policy, "decide"):
+                kinds.add("fp")
+            else:
+                kinds.add("snapshot")
+        if len(kinds) == 1:
+            return kinds.pop()
+        return "mixed"
 
     def _info(self, terminal=False):
         info = {
@@ -772,6 +798,10 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             info["winner"] = winner.name if winner is not None else None
             info["won"] = winner is self.game.players[self.seat]
             info["timeout"] = self._truncated
+            # Who the agent actually played. A single overall win rate cannot
+            # say whether a gain came from the FP bots, from self-play snapshots,
+            # or from the trivial baseline -- which are wildly different bars.
+            info["opponents"] = self._opponent_label()
         return info
 
     # -- Teardown -----------------------------------------------------------

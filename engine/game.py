@@ -10,6 +10,11 @@ class Game:
         self.roll = 0
         self.last_dice = (0, 0)
         self.current_player = 0
+        # Turns played so far. Counted in ``advance_turn``, the one place every
+        # turn loop passes through (the engine's own ``step``, the RL env's
+        # ``_play_turn``, and the GUI's), so "how far into the game are we" has a
+        # single definition -- the observation and the tempo reward both read it.
+        self.turn = 0
 
         # Positions
         self.jail_position = 10
@@ -422,6 +427,10 @@ class Game:
                 f"properties and cards.")
             for prop in list(player.properties):
                 prop.transfer_ownership(creditor)
+                # Inheriting a tile is an acquisition like any other -- the tile
+                # that completes a set (or blocks someone else's) counts the same
+                # whether it arrived by trade or by a rival going broke.
+                self._acquired(creditor, prop, source="inherit")
             for card in list(player.jail_cards):
                 creditor.jail_cards.append(card)
             player.jail_cards.clear()
@@ -457,6 +466,7 @@ class Game:
 
     def advance_turn(self):
         """Passes play to the next player who is still in the game."""
+        self.turn += 1
         for _ in range(len(self.players)):
             self.current_player = (self.current_player + 1) % len(self.players)
             if not self.players[self.current_player].bankrupt:

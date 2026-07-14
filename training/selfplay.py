@@ -65,12 +65,13 @@ class OpponentPool:
 
     def __init__(self, pool_dir, baseline_prob=0.2, fp_prob=0.0, cache_size=8,
                  deterministic=False, seed=None, expected_obs_shape=None,
-                 expected_action_n=None):
+                 expected_action_n=None, num_opponents=3):
         self.pool_dir = pool_dir
         self.baseline_prob = baseline_prob
         self.fp_prob = fp_prob
         self.cache_size = cache_size
         self.deterministic = deterministic
+        self.num_opponents = num_opponents
         # Snapshots trained against an older obs *or* action space would crash at
         # predict time; skip any whose observation or action space doesn't match.
         # Both must be checked -- e.g. a snapshot from after an obs change but
@@ -83,19 +84,36 @@ class OpponentPool:
         self._cache = OrderedDict()
 
     def __call__(self):
-        """Samples an opponent spec for one episode.
+        """Samples an opponent roster for one episode.
 
-        Returns the FP trio (prob ``fp_prob``), the trivial engine baseline
-        (``None``, prob ``baseline_prob``), or a sampled snapshot policy.
+        With probability ``fp_prob`` the roster is the **whole FP-A/B/C trio**,
+        and with ``baseline_prob`` it is all trivial baselines. Keeping these
+        rosters coherent matters: the FP trio is the benchmark the agent is
+        measured against, and sprinkling FP bots in seat-by-seat would make a
+        full trio vanishingly rare (0.3 per seat is a 2.7% chance of all three).
+
+        Otherwise the roster is drawn from the snapshot pool **independently per
+        seat**, so the agent faces an old self and a recent self in the same
+        game rather than three copies of one snapshot -- much more varied play
+        out of the same pool, and the direct counter to the strategic cycling
+        that a single-opponent roster invites.
+
+        Returns a list the env deals across the opponent seats; a ``None`` entry
+        leaves that seat on the engine baseline.
         """
         r = self._rng.random()
         if r < self.fp_prob:
             return make_baseline_trio()
         if r < self.fp_prob + self.baseline_prob:
             return None
+        return [self._sample_snapshot() for _ in range(self.num_opponents)]
+
+    def _sample_snapshot(self):
+        """A policy from a uniformly-drawn pool snapshot, or ``None`` (baseline)
+        when the pool is empty -- as it is early in training."""
         paths = glob.glob(os.path.join(self.pool_dir, "*.zip"))
         if not paths:
-            return None  # empty pool early in training -> baseline opponents
+            return None
         model = self._load(self._rng.choice(paths))
         if model is None:
             return None
@@ -134,8 +152,22 @@ class OpponentPool:
 class SelfPlayCallback(BaseCallback):
     """Snapshots the learner into the opponent pool at a fixed step interval.
 
-    Keeps only the most recent ``pool_size`` snapshots so the pool stays bounded
-    and weighted toward recent (stronger) versions of the agent.
+    The pool is capped at ``pool_size``, but *which* snapshots it keeps matters
+    as much as how many. Pruning to the newest N (the old behaviour) leaves a
+    sliding window of near-copies of the agent's recent self -- at a 100k
+    snapshot interval and a cap of 10, it never faces anything older than its
+    last million steps. That is the classic setup for strategic cycling: the
+    agent learns to beat its current self, drifts, forgets the counter to what it
+    used to do, and can cycle indefinitely without getting stronger.
+
+    So eviction keeps a *spread over training history* instead:
+
+    * the **earliest** snapshot is an anchor and is never evicted -- a permanent
+      reference point that the agent must keep beating;
+    * the newest is always kept (it is the strongest);
+    * otherwise the snapshot whose two neighbours in time are closest is dropped,
+      which thins the most crowded stretch of history and leaves the survivors
+      spread across the whole run.
     """
 
     def __init__(self, pool_dir, snapshot_freq, pool_size=10, verbose=0):
@@ -158,32 +190,71 @@ class SelfPlayCallback(BaseCallback):
         path = os.path.join(
             self.pool_dir, f"snapshot_{self.num_timesteps:09d}.zip")
         self.model.save(path)
+        # Filenames are zero-padded step counts, so lexical order is time order.
         snaps = sorted(glob.glob(os.path.join(self.pool_dir, "snapshot_*.zip")))
-        for old in snaps[:-self.pool_size]:  # prune all but the newest pool_size
+        for old in self._evict(snaps):
             try:
                 os.remove(old)
             except OSError:
                 pass
         if self.verbose:
-            kept = min(len(snaps), self.pool_size)
             print(f"[self-play] snapshot at {self.num_timesteps} steps "
-                  f"(pool size {kept})")
+                  f"(pool size {min(len(snaps), self.pool_size)})")
+
+    def _evict(self, snaps):
+        """Which snapshots to delete, keeping a spread across training history.
+
+        Returns the paths to remove (never the first or the last).
+        """
+        drop = []
+        keep = list(snaps)
+        while len(keep) > self.pool_size:
+            steps = [_snapshot_steps(p) for p in keep]
+            # Interior snapshot with the smallest gap to its neighbours: the most
+            # redundant point in the timeline.
+            gaps = [(steps[i + 1] - steps[i - 1], i)
+                    for i in range(1, len(keep) - 1)]
+            if not gaps:
+                break
+            _, victim = min(gaps)
+            drop.append(keep.pop(victim))
+        return drop
+
+
+def _snapshot_steps(path):
+    """The training step a snapshot filename encodes (0 if unparseable)."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    try:
+        return int(stem.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return 0
 
 
 def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
-                      baseline_prob, opp_deterministic, fp_prob=0.0):
-    """Returns a picklable factory for one self-play ``MonopolyEnv`` worker."""
+                      baseline_prob, opp_deterministic, fp_prob=0.0,
+                      gamma=0.999, cfg=None):
+    """Returns a picklable factory for one self-play ``MonopolyEnv`` worker.
+
+    ``gamma`` is handed to the env so its potential-based shaping discounts with
+    the *same* factor the learner does -- otherwise the shaping is not the
+    policy-invariant transform it is meant to be. ``cfg`` is the run's
+    :class:`~engine.config.RewardConfig` (a frozen dataclass, so it pickles
+    across to the worker processes), which is what makes a coefficient sweep
+    possible without monkeypatching module globals.
+    """
 
     def _init():
         env = MonopolyEnv(seat=seat, reward_mode=reward_mode,
-                          max_turns=max_turns, seed=seed + rank)
-        # Small per-worker cache: with many parallel envs the opponent models
-        # are the dominant memory cost, so keep only a couple resident (they're
-        # cheap to reload from disk) to stay well under tight memory caps.
+                          max_turns=max_turns, seed=seed + rank, gamma=gamma,
+                          cfg=cfg)
+        # Per-worker LRU cache of loaded snapshots. An episode now draws an
+        # opponent *per seat*, so up to three distinct snapshots are live at
+        # once; a cache of 2 would reload from disk almost every episode. The
+        # models are small, so hold a few.
         pool = OpponentPool(pool_dir, baseline_prob=baseline_prob,
                             fp_prob=fp_prob,
                             deterministic=opp_deterministic, seed=seed + rank,
-                            cache_size=2,
+                            cache_size=6,
                             expected_obs_shape=env.observation_space.shape,
                             expected_action_n=env.action_space.n)
         # Read at each reset (see MonopolyEnv.reset); safe to set post-init.

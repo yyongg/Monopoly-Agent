@@ -168,8 +168,13 @@ def play_one_game(env, policy, seed, max_turns):
 
     def counting_attempt(initiator, target, tier=1):
         enc = env.encoder
-        offered = (enc._can_propose_trade(initiator, target)
-                   and enc._choose_give_tile(initiator, target.owner, target) is not None)
+        # Ask the *same* builder the env is about to use, so "an offer was made"
+        # here means exactly what it means there (it declines to build one when
+        # the trade is unproposable, there is nothing to give, or the swap loses
+        # value at any price).
+        offered = enc.build_offer(
+            initiator, target, tier,
+            overpay=env._overpay_for_set(initiator, target)) is not None
         # Whether acquiring ``target`` would finish a monopoly for the initiator
         # (checked *before* the swap, while it still lacks the tile).
         completes = offered and enc._completes_monopoly_for(initiator, target)

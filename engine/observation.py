@@ -17,6 +17,7 @@ two transient per-decision fields on it:
 
 import json
 import os
+from typing import NamedTuple
 
 import numpy as np
 
@@ -27,36 +28,78 @@ from engine.constants import (
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, NUM_TRADE_TIERS, BID_FRACTIONS,
-    trade_action,
+    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, NUM_TRADE_TIERS, TRADE_CASH_TIERS,
+    BID_FRACTIONS, trade_action,
 )
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
 
 
-LANDING_FREQ_PATH = os.path.join("runs", "board_visits.json")
+# The landing-frequency table is *part of the observation definition* (it scales
+# every ``_traffic``-derived feature and valuation), so the canonical copy is
+# tracked static data next to the board itself. ``runs/`` is only a fallback for
+# a locally regenerated table -- it is gitignored, and a silent fall back to a
+# uniform prior there would hand a fresh clone a different observation encoding
+# than the shipped model was trained on.
+# Anchored to the repo root, not the working directory: the table used to be
+# looked up at the relative path "runs/board_visits.json", so *where you ran
+# from* silently decided which observation encoding you got.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LANDING_FREQ_PATH = os.path.join(_REPO_ROOT, "data", "board_visits.json")
+LANDING_FREQ_FALLBACKS = (os.path.join(_REPO_ROOT, "runs", "board_visits.json"),)
 _LAND_FREQ_CACHE = None
 
 
-def load_landing_frequencies(path=LANDING_FREQ_PATH):
+def load_landing_frequencies(path=LANDING_FREQ_PATH, required=True):
     """Returns ``{board_pos: landing_share}`` from the saved visit table.
 
-    Cached after first load. On a missing/unreadable file returns ``{}``, which
-    callers treat as a uniform prior (see ``ObsEncoder._traffic``)."""
+    Cached after first load. Raises when the table cannot be read and
+    ``required`` (the default): a missing table does not merely disable a
+    feature, it silently *changes the observation* the policy sees. Pass
+    ``required=False`` to opt into the uniform prior (used when generating the
+    table in the first place).
+    """
     global _LAND_FREQ_CACHE
     if _LAND_FREQ_CACHE is not None:
         return _LAND_FREQ_CACHE
-    freqs = {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        for t in data["tiles"]:
-            freqs[int(t["pos"])] = float(t["frequency"])
-    except (OSError, ValueError, KeyError):
-        freqs = {}
-    _LAND_FREQ_CACHE = freqs
-    return freqs
+    tried = []
+    for candidate in (path, *LANDING_FREQ_FALLBACKS):
+        tried.append(candidate)
+        try:
+            with open(candidate) as f:
+                data = json.load(f)
+            freqs = {int(t["pos"]): float(t["frequency"]) for t in data["tiles"]}
+        except (OSError, ValueError, KeyError):
+            continue
+        _LAND_FREQ_CACHE = freqs
+        return freqs
+
+    if required:
+        raise FileNotFoundError(
+            "No landing-frequency table found (looked in "
+            + ", ".join(repr(p) for p in tried)
+            + "). It defines part of the observation, so falling back to a "
+              "uniform prior would silently change what the policy sees. "
+              "Regenerate it with:\n"
+              "    PYTHONPATH=. python -m validation.board_visits")
+    _LAND_FREQ_CACHE = {}
+    return _LAND_FREQ_CACHE
+
+
+def squash(x):
+    """Log-compresses an unbounded dollar-scaled feature, keeping its sign.
+
+    Most features here are naturally bounded (one-hots, fractions of a group,
+    a position on the board). The money ones are not: a late-game balance of
+    $10,000 lands at ``balance / 1500 == 6.7``, and expected profit per turn can
+    swing either way without limit. Feeding those raw into the policy net makes
+    the money features dominate the tame ones and saturates a tanh unit, so they
+    go through ``sign(x) * log1p(|x|)`` -- monotone, sign-preserving, and gentle
+    on the tail (6.7 becomes 2.0), so "rich" and "very rich" stay distinguishable
+    without drowning out the rest of the board.
+    """
+    return float(np.sign(x) * np.log1p(abs(x)))
 
 
 def base_rent(prop):
@@ -96,8 +139,22 @@ def observation_length(num_players):
             + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
             + 5               # context prop economics: price, rent, traffic,
                               # buy-yield, dev-ROI
-            + 4)              # race awareness: any set done, my/best-opp set
+            + 4               # race awareness: any set done, my/best-opp set
                               # count, am-I-first
+            + 2               # the money on the table: the amount at stake
+                              # (LIQUIDATE debt / AUCTION min bid) and whether
+                              # the player can even cover it
+            + 1)              # the clock: how far into the game we are
+
+
+class TradeOffer(NamedTuple):
+    """One proposed swap: the initiator hands over ``give`` plus ``cash`` and
+    receives ``receive``. ``cash`` is signed -- negative means the initiator is
+    *asking* the partner for money (a mutual set-for-set)."""
+
+    give: object
+    receive: list
+    cash: int
 
 
 def safe_default(phase):
@@ -121,8 +178,12 @@ class ObsEncoder:
     game every episode; the GUI binds once per match).
     """
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None, max_turns=1000):
         self.cfg = cfg or RewardConfig()
+        # Episode horizon, used to scale the clock feature. The env passes its
+        # own turn cap; the GUI (which has no cap) keeps the default, so a GUI
+        # game reads the clock on the same scale the policy trained with.
+        self.max_turns = max_turns
         self.game = None
         self.ownable = []
         self.num_players = 0
@@ -428,13 +489,85 @@ class ObsEncoder:
         premium = int(round(0.25 * set_price))
         return int(round(recv_val - give_val)) + premium
 
-    def _formula_trade_ok(self, partner, gain, lose, cash):
-        """Baseline partner's accept rule: take the deal when it is non-negative
-        by :meth:`_trade_value` from the partner's side."""
+    # -- The trade rules: one accept rule, one offer builder ----------------
+    # Every trade decision in the project runs through these two methods -- the
+    # training env, the GUI's AI seats, and the FP baselines alike. They used to
+    # be four separate implementations (two offer builders, three accept rules)
+    # kept in step by comment discipline, and they had already drifted.
+
+    def trade_delta(self, player, gain, lose, cash):
+        """Dollar value to ``player`` of receiving ``gain`` plus ``cash`` while
+        giving up ``lose``, priced with :meth:`_trade_value` (list price, a few
+        turns of expected rent, and the monopoly/denial value of any set it
+        completes or blocks)."""
         value = float(cash)
-        value += sum(self._trade_value(p, partner) for p in gain)
-        value -= sum(self._trade_value(p, partner) for p in lose)
-        return value >= 0
+        value += sum(self._trade_value(p, player) for p in gain)
+        value -= sum(self._trade_value(p, player) for p in lose)
+        return value
+
+    def accepts(self, player, gain, lose, cash):
+        """Whether ``player`` takes this deal, and what it is worth to them.
+
+        The single acceptance rule: take any swap that is non-negative by
+        :meth:`trade_delta`, provided the cash owed is actually covered.
+
+        Returns ``(accepted, value)``.
+        """
+        if cash < 0 and player.balance < -cash:
+            return False, float("-inf")
+        value = self.trade_delta(player, gain, lose, cash)
+        return value >= 0, value
+
+    def build_offer(self, initiator, target, tier=1, overpay=False):
+        """The offer ``initiator`` makes to acquire ``target`` at cash ``tier``,
+        or ``None`` when there is no sane deal to propose.
+
+        The engine picks the give-tile (:meth:`_choose_give_tile`) and the
+        balancing cash (:meth:`_balancing_cash`, valued from the *partner*'s
+        side); ``tier`` scales that ask -- lowball, fair, or generous.
+
+        Two caps apply to the cash:
+
+        * Normally the offer is capped at the initiator's own **break-even** --
+          the most it could pay and still accept the identical deal handed back
+          to it (:meth:`accepts` is linear in cash with slope 1). An agent that
+          proposes a swap it would itself reject is simply losing value.
+        * When ``overpay`` is set and ``target`` completes the initiator's *own*
+          monopoly, that cap is deliberately dropped in favour of a **surplus**
+          cap: it may spend every dollar above its rent-sized cash reserve
+          (:meth:`_cash_reserve`), because idle cash is worth little and a set is
+          worth a great deal -- but it never digs into the cushion that keeps it
+          solvent. This is what lets a rich agent actually pay a contested ask.
+        """
+        partner = target.owner
+        if not self._can_propose_trade(initiator, target):
+            return None
+        give = self._choose_give_tile(initiator, partner, target)
+        if give is None:
+            return None
+        receive = [target]
+
+        _, self_value = self.accepts(initiator, receive, [give], 0)
+        if self_value <= 0:
+            return None  # a losing swap at any price: the tile we'd give is
+            #              worth more to us than the one we'd get
+        break_even = int(np.ceil(self_value)) - 1
+
+        balancing = self._balancing_cash(initiator, partner, [give], receive)
+        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
+
+        if raw < 0:
+            # A mutual set-for-set where the tile we hand over is worth more to
+            # the partner than the one we take: *we* get paid. Clamp the request
+            # to their balance so the swap can settle.
+            return TradeOffer(give, receive, -min(-raw, partner.balance))
+
+        if overpay and self._completes_monopoly_for(initiator, target):
+            surplus = max(0, int(initiator.balance - self._cash_reserve(initiator)))
+            cash = min(raw, surplus)
+        else:
+            cash = min(raw, break_even, initiator.balance)
+        return TradeOffer(give, receive, cash)
 
     # -- Liquidation reachability (used by masks / buy hooks) --------------
     def _has_liquidation_options(self, player):
@@ -541,13 +674,19 @@ class ObsEncoder:
         return mask
 
     # -- Observation --------------------------------------------------------
-    def _encode_obs(self, perspective, phase, prop):
+    def _encode_obs(self, perspective, phase, prop, amount=0):
         """Builds the flat float32 observation from ``perspective``'s view.
 
         Players are ordered starting at ``perspective`` (so the acting seat is
         always relative player 0) and property owners are encoded by relative
         seat. This makes the observation perspective-invariant, so one policy
         can play any seat -- the basis for self-play.
+
+        ``amount`` is the money the decision actually turns on: the debt to be
+        covered in ``PHASE_LIQUIDATE``, the minimum bid in ``PHASE_AUCTION``. It
+        was previously handed to the heuristic baselines but *never encoded*, so
+        the learned policy was choosing what to mortgage without knowing whether
+        it owed $50 or $2,000.
         """
         g = self.game
         n = self.num_players
@@ -560,12 +699,12 @@ class ObsEncoder:
             idx = (perspective + k) % n
             p = g.players[idx]
             parts.extend([
-                p.balance / 1500.0,
+                squash(p.balance / 1500.0),
                 p.pos / 39.0,
                 1.0 if p.in_jail else 0.0,
                 float(len(p.jail_cards)),
                 1.0 if p.bankrupt else 0.0,
-                profits[idx] / self.cfg.profit_scale,
+                squash(profits[idx] / self.cfg.profit_scale),
             ])
 
         # Per-property block: owner one-hot relative to perspective (slot 0 ==
@@ -601,7 +740,7 @@ class ObsEncoder:
                          if recv is not None else -1.0)
             parts.append(self._prop_index[id(give)] / NUM_OWNABLE
                          if give is not None else -1.0)
-            parts.append(tc["cash"] / 1500.0)
+            parts.append(squash(tc["cash"] / 1500.0))
         else:
             parts.extend([-1.0, -1.0, 0.0])
 
@@ -654,5 +793,22 @@ class ObsEncoder:
         parts.append(my_sets / n_groups)
         parts.append(opp_sets / n_groups)
         parts.append(1.0 if my_sets > 0 and opp_sets == 0 else 0.0)
+
+        # The money on the table: how much this decision is *for* (the debt in
+        # LIQUIDATE, the minimum bid in AUCTION), and what share of it the player
+        # could actually raise. Without these the liquidation phase is a decision
+        # about an invisible number.
+        amount = float(amount or 0)
+        parts.append(squash(amount / 1500.0))
+        if amount > 0:
+            reach = me.balance + self._raisable_cash(me)
+            parts.append(min(1.0, reach / amount))
+        else:
+            parts.append(1.0)   # nothing owed: trivially covered
+
+        # The clock. The episode is capped (``max_turns``) and the first-monopoly
+        # reward decays with the turn count, so a time-blind state cannot predict
+        # its own return.
+        parts.append(min(1.0, g.turn / float(self.max_turns)))
 
         return np.asarray(parts, dtype=np.float32)

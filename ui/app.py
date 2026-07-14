@@ -18,6 +18,7 @@ import time
 
 import pygame
 
+from engine.config import load_run_config
 from ui.board_layout import (tile_center, tile_rect, interior_offset,
                               TILE_FRAC)
 from models.tiles.properties.street_property import StreetProperty
@@ -2769,13 +2770,18 @@ class MonopolyApp:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _new_match(config, model, ai_names, fp_names, deterministic, seed):
+def _new_match(config, model, ai_names, fp_names, deterministic, seed,
+               cfg=None):
     """Seeds every RNG for one match and builds a fresh ``Game`` plus a decider
     for each AI seat: a ``GUIAIDecider`` (trained model) for ``ai_names`` and an
     ``FPBaselineDecider`` (FP heuristic bot) for ``fp_names``.
 
     FP seats are dealt the FP-A/B/C priority profiles round-robin (so three FP
     seats become exactly the trio, matching the training/eval opponent set).
+
+    ``cfg`` is the :class:`RewardConfig` the model was trained under (read from
+    its metadata sidecar); every seat's encoder shares it, exactly as the seats
+    of a training game share the env's one encoder.
 
     Seeds dice and card shuffles (stdlib ``random``), the turn-order shuffle,
     and the AI's policy sampling (torch), then prints the seed so the game can
@@ -2806,7 +2812,8 @@ def _new_match(config, model, ai_names, fp_names, deterministic, seed):
         from ui.ai_player import GUIAIDecider
         for name in ai_names:
             ai_deciders[name] = GUIAIDecider(
-                num_players=4, model=model, deterministic=deterministic)
+                num_players=4, model=model, deterministic=deterministic,
+                cfg=cfg)
 
     if fp_names:
         from ui.ai_player import FPBaselineDecider
@@ -2817,7 +2824,7 @@ def _new_match(config, model, ai_names, fp_names, deterministic, seed):
         for k, name in enumerate(sorted(fp_names)):
             label, priorities = fp_profiles[k % len(fp_profiles)]
             ai_deciders[name] = FPBaselineDecider(
-                num_players=4, priorities=priorities, name=label)
+                num_players=4, priorities=priorities, name=label, cfg=cfg)
 
     return game, ai_deciders
 
@@ -2869,6 +2876,10 @@ def main():
     # Load the model once if any trained-AI player was chosen (FP bots need no
     # model, so an all-FP or human+FP game loads nothing).
     model = None
+    # The economics the loaded model was *trained* under, read from its metadata
+    # sidecar. Without this the GUI would silently price tiles, trades and sets
+    # with today's defaults, which have changed repeatedly since past runs.
+    cfg = load_run_config(model_path) if model_path else None
     if ai_names and model_path:
         try:
             from sb3_contrib import MaskablePPO
@@ -2902,7 +2913,8 @@ def main():
                 else random.SystemRandom().randrange(2 ** 31))
         next_seed = None  # any restart is a fresh, differently-seeded game
         game, ai_deciders = _new_match(
-            config, model, ai_names, fp_names, args.deterministic, seed)
+            config, model, ai_names, fp_names, args.deterministic, seed,
+            cfg=cfg)
         result = MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
         if result != "restart":
             break
