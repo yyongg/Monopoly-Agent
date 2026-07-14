@@ -244,6 +244,15 @@ class GUIAIDecider:
 
         Returns ``(accepted: bool, value: float)`` -- the value is the engine's
         appraisal either way, so the GUI can show it in the log.
+
+        NOTE the two rules are **not** interchangeable: on identical one-for-one
+        swaps the model accepts ~83% where the formula accepts ~57%, and they
+        disagree on nearly half of all offers. Since ``build_offer`` only ever
+        emits one-for-one, self-play and ``validation.simulate`` exercise the
+        model branch exclusively -- so the accept rate they report is *not* the
+        rate a human sees when they stack tiles or buy with cash and land in the
+        formula branch. Widening the trade action space (so the observation can
+        encode the offers people actually make) is the real fix.
         """
         accepted, value = self.encoder.accepts(me, gain, lose, cash_delta)
         if value == float("-inf"):
@@ -255,7 +264,14 @@ class GUIAIDecider:
         self.encoder._cur_trade = {"recv": gain[0], "give": lose[0],
                                    "cash": cash_delta}
         try:
-            action = self._decide(seat, PHASE_TRADE_RESPOND, lose[0])
+            # ``amount`` must be the trade cash, exactly as the env passes it
+            # (rl_env._attempt_trade: ``decide(PHASE_TRADE_RESPOND, target,
+            # cash)``). Letting it default to 0 leaves two of the 265 features --
+            # the amount and its coverage -- describing a different offer than
+            # the one on the table, which is a state the policy never saw in
+            # training. Pinned by tests/test_trade_parity.py.
+            action = self._decide(seat, PHASE_TRADE_RESPOND, lose[0],
+                                  amount=cash_delta)
         finally:
             self.encoder._cur_trade = None
         return action == A_TRADE_ACCEPT, value

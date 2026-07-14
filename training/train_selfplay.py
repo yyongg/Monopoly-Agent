@@ -33,10 +33,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from engine.config import RewardConfig, save_run_metadata
 from engine.rl_env import MonopolyEnv
-from training.selfplay import SelfPlayCallback, make_selfplay_env
+from training.selfplay import (SelfPlayCallback, cgroup_memory_limit_gb,
+                               make_selfplay_env, max_envs_for_cap,
+                               memory_budget_gb)
 from training.train import WinRateCallback
-
-torch.set_num_threads(1)
 
 
 def main():
@@ -95,6 +95,17 @@ def main():
                              "FP-A/B/C trio as opponents")
     parser.add_argument("--opp-deterministic", action="store_true",
                         help="sampled opponents act greedily")
+    parser.add_argument("--opp-cache-size", type=int, default=3,
+                        help="snapshot policies each env worker keeps resident "
+                             "(LRU). THE memory knob: cost is n_envs x this. "
+                             "3 = one per opponent seat; raise it only together "
+                             "with the job's sbatch --mem")
+    parser.add_argument("--torch-threads", type=int, default=4,
+                        help="intra-op threads for the LEARNER's gradient "
+                             "update (workers stay single-threaded regardless). "
+                             "The update is serial, so this is a real speedup; "
+                             "measured ~1450 -> ~1710 steps/s going 1 -> 4, and "
+                             "flat beyond 4")
     # I/O.
     parser.add_argument("--save-path", default="runs/monopoly_ppo")
     parser.add_argument("--checkpoint-dir", default="runs/sp_checkpoints")
@@ -103,6 +114,24 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
+
+    # The LEARNER may use several threads; the workers may not.
+    #
+    # PPO alternates a parallel phase (n_envs worker processes collecting a
+    # rollout) with a serial one (this process doing n_epochs of SGD over the
+    # whole n_envs x n_steps buffer). The env vars above pin the *workers* to one
+    # thread each, which is right -- they are already parallel across processes,
+    # and oversubscribing cores just makes them fight. But those vars are
+    # inherited by this process too, and until now a hardcoded
+    # torch.set_num_threads(1) kept the learner on a single core as well.
+    #
+    # That is the wrong default, because the update is SERIAL and its cost grows
+    # with n_envs (a bigger buffer means proportionally more gradient steps). At
+    # 32 envs it was 55% of wall clock. Handing it 4 threads -- the workers are
+    # blocked waiting during the update anyway, so the cores are free -- measured
+    # ~1450 -> ~1710 steps/s with no change to what is learned. Gains flatten
+    # past 4: the net is small enough that thread overhead eats the rest.
+    torch.set_num_threads(max(1, args.torch_threads))
 
     # One RewardConfig for the whole run: it reaches every worker env, and it is
     # written to the model's metadata sidecar so the checkpoint can be tied back
@@ -113,11 +142,42 @@ def main():
     ) if v is not None}
     cfg = RewardConfig(**overrides)
 
+    # Envs are worker PROCESSES, so past one per allocated core they stop being
+    # parallel and just timeshare -- paying full memory for no throughput. Worth
+    # saying out loud, because a roomy --mem makes it look like headroom: at
+    # 128 GB the memory budget alone would wave through 286 envs on 64 cores.
+    cores = len(os.sched_getaffinity(0))
+    if args.n_envs > cores:
+        print(f"[cpu] WARNING: --n-envs {args.n_envs} exceeds the {cores} cores "
+              f"this job may use; the surplus workers will timeshare, not "
+              f"parallelise. Raise --cpus-per-task, or lower --n-envs.",
+              flush=True)
+
+    # Check the memory budget against the cgroup cap *before* spawning workers.
+    # An over-provisioned run does not fail cleanly: the kernel SIGKILLs a worker
+    # and the parent dies hundreds of thousands of steps later with an opaque
+    # BrokenPipeError. Better to refuse to start, and say why.
+    need = memory_budget_gb(args.n_envs, args.opp_cache_size)
+    cap = cgroup_memory_limit_gb()
+    print(f"[memory] {args.n_envs} envs x cache {args.opp_cache_size} "
+          f"~= {need:.1f} GB needed; "
+          f"cap = {f'{cap:.1f} GB' if cap else 'unlimited'}", flush=True)
+    if cap is not None and need > cap:
+        raise SystemExit(
+            f"\nRefusing to start: this run needs ~{need:.0f} GB but the job is "
+            f"capped at {cap:.0f} GB.\n"
+            f"Raise the cap (sbatch --mem={need:.0f}G, or the Memory field on "
+            f"the Open OnDemand form) -- it cannot be changed from inside a "
+            f"running job -- or lower --n-envs / --opp-cache-size.\n"
+            f"At this cap, --n-envs {max_envs_for_cap(cap, args.opp_cache_size)} "
+            f"fits.\n")
+
     venv = SubprocVecEnv([
         make_selfplay_env(i, args.seed, args.seat, args.reward_mode,
                           args.max_turns, args.pool_dir, args.baseline_prob,
                           args.opp_deterministic, fp_prob=args.fp_prob,
-                          gamma=args.gamma, cfg=cfg)
+                          gamma=args.gamma, cfg=cfg,
+                          cache_size=args.opp_cache_size)
         for i in range(args.n_envs)
     ])
     venv = VecMonitor(venv)

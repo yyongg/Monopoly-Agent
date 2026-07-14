@@ -256,7 +256,7 @@ def _snapshot_steps(path):
 
 def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
                       baseline_prob, opp_deterministic, fp_prob=0.0,
-                      gamma=0.999, cfg=None):
+                      gamma=0.999, cfg=None, cache_size=3):
     """Returns a picklable factory for one self-play ``MonopolyEnv`` worker.
 
     ``gamma`` is handed to the env so its potential-based shaping discounts with
@@ -265,6 +265,9 @@ def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
     :class:`~engine.config.RewardConfig` (a frozen dataclass, so it pickles
     across to the worker processes), which is what makes a coefficient sweep
     possible without monkeypatching module globals.
+
+    ``cache_size`` is the per-worker LRU of loaded snapshot policies, and it is
+    **the memory knob**: see :func:`memory_budget_gb`.
     """
 
     def _init():
@@ -273,19 +276,20 @@ def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
                           cfg=cfg)
         # Per-worker LRU cache of loaded snapshot policies.
         #
-        # MEMORY IS THE BINDING CONSTRAINT HERE, not disk. Training runs under a
-        # 32 GB cgroup cap (a SLURM allocation -- ``free`` shows the whole host
-        # and will happily lie to you), and there is one of these caches per env
-        # *worker process*. At --n-envs 64 that is 64 copies, on top of a few
-        # hundred MB of torch runtime each. Raising this to 6 is what OOM-killed
-        # the workers mid-run: the parent then dies with an opaque
-        # BrokenPipeError/EOFError and no traceback, because the kernel SIGKILLs
-        # the child. 3 == one per opponent seat, so an episode that draws three
-        # distinct snapshots still never reloads within itself.
+        # MEMORY IS THE BINDING CONSTRAINT HERE, not disk: there is one of these
+        # caches per env *worker process*, so the cost is (n_envs x cache_size)
+        # resident policies. The default of 3 is one per opponent seat, so an
+        # episode that draws three distinct snapshots still never reloads within
+        # itself; going above that buys reuse *across* episodes and little else.
+        # Raise it only alongside the job's --mem (see memory_budget_gb): it was
+        # a cache of 6 x 64 workers that blew a 32 GB cgroup cap and got the
+        # workers OOM-killed, which surfaces in the parent as an opaque
+        # BrokenPipeError/EOFError with no traceback (the kernel SIGKILLs the
+        # child, so there is nothing to raise).
         pool = OpponentPool(pool_dir, baseline_prob=baseline_prob,
                             fp_prob=fp_prob,
                             deterministic=opp_deterministic, seed=seed + rank,
-                            cache_size=3,
+                            cache_size=cache_size,
                             expected_obs_shape=env.observation_space.shape,
                             expected_action_n=env.action_space.n)
         # Read at each reset (see MonopolyEnv.reset); safe to set post-init.
@@ -293,3 +297,71 @@ def make_selfplay_env(rank, seed, seat, reward_mode, max_turns, pool_dir,
         return env
 
     return _init
+
+
+# Fitted against two *measured peaks* on this cluster (obs 265, net 256x256,
+# cache_size=3): 32 envs peaked at 14.7 GB and 64 envs at 27.0 GB resident. That
+# is 0.384 GB per additional worker and a 2.4 GB intercept for the learner.
+#
+# Splitting the per-worker slope into the fixed part and the cache part: a
+# forkserver child pays for its own torch runtime (~0.32 GB, the dominant term --
+# it is why envs are expensive here at all) plus its resident opponent policies.
+# An inference-only 265-dim 256x256 MaskablePPO policy is ~0.02 GB, so cache=3
+# adds ~0.06 and 0.32 + 0.06 = 0.38, recovering the measured slope.
+_GB_LEARNER = 2.4
+_GB_PER_ENV = 0.32              # torch runtime etc., excluding the snapshot cache
+_GB_PER_CACHED_POLICY = 0.02
+
+
+def memory_budget_gb(n_envs, cache_size=3, headroom=1.15):
+    """Rough RAM a self-play run needs, in GB -- what to pass to sbatch --mem.
+
+    The constants are fit to observed *peaks*, so the headroom here is genuine
+    slack rather than a second safety factor stacked on a conservative estimate:
+    15% covers the transient of several workers deserialising a snapshot at once.
+    Erring high is still the right bias -- overshooting --mem costs a little queue
+    time, while undershooting costs the entire run, and it does so silently
+    (see :func:`cgroup_memory_limit_gb`).
+    """
+    resident = (_GB_LEARNER
+                + n_envs * (_GB_PER_ENV + cache_size * _GB_PER_CACHED_POLICY))
+    return resident * headroom
+
+
+def max_envs_for_cap(cap_gb, cache_size=3, headroom=1.15):
+    """Largest ``--n-envs`` that fits in ``cap_gb`` -- the inverse of the above."""
+    per_env = _GB_PER_ENV + cache_size * _GB_PER_CACHED_POLICY
+    return max(1, int((cap_gb / headroom - _GB_LEARNER) / per_env))
+
+
+def cgroup_memory_limit_gb():
+    """This process's cgroup-v2 memory cap in GB, or ``None`` if uncapped.
+
+    Under SLURM this is the real ceiling and ``free`` does **not** show it --
+    ``free`` reports the whole physical host (251 GB here), while the job is held
+    to its ``--mem`` (32 GB), so the host looks reassuringly empty right up until
+    a worker is OOM-killed. The limit is set at submission and is not writable
+    from inside the job. Walks up from the process's own cgroup because the cap
+    may sit on any ancestor (SLURM sets it on the job and step scopes, not the
+    leaf task).
+    """
+    try:
+        with open("/proc/self/cgroup") as fh:
+            rel = fh.readline().strip().split(":")[-1]
+    except OSError:
+        return None
+    path = os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+    limits = []
+    while path.startswith("/sys/fs/cgroup"):
+        try:
+            with open(os.path.join(path, "memory.max")) as fh:
+                raw = fh.read().strip()
+            if raw != "max":
+                limits.append(int(raw) / 1024 ** 3)
+        except (OSError, ValueError):
+            pass
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return min(limits) if limits else None

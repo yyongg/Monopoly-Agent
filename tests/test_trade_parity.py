@@ -16,7 +16,7 @@ will never meet in the GUI.
 import numpy as np
 import pytest
 
-from engine.constants import A_TRADE_ACCEPT
+from engine.constants import A_TRADE_ACCEPT, PHASE_TRADE_RESPOND
 from engine.rl_env import MonopolyEnv
 from tests.conftest import give, group_named
 from ui.ai_player import GUIAIDecider
@@ -145,3 +145,70 @@ def test_a_poor_agent_keeps_its_rent_cushion(env):
     if env_offer is not None:
         _, cash = env_offer
         assert cash <= max(0, int(red.balance - reserve))
+
+
+# --- Parity on the *responding* side -------------------------------------
+#
+# The tests above pin how an offer is BUILT. They say nothing about the
+# observation handed to the policy when it is asked to ANSWER one -- which is a
+# separate call site in each path, and is exactly where `amount` was left at its
+# default of 0 in the GUI while the env passed the trade cash.
+
+
+def _respond_obs(env, seat, recv, give_tile, cash, amount):
+    """The observation a PHASE_TRADE_RESPOND decision is encoded from."""
+    enc = env.encoder
+    enc._cur_trade = {"recv": recv, "give": give_tile, "cash": cash}
+    try:
+        return enc._encode_obs(seat, PHASE_TRADE_RESPOND, give_tile, amount)
+    finally:
+        enc._cur_trade = None
+
+
+def test_trade_response_obs_matches(env):
+    """The GUI must ask the model the *same question* the env asks it.
+
+    ``rl_env._attempt_trade`` responds with ``decide(PHASE_TRADE_RESPOND, target,
+    cash)``; the GUI's ``evaluate_trade`` must pass that same cash as ``amount``.
+    Letting it default to 0 changed two of the 265 features (the amount and its
+    coverage) and flipped ~3% of accept decisions -- a divergence invisible to
+    the offer-construction tests above, because the offer is identical either way.
+    """
+    enc = env.encoder
+    red, blue = env.game.players[0], env.game.players[1]
+    orange = group_named(enc, "orange")
+    brown = group_named(enc, "brown")
+
+    give(red, orange[0], orange[1], brown[0])
+    give(blue, orange[2])
+    red.balance = 5000
+
+    offer = enc.build_offer(red, orange[2], tier=1, overpay=True)
+    assert offer is not None and offer.cash > 0, "need a cash-carrying offer"
+
+    blue_seat = env.game.players.index(blue)
+    as_trained = _respond_obs(env, blue_seat, offer.give, orange[2],
+                              offer.cash, offer.cash)
+    amount_dropped = _respond_obs(env, blue_seat, offer.give, orange[2],
+                                  offer.cash, 0)
+
+    # Guard the guard: if these ever coincide, the test has stopped testing.
+    assert not np.array_equal(as_trained, amount_dropped), (
+        "the amount feature no longer affects the observation -- this test is "
+        "no longer pinning anything")
+
+    gui = GUIAIDecider(env.num_players, model=None)
+    gui.bind(env.game, env.ownable)
+
+    seen = {}
+    gui._decide = lambda seat, phase, prop=None, amount=0: seen.update(
+        obs=_respond_obs(env, seat, offer.give, prop, offer.cash, amount)
+    ) or A_TRADE_ACCEPT
+    gui.model = object()   # take the model branch, not the formula fallback
+
+    gui.evaluate_trade(blue, red, [offer.give], [orange[2]], offer.cash)
+
+    assert "obs" in seen, "the GUI never reached the model branch"
+    np.testing.assert_array_equal(
+        seen["obs"], as_trained,
+        "the GUI encodes a trade response differently than the training env")
