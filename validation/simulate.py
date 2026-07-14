@@ -28,7 +28,7 @@ Usage:
 
 import argparse
 import os
-from collections import Counter, defaultdict
+from collections import Counter
 
 import numpy as np
 
@@ -142,53 +142,39 @@ def play_one_game(env, policy, seed, max_turns):
     # acquired legitimately (bought, won at auction, or traded for).
     inherited_ids = set()
 
-    orig_declare = g.declare_bankrupt
-
-    def tracking_declare(player, creditor=None):
+    def on_bankrupt(player, creditor, estate):
         if creditor is not None and not creditor.bankrupt:
-            for prop in player.properties:
-                inherited_ids.add(id(prop))  # estate passes to the creditor
+            inherited_ids.update(id(p) for p in estate)   # passes to the creditor
         else:
-            for prop in player.properties:
-                inherited_ids.discard(id(prop))  # estate returns to the bank
-        orig_declare(player, creditor)
+            inherited_ids.difference_update(id(p) for p in estate)  # to the bank
 
-    g.declare_bankrupt = tracking_declare
+    g.on_bankrupt = on_bankrupt
     # A legitimate (re)acquisition -- buy, auction win, or trade -- clears the
-    # inherited flag; bankruptcy inheritance doesn't fire this hook.
-    g.on_acquire = lambda player, prop, source="trade": inherited_ids.discard(id(prop))
+    # inherited flag. (Inheritance fires on_acquire with source="inherit", which
+    # must *not* clear it.)
+    def on_acquire(player, prop, source="trade"):
+        if source != "inherit":
+            inherited_ids.discard(id(prop))
 
-    # Trade analytics: count every proposal actually *offered* to a partner and
-    # whether it was accepted (the swap executed, so the target changed hands) or
-    # rejected. Wrap the env's trade builder; ``_attempt_trade`` returns early
-    # without offering anything when it can't propose or has no tile to give, so
-    # those non-offers are not counted.
+    g.on_acquire = on_acquire
+
+    # Trade analytics: every proposal actually offered to a partner, and whether
+    # it was accepted. Reported by the env itself (``on_trade_offer``) rather
+    # than reconstructed by monkey-patching its private trade builder -- an
+    # offer of ``None`` means no sane deal existed, so nothing was proposed.
     trades = {"accepted": 0, "rejected": 0, "accepted_set_completing": 0}
-    class_attempt = type(env)._attempt_trade
 
-    def counting_attempt(initiator, target, tier=1):
-        enc = env.encoder
-        # Ask the *same* builder the env is about to use, so "an offer was made"
-        # here means exactly what it means there (it declines to build one when
-        # the trade is unproposable, there is nothing to give, or the swap loses
-        # value at any price).
-        offered = enc.build_offer(
-            initiator, target, tier,
-            overpay=env._overpay_for_set(initiator, target)) is not None
-        # Whether acquiring ``target`` would finish a monopoly for the initiator
-        # (checked *before* the swap, while it still lacks the tile).
-        completes = offered and enc._completes_monopoly_for(initiator, target)
-        before = target.owner
-        class_attempt(env, initiator, target, tier)
-        if offered:
-            if target.owner is not before:
-                trades["accepted"] += 1
-                if completes:
-                    trades["accepted_set_completing"] += 1
-            else:
-                trades["rejected"] += 1
+    def on_trade_offer(initiator, partner, offer, accepted, completes):
+        if offer is None:
+            return  # nothing was put to the partner
+        if accepted:
+            trades["accepted"] += 1
+            if completes:
+                trades["accepted_set_completing"] += 1
+        else:
+            trades["rejected"] += 1
 
-    env._attempt_trade = counting_attempt
+    env.on_trade_offer = on_trade_offer
 
     ever_monopolies = [set() for _ in range(n)]
     first_monopoly_turn = [None] * n

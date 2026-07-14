@@ -42,7 +42,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from engine.rl_env import base_rent
+from engine.observation import base_rent
 from data.board_tiles import build_board_tiles
 from models.tiles.properties.street_property import StreetProperty
 
@@ -91,7 +91,8 @@ def board_heatmap(tiles, path):
                 fontsize=6.5, wrap=True)
         ax.text(c, r + 0.2, f"{t['frequency'] * 100:.2f}%", ha="center",
                 va="center", fontsize=7, fontweight="bold")
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
     ax.set_title("Landing share per tile (% of all landings)", fontsize=14)
     fig.colorbar(im, ax=ax, shrink=0.6, label="% of landings")
     fig.tight_layout()
@@ -109,7 +110,8 @@ def landing_frequency(tiles, board_size, path):
     y = np.arange(len(ts))
     ax.barh(y, mult, color=colors, edgecolor="#00000033")
     ax.axvline(1.0, color="k", ls="--", lw=1, label="even (1/40)")
-    ax.set_yticks(y); ax.set_yticklabels(names, fontsize=8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(names, fontsize=8)
     ax.invert_yaxis()
     ax.set_xlabel("landing traffic  (x an average tile)")
     ax.set_title("How often each tile is landed on")
@@ -130,7 +132,8 @@ def _value_chart(tiles, values, title, xlabel, path, top=None):
     fig, ax = plt.subplots(figsize=(10, max(6, 0.32 * len(ts))))
     y = np.arange(len(ts))
     ax.barh(y, vals, color=colors, edgecolor="#00000033")
-    ax.set_yticks(y); ax.set_yticklabels([t["name"] for t in ts], fontsize=8)
+    ax.set_yticks(y)
+    ax.set_yticklabels([t["name"] for t in ts], fontsize=8)
     ax.invert_yaxis()
     ax.set_xlabel(xlabel)
     ax.set_title(title)
@@ -157,7 +160,6 @@ def main():
     # Map each ownable tile to its engine object so rent uses the same
     # ``base_rent`` / rent_table the agent sees.
     by_pos = {t.pos: t for t in build_board_tiles()}
-    uniform = 1.0 / board_size
 
     ownable, exp_income, exp_hotel, buy_yield = [], [], [], []
     dev_tiles, dev_roi = [], []

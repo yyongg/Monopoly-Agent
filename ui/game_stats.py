@@ -82,18 +82,15 @@ class GameStats:
     def _install_hooks(self):
         self.game.on_auction_end = self._on_auction_end
         self.game.on_acquire = self._on_acquire
-        orig_declare = self.game.declare_bankrupt
+        self.game.on_bankrupt = self._on_bankrupt
 
-        def tracking_declare(player, creditor=None):
-            if creditor is not None and not creditor.bankrupt:
-                for prop in player.properties:
-                    self._inherited_ids.add(id(prop))   # estate passes on
-            else:
-                for prop in player.properties:
-                    self._inherited_ids.discard(id(prop))  # back to the bank
-            orig_declare(player, creditor)
-
-        self.game.declare_bankrupt = tracking_declare
+    def _on_bankrupt(self, player, creditor, estate):
+        """A bankrupt player's estate is inherited, not won: flag it so it does
+        not count toward the "completed through play" monopoly tempo."""
+        if creditor is not None and not creditor.bankrupt:
+            self._inherited_ids.update(id(p) for p in estate)   # estate passes on
+        else:
+            self._inherited_ids.difference_update(id(p) for p in estate)  # to bank
 
     def _completes_for(self, player, prop, group):
         """Whether ``player`` owns every tile in ``group`` except ``prop``."""
@@ -110,8 +107,11 @@ class GameStats:
          else self.non_completion_bids).append((bid, prop.price))
 
     def _on_acquire(self, player, prop, source="trade"):
-        # A legitimate (re)acquisition clears any inherited flag on the tile.
-        self._inherited_ids.discard(id(prop))
+        # A legitimate (re)acquisition -- bought, won at auction, traded for --
+        # clears any inherited flag. Inheritance itself now fires this hook too
+        # (source="inherit"), and must NOT clear the flag it was just given.
+        if source != "inherit":
+            self._inherited_ids.discard(id(prop))
         group = self._group_of.get(id(prop))
         if group is None:
             return

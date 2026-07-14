@@ -77,28 +77,21 @@ from data.board_tiles import build_board_tiles
 from data.decks import build_chance_deck, build_community_deck
 
 # Structural ids, tuning knobs, the observation encoder, and reward shaping live
-# in dedicated modules; re-export the public names so existing
-# ``from engine.rl_env import PHASE_BUY, MonopolyEnv, ...`` imports keep working.
+# in dedicated modules. This module used to re-export ~20 further names purely so
+# that ``from engine.rl_env import TRADE_INCOME_WEIGHT`` kept resolving after the
+# split; nothing imported them, so they are gone. Import the coefficients from
+# :mod:`engine.config` and the valuations from :mod:`engine.observation`.
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE, PHASE_TERMINAL,
-    PHASE_AUCTION, PHASE_TRADE_RESPOND, NUM_PHASES,
+    PHASE_AUCTION, PHASE_TRADE_RESPOND,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
     NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS, NUM_TRADE_TIERS,
-    TRADE_CASH_TIERS, BID_FRACTIONS, BID_CEILING_MULT, decode_trade_action,
+    BID_FRACTIONS, BID_CEILING_MULT, decode_trade_action,
 )
-from engine.config import (
-    RewardConfig, DEFAULT_REWARD_CONFIG,
-    ACQUISITION_PREMIUM, MONOPOLY_BONUS, DENIAL_VALUE_WEIGHT, TRADE_INCOME_WEIGHT,
-    DENIAL_BONUS_COEF, ACQUISITION_BONUS_COEF, AUCTION_ACQUISITION_BONUS_COEF,
-    BUY_PREFERENCE_COEF, BUILD_BONUS_COEF, BUILD_ROI_REF_HOUSE_COST,
-    SET_ROI_REF, SET_QUALITY_CLAMP, PROFIT_SCALE, SET_BONUS, KEEP_PREMIUM,
-)
-from engine.observation import (
-    ObsEncoder, observation_length, load_landing_frequencies, base_rent,
-    build_groups, safe_default, LANDING_FREQ_PATH,
-)
+from engine.config import RewardConfig
+from engine.observation import ObsEncoder, observation_length, build_groups
 from engine.rewards import RewardMixin
 
 try:  # Gymnasium is optional; the env works standalone without it.
@@ -251,6 +244,10 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
         self.encoder._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
         self.encoder._traded_this_manage = set()  # trade targets tried this MANAGE phase
+        # Optional observer, called as on_trade_offer(initiator, partner, offer,
+        # accepted, completes_set) for every trade the agent or an opponent
+        # proposes. Left as None in training; the analytics harness subscribes.
+        self.on_trade_offer = None
         self._prev_potential = 0.0  # last shaping potential (see rewards.py)
         self._pending_bonus = 0.0   # denial reward queued by the on_acquire hook
         self._penalty_turn = -1     # last turn the solvency penalty was charged
@@ -285,7 +282,6 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._opponent_policies = self._resolve_opponents(chosen)
         self._wire_deciders()
 
-        controlled = self.game.players[self.seat]
         # Shortfalls are dispatched by payer: the agent and any policy-driven
         # opponents may liquidate; baseline opponents fall through to bankruptcy.
         self.game.on_shortfall = self._on_shortfall
@@ -723,8 +719,11 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             initiator, target, tier,
             overpay=self._overpay_for_set(initiator, target))
         if offer is None:
+            self._report_trade(initiator, partner, None, False, False)
             return
         give, receive, cash = offer
+        # Evaluated *before* the swap, while the initiator still lacks the tile.
+        completes = self.encoder._completes_monopoly_for(initiator, target)
 
         partner_seat = g.players.index(partner)
         decide = self._deciders.get(partner_seat)
@@ -738,8 +737,21 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         else:
             accept, _ = self.encoder.accepts(partner, [give], receive, cash)
 
-        if accept:
-            g.execute_trade(initiator, partner, [give], receive, cash)
+        executed = bool(
+            accept and g.execute_trade(initiator, partner, [give], receive, cash))
+        self._report_trade(initiator, partner, offer, executed, completes)
+
+    def _report_trade(self, initiator, partner, offer, accepted, completes):
+        """Announces the outcome of a trade proposal to ``on_trade_offer``.
+
+        A first-class observation point for the analytics (accept/reject rates,
+        set-completing trades), which used to get at this by monkey-patching
+        ``_attempt_trade`` itself -- so any change to a private method silently
+        broke the harness. ``offer`` is ``None`` when no sane offer could be
+        built (nothing to give, or a swap that loses value at any price).
+        """
+        if self.on_trade_offer is not None:
+            self.on_trade_offer(initiator, partner, offer, accepted, completes)
 
     # -- Legal-action masks -------------------------------------------------
     # -- Observation & reward ----------------------------------------------

@@ -55,6 +55,15 @@ class Game:
         # for auction analytics. Left as None otherwise.
         self.on_auction_end = None
 
+        # Optional hook: called as on_bankrupt(player, creditor, estate) the
+        # moment a player goes bankrupt, *before* their property moves, so an
+        # observer can see the estate that is about to change hands (``estate``
+        # is that list of properties; ``creditor`` is None for a bankruptcy to
+        # the bank). The analytics use it to discount holdings that were
+        # inherited from a rival rather than won through play -- which they used
+        # to do by monkey-patching this method.
+        self.on_bankrupt = None
+
     def announce(self, message):
         """
         Reports an automatic game event via the optional ``notify`` hook so the
@@ -420,6 +429,10 @@ class Game:
                 when the debt was to the bank.
         """
         player.bankrupt = True
+
+        if self.on_bankrupt is not None:
+            # Fired before the estate moves, so an observer can still see it.
+            self.on_bankrupt(player, creditor, list(player.properties))
 
         if creditor is not None and not creditor.bankrupt:
             self.announce(

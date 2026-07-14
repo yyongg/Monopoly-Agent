@@ -4,3 +4,21 @@
 # with ``PYTHONPATH=.``. Teach pytest the same root so ``pytest`` just works.
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+extend-exclude = [".venv", "runs"]
+
+[tool.ruff.lint]
+# Ruff's default set: pyflakes (F -- the findings that are actually bugs, like
+# an unused import left behind by a refactor or a name that doesn't exist) plus
+# the pycodestyle errors that aren't purely cosmetic. Line length is checked by
+# eye here, not by the linter -- E501 would flag 30-odd pre-existing lines and
+# bury the real findings.
+select = ["E4", "E7", "E9", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# The trainers must set OMP_NUM_THREADS & co. *before* numpy/torch are imported,
+# so their imports are deliberately not at the top of the file.
+"training/train.py" = ["E402"]
+"training/train_selfplay.py" = ["E402"]

@@ -1,5 +1,5 @@
-# Reinforcement-learning dependencies for training an agent (train.py /
-# evaluate.py) on the Gym-style engine/rl_env.py environment.
+# Reinforcement-learning dependencies for training and evaluating an agent
+# (training/, validation/) on the Gym-style engine/rl_env.py environment.
 # Install with:  pip install -r requirements-rl.txt
 #
 # These are NOT needed to run the game itself (engine is pure standard library)
@@ -15,5 +15,11 @@ sb3_contrib==2.9.0
 torch==2.12.1
 numpy==2.5.0
 
-# Optional: enables TensorBoard logging in train.py (training works without it).
+# Dashboards written by validation/evaluate.py, validation/simulate.py and
+# validation/traffic_plots.py (`--plot`). These import it unconditionally, so it
+# is a real dependency of the validation tools, not an optional extra.
+matplotlib==3.11.0
+
+# Optional: enables TensorBoard logging during training (training works without
+# it -- the trainer detects its absence and carries on).
 # tensorboard

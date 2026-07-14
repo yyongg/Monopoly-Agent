@@ -26,7 +26,7 @@ from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
     PHASE_AUCTION, PHASE_TRADE_RESPOND, NUM_PHASES,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
-    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
+    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
     A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
     NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, NUM_TRADE_TIERS, TRADE_CASH_TIERS,
     BID_FRACTIONS, trade_action,
@@ -36,15 +36,14 @@ from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
 
 
-# The landing-frequency table is *part of the observation definition* (it scales
-# every ``_traffic``-derived feature and valuation), so the canonical copy is
-# tracked static data next to the board itself. ``runs/`` is only a fallback for
-# a locally regenerated table -- it is gitignored, and a silent fall back to a
-# uniform prior there would hand a fresh clone a different observation encoding
-# than the shipped model was trained on.
-# Anchored to the repo root, not the working directory: the table used to be
-# looked up at the relative path "runs/board_visits.json", so *where you ran
-# from* silently decided which observation encoding you got.
+# The landing-frequency table is *part of the observation definition* -- it scales
+# every ``_traffic``-derived feature and valuation -- so the canonical copy is
+# tracked static data next to the board itself, and ``runs/`` is only a fallback
+# for a locally regenerated one. It used to live solely in gitignored ``runs/``,
+# reached by a *relative* path, so a fresh clone (or simply running from another
+# directory) silently swapped in a uniform prior: a different observation
+# encoding than the shipped model was trained on, with no warning. Hence both the
+# repo-root anchor below and the hard failure in ``load_landing_frequencies``.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LANDING_FREQ_PATH = os.path.join(_REPO_ROOT, "data", "board_visits.json")
 LANDING_FREQ_FALLBACKS = (os.path.join(_REPO_ROOT, "runs", "board_visits.json"),)
