@@ -61,10 +61,12 @@ to a live game, it is the single place that computes:
 - the **observation vector** the policy sees,
 - the **legal-action mask** for each decision phase,
 - every economic **valuation** — tile value, trade value, bid value, balancing
-  cash, "completes my set", "denies an opponent", rent exposure, and more,
+  cash, "completes my set", "denies an opponent", rent exposure, **how strong a
+  monopoly is** (`_set_strength`), and more,
 - and **the trade rules**: `build_offer()` constructs every proposal (which tile to
   hand over, how much cash), `accepts()` decides every offer. One implementation
-  each, called by the training env and the GUI alike.
+  each, called by the training env and the GUI alike. `accepts()` also *gates the
+  mask* at both ends — see the trade band below.
 
 Both the training env and the GUI's AI ([`ui/ai_player.py`](ui/ai_player.py)) import
 and use this same encoder, guaranteeing train/play parity. That guarantee is
@@ -91,6 +93,12 @@ was wrong by 3× on a contested trade.
 - Trade proposals use a **target + cash-tier** scheme: the agent picks which tile to
   acquire and a cash tier (0.75× / 1.0× / 1.25× the engine's balancing amount); the
   engine chooses the give-tile and computes the balancing cash.
+- **The trade band is gated at both ends by `accepts()`**, the same rule the FP bots
+  use. A *proposal* is only offered when the deal it would build is one the partner
+  could actually take (`_offer_would_clear`); *accepting* is only legal when the offer
+  on the table is non-negative by the agent's own valuation. Rejecting is always
+  legal. Without these the policy proposed ~2,800 hopeless offers a game and accepted
+  ~85% of everything put to it — see the trade gotchas below.
 
 > **Obs/action shape is locked.** Any change to the observation dimension or action
 > count requires a from-scratch retrain — saved models are shape-locked to
@@ -111,12 +119,17 @@ The reward ([`engine/rewards.py`](engine/rewards.py)) has a **shaped** and a
   the end is what stops the last step paying out the agent's whole net worth
   (a `+5..+12` spike that dwarfed the `±1` saying who won, training it to *end rich*
   rather than to *win*).
+- Net worth prices a **completed set by how good that set actually is**: each
+  fully-owned group contributes `group price × _set_strength` (see the gotchas), so
+  losing the orange set costs the agent far more shaped reward than losing the
+  utilities. `set_strength_reward_weight` scales the tilt — `0` recovers the old flat
+  behaviour exactly, which makes it a clean ablation baseline.
 - On top of that sit one-time bonuses for acquiring tiles, building houses, being
-  **first** to a set, and **denying** an opponent a set, plus a **solvency penalty**
-  that keeps a rent-sized cash cushion so the agent does not spend itself into
-  bankruptcy. It is charged **once per turn**, not per decision: the number of
-  decisions in a turn is the agent's own choice, so a per-decision drag could be
-  shrunk by simply doing less.
+  **first** to a set, and **denying** an opponent a set (the last two also weighted by
+  set strength), plus a **solvency penalty** that keeps a rent-sized cash cushion so
+  the agent does not spend itself into bankruptcy. It is charged **once per turn**,
+  not per decision: the number of decisions in a turn is the agent's own choice, so a
+  per-decision drag could be shrunk by simply doing less.
 - **Terminal reward** ∈ `[-1, +1]`: bankruptcy `−1`, sole survivor `+1`, otherwise
   net-worth rank among the survivors. A **turn-cap timeout is a truncation, not a
   termination**: the game did not really end, so no final payoff is invented and the
@@ -215,6 +228,10 @@ python -m training.train_selfplay --timesteps 15000000 --n-envs 32 --fp-prob 0.3
 # Sweep a reward coefficient (RewardConfig is injectable; nothing to monkeypatch)
 python -m training.train_selfplay --solvency-penalty-coef 0.05 --save-path runs/sweep_005
 
+# The trade-economics knobs (see the trade gotchas below before touching these)
+python -m training.train_selfplay --trade-denial-weight 0.5 --trade-monopoly-mult 3.0 \
+    --set-strength-clamp 0.3 2.0 --set-strength-reward-weight 1.0
+
 # Evaluate vs the strong FP trio (the meaningful benchmark)
 PYTHONPATH=. python -m validation.evaluate runs/monopoly_ppo --episodes 200 --opponent fp
 
@@ -240,6 +257,39 @@ and the git SHA it was trained with. It loads and runs in both evaluation and th
   `ObsEncoder.accepts()`. There used to be four implementations (two offer builders,
   three accept rules) kept in step by comment discipline, and they had already
   drifted apart. Add trade logic there, not in the env or the UI.
+- **Blocking must be worth less than completing, or nothing can trade.**
+  `trade_denial_weight` is the single most load-bearing trade knob. At `1.0` a
+  set-completing tile is worth `base + set_value` to the acquirer *and*
+  `base + 1.0 × set_value` to the holder who blocks — the same number. The swap is
+  **zero-sum**, there are no gains from trade, and `accepts()` correctly refuses
+  essentially every offer: monopolies stop forming and games drag to the turn cap.
+  It sits at `0.5` so a bargaining range exists. This was invisible for a long time
+  because the learned policy *ignored* `accepts()` and traded anyway (badly); the
+  accept-guard did not cause the problem, it exposed it. It is also why the FP bots
+  traded so little. Note this is **split from `denial_value_weight`**, which still
+  governs auction blocking only.
+- **Sets are not equal: `_set_strength` weighs each one.** A per-group multiplier
+  from *landing traffic × full-development rent*, normalised so the average group
+  scores ~1.0 and clamped by `set_strength_clamp` — so it **redistributes** the flat
+  `trade_monopoly_mult` across sets rather than changing the overall scale. It lands
+  around green 1.58 / red 1.51 / orange 1.40 versus utilities and brown pinned to the
+  0.30 floor. Before it, a 2-tile $300 Utility "monopoly" was priced like the orange
+  set (~$1,800 in trade cash with the first-monopoly weight), and the agents
+  ping-ponged it every few turns: one tile changed hands **424 times in a single
+  game** and ~$59k/game in trade cash sloshed around a board where you start with
+  $1,500. One definition, shared by trades and the reward.
+- **The trade band is gated by `accepts()` at both ends** (proposal *and* accept).
+  Dropping either gate re-opens a pathology, and they are not interchangeable:
+  without the accept-guard the learned responder took ~85% of everything, including
+  handing over completed monopolies; without the proposal gate it re-offered the same
+  refused deal every MANAGE phase forever (~2,800 rejected proposals/game, 100% of
+  them refused by the guard). A healthy run looks like ~4 accepted trades/game, all
+  of them set-completing, and **every rejection a policy choice rather than a wall**
+  (`reject: guard forbade accept` should be ~0).
+- **`overpay_seats` must agree with who actually overpays.** The proposal gate builds
+  the offer to test it, so it needs the same `overpay` flag the caller will use, or it
+  gates on a deal nobody will propose. The env sets it in `_wire_deciders`, the GUI in
+  `bind()`; `None` means every seat overpays (the right default standalone/in tests).
 - **Obs/action shape changes ⇒ from-scratch retrain.** All saved models are locked to
   `265 / 211`. The opponent pool checks the shape and skips stale snapshots.
 - **The landing-frequency table is part of the observation.** `data/board_visits.json`
@@ -250,7 +300,9 @@ and the git SHA it was trained with. It loads and runs in both evaluation and th
   deliberately kept at the plain sticker premium even though *trade* valuations prize
   monopolies far higher; the health metric `mean_set_completion_bid_ratio` (from
   `simulate.py`) should stay near retail. Do not "fix" auctions with the trade
-  multiplier.
+  multiplier. This is why the denial weight is **two knobs**: `denial_value_weight`
+  (auctions, `1.0`) and `trade_denial_weight` (trades, `0.5`). `_set_strength` is
+  likewise trade/reward-only and deliberately not applied to `_bid_value`.
 - **Analytics observe, they don't patch.** `simulate.py` used to monkey-patch the
   env's private methods to count trades and bankruptcies, so any refactor silently
   broke it. The engine now reports these (`Game.on_bankrupt`,
@@ -259,7 +311,15 @@ and the git SHA it was trained with. It loads and runs in both evaluation and th
   loops → phantom timeouts); use `--stochastic` there, but not against FP.
 - **`simulate.py`'s "monopolies ever completed" is cumulative** (a set counts even if
   later traded away, and re-counts for each owner). "Monopolies held at game end" is
-  the number you see on the board.
+  the number you see on the board. The gap between the two is the **churn metric**: a
+  winner completing 6.8 sets but holding 3.65 means half of them were traded away
+  again. Healthy is ever ≈ held (currently 2.00 vs 1.97).
+- **Game length and first-monopoly tempo are noise-dominated below ~100 games.**
+  Seed choice swamps them: the *same* config measured 416 turns on seeds 0–29 and 256
+  turns on seeds 100–125, and a `trade_monopoly_mult` sweep at n=12 ranked 1.5 worse
+  than both 1.0 and 2.0. Do not tune against these at small n — it is how you end up
+  chasing a coefficient that was never the cause. The trade-volume metrics (hundreds
+  of samples per game) are stable and can be trusted much sooner.
 
 ---
 
