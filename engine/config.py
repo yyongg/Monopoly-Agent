@@ -36,7 +36,20 @@ class RewardConfig:
     monopoly_bonus: float = 1.0
 
     # -- Trade / bid valuation ---------------------------------------------
-    denial_value_weight: float = 1.0   # weight on the blocking (deny-opponent) term
+    # Weight on the blocking (deny-opponent) term in *auction* bidding
+    # (``_bid_value``). Kept at 1.0: auction economics are a standing constraint.
+    denial_value_weight: float = 1.0
+    # Weight on the blocking term in *trade* valuation (``_trade_value``), split
+    # from the auction weight above so it can be tuned without touching auctions.
+    #
+    # This knob is what makes trade possible at all. At 1.0 a set-completing tile
+    # is worth exactly as much to the holder (who blocks) as to the acquirer (who
+    # completes), so the swap is **zero-sum** and there are no gains from trade --
+    # ``accepts()`` then correctly refuses essentially every offer, monopolies
+    # stop forming, and games drag to the turn cap. Below 1.0 blocking is worth
+    # less than completing, which opens a bargaining range: a deal clears at a
+    # price both sides gain from, while the accept-guard still blocks a giveaway.
+    trade_denial_weight: float = 0.5
     # Turns of expected rent folded into a tile's trade value (list price +
     # trade_income_weight * landing-traffic * nominal rent).
     trade_income_weight: float = 3.0
@@ -101,9 +114,27 @@ class RewardConfig:
     # only its distribution across colours shifts.
     build_roi_ref_house_cost: float = 95.0
     # Set-completion tilt: avg group dev-ROI / set_roi_ref, clamped so it nudges
-    # rather than dominates the sticker/traffic value in a trade.
+    # rather than dominates the sticker/traffic value in a trade. (Superseded in
+    # the trade path by set_strength below, which weighs traffic AND absolute
+    # rent; kept for back-compat / the sidecar round-trip.)
     set_roi_ref: float = 1.3
     set_quality_clamp: tuple = (0.75, 1.25)
+
+    # -- Per-set strength: value a monopoly by its real earning power ------
+    # A single per-group multiplier from traffic x full-development rent,
+    # normalised so the *average* group scores ~1.0 (it redistributes the flat
+    # trade_monopoly_mult across sets rather than changing the overall scale).
+    # High-traffic money sets (orange/red) land well above 1; cheap low-traffic
+    # sets (utilities/brown) land near the floor -- which stops a 2-tile $300
+    # Utility "monopoly" from being priced like the orange set and ping-ponged
+    # for cash. Computed in ObsEncoder._set_strength and clamped to this range.
+    set_strength_clamp: tuple = (0.3, 2.0)
+    # How strongly the *reward's* owned-monopoly net worth (and the one-time
+    # first-monopoly / denial bonuses) tilt by set strength: effective strength
+    # is 1 + w*(strength - 1). w=0 recovers the old flat behaviour exactly (a
+    # safe ablation baseline); w=1 is full strength. The trade valuation always
+    # uses full strength; this knob only governs the reward shaping.
+    set_strength_reward_weight: float = 1.0
 
     # -- Observation scaling -----------------------------------------------
     # Divides the expected-profit-per-turn dollar figure into feature range.
@@ -126,6 +157,7 @@ DEFAULT_REWARD_CONFIG = RewardConfig()
 ACQUISITION_PREMIUM = DEFAULT_REWARD_CONFIG.acquisition_premium
 MONOPOLY_BONUS = DEFAULT_REWARD_CONFIG.monopoly_bonus
 DENIAL_VALUE_WEIGHT = DEFAULT_REWARD_CONFIG.denial_value_weight
+TRADE_DENIAL_WEIGHT = DEFAULT_REWARD_CONFIG.trade_denial_weight
 TRADE_INCOME_WEIGHT = DEFAULT_REWARD_CONFIG.trade_income_weight
 DENIAL_BONUS_COEF = DEFAULT_REWARD_CONFIG.denial_bonus_coef
 FIRST_MONOPOLY_BONUS_COEF = DEFAULT_REWARD_CONFIG.first_monopoly_bonus_coef
@@ -139,6 +171,8 @@ BUILD_BONUS_COEF = DEFAULT_REWARD_CONFIG.build_bonus_coef
 BUILD_ROI_REF_HOUSE_COST = DEFAULT_REWARD_CONFIG.build_roi_ref_house_cost
 SET_ROI_REF = DEFAULT_REWARD_CONFIG.set_roi_ref
 SET_QUALITY_CLAMP = DEFAULT_REWARD_CONFIG.set_quality_clamp
+SET_STRENGTH_CLAMP = DEFAULT_REWARD_CONFIG.set_strength_clamp
+SET_STRENGTH_REWARD_WEIGHT = DEFAULT_REWARD_CONFIG.set_strength_reward_weight
 PROFIT_SCALE = DEFAULT_REWARD_CONFIG.profit_scale
 SET_BONUS = DEFAULT_REWARD_CONFIG.set_bonus
 KEEP_PREMIUM = DEFAULT_REWARD_CONFIG.keep_premium

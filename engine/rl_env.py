@@ -384,6 +384,12 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             if hasattr(policy, "bind"):
                 policy.bind(self.game, self.ownable)
             self._deciders[s] = self._make_policy_decider(s)
+        # Tell the encoder which seats overpay for a set, so the trade mask gates
+        # proposals on the *same* offer this env will actually build (see
+        # ``ObsEncoder._offer_would_clear`` / :meth:`_overpay_for_set`).
+        self.encoder.overpay_seats = {
+            s for s in range(self.num_players)
+            if not hasattr(self._opponent_policies.get(s), "decide")}
         for s, decide in self._deciders.items():
             self.game.players[s].decide_purchase = self._make_buy_hook(s, decide)
             self.game.players[s].decide_bid = self._make_bid_hook(s, decide)
@@ -698,10 +704,11 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         so the hand-crafted FP baselines stay the fixed benchmark: a seat driven
         by a ``HeuristicAgent`` (it has ``.decide``) keeps the conservative
         break-even cap. An opponent seat with no policy (the trivial baseline)
-        never proposes trades, so it never reaches here."""
-        seat = self.game.players.index(initiator)
-        pol = self._opponent_policies.get(seat)
-        return not hasattr(pol, "decide")
+        never proposes trades, so it never reaches here.
+
+        Delegates to the encoder (populated in :meth:`_wire_deciders`) so the
+        trade mask and the proposal it gates read one definition."""
+        return self.encoder._overpays(initiator)
 
     def _attempt_trade(self, initiator, target, tier=1):
         """Offers a trade to acquire ``target`` at cash ``tier``.

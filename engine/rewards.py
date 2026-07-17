@@ -41,12 +41,26 @@ class RewardMixin:
         total += self.cfg.monopoly_bonus * self._owned_monopoly_value(player)
         return total
 
+    def _effective_set_strength(self, grp):
+        """The shared per-set strength (:meth:`ObsEncoder._set_strength`) tilted
+        by ``set_strength_reward_weight`` (w): ``1 + w*(strength - 1)``. ``w=0``
+        recovers the old flat behaviour (every set weighted 1.0); ``w=1`` is full
+        strength. Read by the owned-monopoly net worth and the one-time
+        first-monopoly / denial bonuses, so the reward prizes a high-traffic money
+        set above a cheap one -- the same ordering trades use."""
+        w = self.cfg.set_strength_reward_weight
+        return 1.0 + w * (self.encoder._set_strength(grp) - 1.0)
+
     def _owned_monopoly_value(self, player):
-        """Total list price of the monopoly groups ``player`` fully owns."""
+        """Strength-weighted value of the monopoly groups ``player`` fully owns:
+        each set's total list price times its :meth:`_effective_set_strength`, so
+        holding (and thus losing) a strong set moves net worth -- and the shaped
+        reward -- more than a weak one of equal sticker price."""
         total = 0.0
         for tiles in self.encoder._groups:
             if all(t.owner is player for t in tiles):
-                total += sum(t.price for t in tiles)
+                total += (sum(t.price for t in tiles)
+                          * self._effective_set_strength(tiles))
         return total
 
     # -- One-time shaped bonuses -------------------------------------------
@@ -100,6 +114,7 @@ class RewardMixin:
                 self._pending_bonus += (
                     self.cfg.first_monopoly_bonus_coef * self.cfg.monopoly_bonus
                     * enc._group_price(grp) / 1000.0
+                    * self._effective_set_strength(grp)
                     * (1.0 + self.cfg.first_monopoly_tempo_weight * tempo))
             return
 
@@ -114,7 +129,8 @@ class RewardMixin:
                     if self._count_complete_sets() == 0 else 1.0)
             self._pending_bonus += (self.cfg.denial_bonus_coef
                                     * self.cfg.monopoly_bonus
-                                    * enc._group_price(grp) / 1000.0 * mult)
+                                    * enc._group_price(grp) / 1000.0 * mult
+                                    * self._effective_set_strength(grp))
 
     def _count_complete_sets(self, exclude=None):
         """Number of colour groups fully owned by a single non-bankrupt player,

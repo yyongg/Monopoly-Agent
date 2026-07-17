@@ -80,6 +80,27 @@ def main():
                         help="rounds of expected rent the cash cushion should "
                              "cover (default: "
                              f"{RewardConfig().solvency_cushion_turns})")
+    parser.add_argument("--set-strength-clamp", type=float, nargs=2, default=None,
+                        metavar=("LO", "HI"),
+                        help="floor/ceiling for the per-set strength multiplier "
+                             "(traffic x rent, normalised to ~1.0 average; "
+                             "default: "
+                             f"{RewardConfig().set_strength_clamp})")
+    parser.add_argument("--set-strength-reward-weight", type=float, default=None,
+                        help="how strongly the reward tilts owned-set net worth "
+                             "by set strength (0 = flat/old, 1 = full; default: "
+                             f"{RewardConfig().set_strength_reward_weight})")
+    parser.add_argument("--trade-monopoly-mult", type=float, default=None,
+                        help="base set premium in trade valuation, on top of the "
+                             "per-set strength. Sets the cash a set-completer "
+                             "costs, so it governs how early a set can be bought "
+                             f"(default: {RewardConfig().trade_monopoly_mult})")
+    parser.add_argument("--trade-denial-weight", type=float, default=None,
+                        help="weight on the blocking term in TRADE valuation; "
+                             "below 1.0 opens a bargaining range (at 1.0 a "
+                             "set-completing swap is zero-sum and nothing trades). "
+                             "Auction bidding keeps denial_value_weight. Default: "
+                             f"{RewardConfig().trade_denial_weight}")
     # Self-play knobs.
     parser.add_argument("--pool-dir", default="runs/sp_pool",
                         help="directory of opponent snapshots")
@@ -139,6 +160,11 @@ def main():
     overrides = {k: v for k, v in (
         ("solvency_penalty_coef", args.solvency_penalty_coef),
         ("solvency_cushion_turns", args.solvency_cushion_turns),
+        ("set_strength_clamp",
+         tuple(args.set_strength_clamp) if args.set_strength_clamp else None),
+        ("set_strength_reward_weight", args.set_strength_reward_weight),
+        ("trade_denial_weight", args.trade_denial_weight),
+        ("trade_monopoly_mult", args.trade_monopoly_mult),
     ) if v is not None}
     cfg = RewardConfig(**overrides)
 

@@ -8,11 +8,14 @@ observation can never drift between training and the GUI -- the drift that used
 to be guarded by a hand-maintained "mirrors the env" copy in the UI.
 
 An encoder is bound to a live game with :meth:`ObsEncoder.bind`; the owner sets
-two transient per-decision fields on it:
+three transient fields on it:
 
 * ``_cur_trade`` -- the offer being judged, for a PHASE_TRADE_RESPOND observation,
 * ``_traded_this_manage`` -- trade targets already tried this MANAGE phase, so
-  :meth:`_legal_mask` stops re-offering them.
+  :meth:`_legal_mask` stops re-offering them,
+* ``overpay_seats`` -- which seats spend surplus cash to complete a set (see
+  ``build_offer``'s ``overpay``). The mask must build the *same* offer the owner
+  will actually propose, or it would gate proposals on the wrong deal.
 """
 
 import json
@@ -111,6 +114,19 @@ def base_rent(prop):
     return 28.0               # utility: 4x an average roll of 7
 
 
+def peak_rent(prop):
+    """The rent ``prop`` collects when its group is *fully developed* -- the
+    earning power that makes a monopoly worth holding. Streets: the hotel row of
+    the rent table. Railroads: the four-railroad rent (25 * 2**4 = 400, the
+    engine's doubled table). Utilities: both-owned, at an average roll of 7
+    (10 * 7 = 70). Used to weigh each set's strength in :meth:`ObsEncoder._set_strength`."""
+    if isinstance(prop, StreetProperty):
+        return float(prop.rent_table[-1])
+    if isinstance(prop, Railroad):
+        return 400.0          # 25 * 2**4: rent per railroad when all four are held
+    return 70.0               # utility: 10x an average roll of 7 (both owned)
+
+
 def build_groups(ownable):
     """Groups ownable tiles into the sets that form a monopoly, in a stable
     order (by group key) so the per-group observation features line up
@@ -190,10 +206,16 @@ class ObsEncoder:
         self._groups = []
         self._group_of = {}
         self._land_freq = {}
+        self._strength_of = {}  # id(tile) -> per-set strength (see _set_strength)
         self._board_size = 40
         # Transient per-decision state, set by the owner (env / GUI decider).
         self._cur_trade = None            # offer judged in PHASE_TRADE_RESPOND
         self._traded_this_manage = set()  # trade targets tried this MANAGE phase
+        # Seats that spend surplus cash to complete a set (build_offer's
+        # ``overpay``): learned policies do, the FP baselines stay conservative.
+        # ``None`` means every seat overpays -- the right default for the encoder
+        # used standalone (tests) or with every seat on one policy (simulate).
+        self.overpay_seats = None
 
     def bind(self, game, ownable):
         """Attach to a live game. Must be called before any encoding."""
@@ -205,6 +227,7 @@ class ObsEncoder:
         self._group_of = {id(t): grp for grp in self._groups for t in grp}
         self._land_freq = load_landing_frequencies()
         self._board_size = game.board.length
+        self._compute_set_strengths()
         return self
 
     @property
@@ -316,6 +339,34 @@ class ObsEncoder:
         lo, hi = self.cfg.set_quality_clamp
         return max(lo, min(hi, (sum(rois) / len(rois)) / self.cfg.set_roi_ref))
 
+    def _compute_set_strengths(self):
+        """Precomputes a per-set strength multiplier, cached by tile id.
+
+        Called once per :meth:`bind` (the board is fixed within a game). Each
+        group's raw strength is its traffic-weighted full-development rent
+        (landing traffic x :func:`peak_rent`, summed over the group); the raw
+        scores are normalised by their mean across all groups so the *average*
+        set scores ~1.0. This makes ``_set_strength`` a redistribution of the
+        flat ``trade_monopoly_mult`` -- money sets (orange/red) score above 1,
+        cheap low-traffic sets (utilities/brown) near the clamp floor -- rather
+        than a change to the overall trade-value scale."""
+        raw = [sum(self._traffic(t) * peak_rent(t) for t in grp)
+               for grp in self._groups]
+        mean = (sum(raw) / len(raw)) if raw else 0.0
+        lo, hi = self.cfg.set_strength_clamp
+        self._strength_of = {}
+        for grp, r in zip(self._groups, raw):
+            strength = max(lo, min(hi, r / mean)) if mean > 0 else 1.0
+            for t in grp:
+                self._strength_of[id(t)] = strength
+
+    def _set_strength(self, grp):
+        """The strength multiplier for monopoly ``grp`` (see
+        :meth:`_compute_set_strengths`): how valuable completing/holding this set
+        is, from traffic x full-development rent, normalised to ~1.0 average and
+        clamped. Falls back to 1.0 for an unrecognised group."""
+        return self._strength_of.get(id(grp[0]), 1.0) if grp else 1.0
+
     # -- Trade valuation ----------------------------------------------------
     def _prop_value(self, prop):
         """List-price value of a property, discounted for an unpaid mortgage."""
@@ -340,10 +391,13 @@ class ObsEncoder:
         # A monopoly earns many times its sticker price over a game, so trade
         # valuations prize completing/denying a set at ``trade_monopoly_mult`` x
         # the sticker premium (auction bidding keeps the plain premium so its
-        # economics stay near retail). The game's *first* monopoly is a decisive
-        # tempo edge, so it is worth even more to secure -- or refuse to sell.
+        # economics stay near retail). ``_set_strength`` then re-weights that
+        # premium per set by real earning power (traffic x rent), so a cheap
+        # low-traffic set (utilities) is no longer valued like the orange set --
+        # the fix for the set-ping-pong. The game's *first* monopoly is a
+        # decisive tempo edge, so it is worth even more to secure -- or refuse.
         set_value = (self.cfg.monopoly_bonus * self._group_price(grp)
-                     * self._set_quality(grp) * self.cfg.trade_monopoly_mult)
+                     * self._set_strength(grp) * self.cfg.trade_monopoly_mult)
         if not self._any_monopoly_exists(exclude=grp):
             set_value *= (1.0 + self.cfg.trade_first_monopoly_weight)
         if self._completes_monopoly_for(owner, prop):
@@ -351,7 +405,11 @@ class ObsEncoder:
         elif any(o is not owner and not o.bankrupt
                  and self._completes_monopoly_for(o, prop)
                  for o in self.game.players):
-            value += self.cfg.denial_value_weight * set_value
+            # Blocking is deliberately worth *less* than completing
+            # (``trade_denial_weight`` < 1). At equal weight the tile is worth the
+            # same to both sides, the swap is zero-sum, and no trade can ever
+            # clear -- see the note on the knob in :mod:`engine.config`.
+            value += self.cfg.trade_denial_weight * set_value
         return value
 
     def _completes_monopoly_for(self, player, target):
@@ -568,6 +626,34 @@ class ObsEncoder:
             cash = min(raw, break_even, initiator.balance)
         return TradeOffer(give, receive, cash)
 
+    def _overpays(self, player):
+        """Whether ``player`` spends surplus cash to complete its own set (see
+        ``build_offer``'s ``overpay``). Reads ``overpay_seats``, which the owner
+        sets; ``None`` means every seat does."""
+        if self.overpay_seats is None:
+            return True
+        return self.game.players.index(player) in self.overpay_seats
+
+    def _offer_would_clear(self, initiator, target, tier):
+        """Whether the offer ``initiator`` would actually make for ``target`` at
+        ``tier`` is one the partner could accept.
+
+        Used by :meth:`_legal_mask` to keep the trade band **honest**: without it
+        the mask offers every set-completing/denying target whether or not any
+        deal exists, and the agent re-proposes the same hopeless offer every
+        MANAGE phase for the rest of the game (measured: ~2,800 rejected
+        proposals per game, 100% of them refused by the accept-guard). Builds the
+        offer exactly as the owner will -- same ``overpay`` -- so the mask and the
+        proposal cannot disagree.
+        """
+        offer = self.build_offer(initiator, target, tier,
+                                 overpay=self._overpays(initiator))
+        if offer is None:
+            return False
+        give, receive, cash = offer
+        accepted, _ = self.accepts(target.owner, [give], receive, cash)
+        return accepted
+
     # -- Liquidation reachability (used by masks / buy hooks) --------------
     def _has_liquidation_options(self, player):
         """Whether ``player`` has any house to sell or property to mortgage."""
@@ -631,8 +717,26 @@ class ObsEncoder:
             return mask
 
         if phase == PHASE_TRADE_RESPOND:
-            mask[A_TRADE_ACCEPT] = 1
+            # Rejecting is always legal. Accepting is gated on the shared
+            # ``accepts()`` valuation (the same sound rule the FP bots use): the
+            # agent may not accept a swap that is value-losing by its own
+            # strength-weighted trade valuation. This is what structurally stops
+            # it giving up a monopoly (or breaking its own set) for too little --
+            # the learned responder used to accept ~85% of everything. ``accepts``
+            # is strength-aware, so a strong set demands real compensation while a
+            # weak one can still be traded freely. ``_cur_trade`` is set by the
+            # caller before every trade-respond decision; if it is somehow absent
+            # we cannot evaluate, so we leave accept legal rather than over-constrain.
             mask[A_TRADE_REJECT] = 1
+            tc = self._cur_trade
+            if tc is None:
+                mask[A_TRADE_ACCEPT] = 1
+            else:
+                gain = [tc["recv"]] if tc.get("recv") is not None else []
+                lose = [tc["give"]] if tc.get("give") is not None else []
+                ok, _ = self.accepts(player, gain, lose, tc.get("cash", 0))
+                if ok:
+                    mask[A_TRADE_ACCEPT] = 1
             return mask
 
         # MANAGE and LIQUIDATE share the property-action masks.
@@ -659,14 +763,18 @@ class ObsEncoder:
 
         # Trade proposals target tiles owned by *other* players. For each
         # proposable opponent tile (not already tried this MANAGE phase), offer
-        # all NUM_TRADE_TIERS cash tiers so the agent picks how generous the
-        # offer is. A tile is tried at most once per phase (any tier), which
-        # keeps the manage loop from spinning on a repeatedly-declined target.
+        # every cash tier whose resulting deal the partner could actually accept,
+        # so the agent picks how generous to be among offers that can really
+        # happen. A tile is tried at most once per phase (any tier), which keeps
+        # the manage loop from spinning on a repeatedly-declined target.
         if phase == PHASE_MANAGE:
             for i, p in enumerate(self.ownable):
-                if i not in self._traded_this_manage \
-                        and self._can_propose_trade(player, p):
-                    for tier in range(NUM_TRADE_TIERS):
+                if i in self._traded_this_manage:
+                    continue
+                if not self._can_propose_trade(player, p):
+                    continue
+                for tier in range(NUM_TRADE_TIERS):
+                    if self._offer_would_clear(player, p, tier):
                         mask[trade_action(i, tier)] = 1
 
         mask[A_END_MANAGE] = 1  # always allowed to stop

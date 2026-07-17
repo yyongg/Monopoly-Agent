@@ -13,7 +13,7 @@ from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
     PHASE_AUCTION, PHASE_TRADE_RESPOND,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
-    A_BUILD, A_MORTGAGE, A_TRADE, A_AUCTION_BID,
+    A_BUILD, A_MORTGAGE, A_TRADE, A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_BID,
     NUM_OWNABLE, NUM_TRADE_TIERS, BID_FRACTIONS, decode_trade_action,
 )
 from engine.observation import safe_default
@@ -112,37 +112,105 @@ class TestManage:
         # ...but available when raising cash under duress.
         assert encoder._legal_mask(PHASE_LIQUIDATE, None, 0)[A_MORTGAGE + i] == 1
 
+    @staticmethod
+    def _one_away(encoder, game):
+        """Red is one orange short of the set, Blue holds it, and Red is flush
+        enough to actually pay for it -- a deal that clears, so the trade band is
+        offered. Returns ``(red, blue, target)``."""
+        red, blue = game.players[0], game.players[1]
+        orange = group_named(encoder, "orange")
+        give(red, orange[0], orange[2])
+        give(blue, orange[1])                          # Red's set-completer
+        give(red, group_named(encoder, "brown")[0])    # something to hand over
+        red.balance = 5000                             # able to fund the premium
+        return red, blue, orange[1]
+
     def test_every_offered_trade_action_is_actually_proposable(
             self, game, encoder, ownable):
         """The trade band is the largest slice of the action space (84 of 211).
-        Every action it offers must survive ``_can_propose_trade``."""
-        red, blue = game.players[0], game.players[1]
-        orange = group_named(encoder, "orange")
-        give(red, orange[0])
-        give(blue, orange[1], orange[2])          # a set Red can deny
-        give(red, group_named(encoder, "brown")[0])   # something to hand over
+        Every action it offers must survive ``_can_propose_trade`` *and* be a
+        deal the partner could accept."""
+        red, _, _ = self._one_away(encoder, game)
 
         mask = encoder._legal_mask(PHASE_MANAGE, None, 0)
         offered = [a for a in range(A_TRADE, A_TRADE + NUM_OWNABLE * NUM_TRADE_TIERS)
                    if mask[a]]
-        assert offered, "expected Red to be able to pry an orange off Blue"
+        assert offered, "expected Red to be able to buy its set-completer"
         for action in offered:
             i, tier = decode_trade_action(action)
             assert 0 <= tier < NUM_TRADE_TIERS
             assert encoder._can_propose_trade(red, ownable[i])
+            assert encoder._offer_would_clear(red, ownable[i], tier)
 
     def test_a_target_is_offered_at_most_once_per_manage_phase(
             self, game, encoder, ownable):
-        red, blue = game.players[0], game.players[1]
-        orange = group_named(encoder, "orange")
-        give(red, orange[0])
-        give(blue, orange[1], orange[2])
-        give(red, group_named(encoder, "brown")[0])
+        _, _, target = self._one_away(encoder, game)
+        target_i = ownable.index(target)
+        tiers = [A_TRADE + target_i * NUM_TRADE_TIERS + t
+                 for t in range(NUM_TRADE_TIERS)]
 
-        target_i = ownable.index(orange[1])
-        assert encoder._legal_mask(PHASE_MANAGE, None, 0)[
-            A_TRADE + target_i * NUM_TRADE_TIERS] == 1
+        mask = encoder._legal_mask(PHASE_MANAGE, None, 0)
+        assert any(mask[a] for a in tiers), "expected the target to be offered"
 
         encoder._traded_this_manage.add(target_i)
-        assert encoder._legal_mask(PHASE_MANAGE, None, 0)[
-            A_TRADE + target_i * NUM_TRADE_TIERS] == 0
+        mask = encoder._legal_mask(PHASE_MANAGE, None, 0)
+        assert not any(mask[a] for a in tiers)
+
+    def test_an_offer_the_partner_would_refuse_is_not_proposed(
+            self, game, encoder, ownable):
+        """The proposal gate. Red can reach its set-completer, but is broke, so
+        no cash offer it can make would clear -- the trade band stays shut rather
+        than spending the phase on an offer that is certain to be refused."""
+        red, _, target = self._one_away(encoder, game)
+        red.balance = 0
+
+        target_i = ownable.index(target)
+        mask = encoder._legal_mask(PHASE_MANAGE, None, 0)
+        assert encoder._can_propose_trade(red, target)   # still *proposable*...
+        for t in range(NUM_TRADE_TIERS):                 # ...but no deal clears
+            assert mask[A_TRADE + target_i * NUM_TRADE_TIERS + t] == 0
+
+
+class TestTradeRespond:
+    """The accept-guard. Rejecting is always legal; accepting is masked out when
+    the shared ``accepts()`` valuation scores the swap value-losing -- what stops
+    the learned responder from breaking up its own sets (it used to accept ~85%
+    of everything, including monopoly giveaways)."""
+
+    def test_reject_is_always_legal(self, encoder, ownable):
+        encoder._cur_trade = None
+        mask = encoder._legal_mask(PHASE_TRADE_RESPOND, ownable[0], 0)
+        assert mask[A_TRADE_REJECT] == 1
+
+    def test_no_offer_to_evaluate_leaves_accept_legal(self, encoder, ownable):
+        # Without a bound offer the guard cannot judge the deal, so it does not
+        # over-constrain -- accept stays legal (and the mask is never empty).
+        encoder._cur_trade = None
+        mask = encoder._legal_mask(PHASE_TRADE_RESPOND, ownable[0], 0)
+        assert mask[A_TRADE_ACCEPT] == 1
+
+    def test_a_losing_offer_masks_out_accept(self, game, encoder):
+        # Red owns the whole orange set; parting with an orange tile for a cheap
+        # brown + token cash is value-losing, so accept is forbidden.
+        red, blue = game.players[0], game.players[1]
+        orange = group_named(encoder, "orange")
+        give(red, *orange)
+        cheap = group_named(encoder, "brown")[0]
+        give(blue, cheap)
+
+        encoder._cur_trade = {"recv": cheap, "give": orange[0], "cash": 5}
+        mask = encoder._legal_mask(PHASE_TRADE_RESPOND, orange[0], 0)
+        assert mask[A_TRADE_ACCEPT] == 0
+        assert mask[A_TRADE_REJECT] == 1
+
+    def test_a_generous_offer_keeps_accept_legal(self, game, encoder):
+        red, blue = game.players[0], game.players[1]
+        orange = group_named(encoder, "orange")
+        give(red, *orange)
+        cheap = group_named(encoder, "brown")[0]
+        give(blue, cheap)
+
+        # Enough cash that giving up the orange tile is net-positive for Red.
+        encoder._cur_trade = {"recv": cheap, "give": orange[0], "cash": 100_000}
+        mask = encoder._legal_mask(PHASE_TRADE_RESPOND, orange[0], 0)
+        assert mask[A_TRADE_ACCEPT] == 1

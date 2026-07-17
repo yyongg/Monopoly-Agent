@@ -8,7 +8,9 @@ it just quietly trains the wrong policy.
 import numpy as np
 import pytest
 
+from engine.config import RewardConfig
 from engine.rl_env import MonopolyEnv
+from models.tiles.properties.utility import Utility
 from tests.conftest import give, group_named
 
 
@@ -21,6 +23,14 @@ def env():
     env._prev_potential = 0.0
     env._pending_bonus = 0.0
     env._penalty_turn = -1
+    return env
+
+
+def _env_with_strength_weight(w):
+    env = MonopolyEnv(seat=0, num_players=4, seed=0, max_turns=1000, gamma=0.99,
+                      cfg=RewardConfig(set_strength_reward_weight=w))
+    env.np_random = np.random.default_rng(0)
+    env._build_game()
     return env
 
 
@@ -122,3 +132,45 @@ class TestSolvencyPenalty:
         game.advance_turn()                   # a new turn: charged once more
         after_turn = env._reward(terminal=False)
         assert after_turn - again == pytest.approx(-penalty)
+
+
+class TestSetStrengthReward:
+    """The reward prizes a strong monopoly above a weak one of equal sticker
+    price, so losing (or giving away) a money set costs more shaped reward than
+    trading a cheap one -- the reward-side lever behind smarter trading. ``w=0``
+    recovers the old flat behaviour exactly."""
+
+    def _util_group(self, env):
+        return next(g for g in env.encoder._groups
+                    if isinstance(g[0], Utility))
+
+    def test_flat_weight_recovers_unweighted_value(self):
+        env = _env_with_strength_weight(0.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        give(red, *orange)
+        # w=0 -> every set weighted 1.0, so the owned-monopoly value is just the
+        # group's list price and the effective strength is 1.
+        assert env._effective_set_strength(orange) == pytest.approx(1.0)
+        assert env._owned_monopoly_value(red) == pytest.approx(
+            sum(t.price for t in orange))
+
+    def test_a_strong_set_is_worth_more_than_flat(self):
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        give(red, *orange)
+        s = env.encoder._set_strength(orange)
+        assert s > 1.0
+        assert env._owned_monopoly_value(red) == pytest.approx(
+            sum(t.price for t in orange) * s)
+
+    def test_a_weak_set_is_worth_less_than_flat(self):
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        util = self._util_group(env)
+        give(red, *util)
+        s = env.encoder._set_strength(util)
+        assert s < 1.0
+        assert env._owned_monopoly_value(red) == pytest.approx(
+            sum(t.price for t in util) * s)

@@ -68,6 +68,11 @@ class GUIAIDecider:
         self.game = game
         self.ownable = ownable
         self.encoder.bind(game, ownable)
+        # This decider only ever decides for its own seat, so ``_overpay_sets``
+        # applies to every seat it asks about. Keeps the trade mask gating
+        # proposals on the same offer _attempt_trade will build (mirrors
+        # MonopolyEnv._wire_deciders).
+        self.encoder.overpay_seats = None if self._overpay_sets else set()
 
     # --- Public decision methods ---
 
