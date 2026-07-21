@@ -7,15 +7,14 @@ sees and for the dollar-valued heuristics built on top of it. Both
 observation can never drift between training and the GUI -- the drift that used
 to be guarded by a hand-maintained "mirrors the env" copy in the UI.
 
-An encoder is bound to a live game with :meth:`ObsEncoder.bind`; the owner sets
-three transient fields on it:
+An encoder is bound to a live game with :meth:`ObsEncoder.bind`.
 
-* ``_cur_trade`` -- the offer being judged, for a PHASE_TRADE_RESPOND observation,
-* ``_traded_this_manage`` -- trade targets already tried this MANAGE phase, so
-  :meth:`_legal_mask` stops re-offering them,
-* ``overpay_seats`` -- which seats spend surplus cash to complete a set (see
-  ``build_offer``'s ``overpay``). The mask must build the *same* offer the owner
-  will actually propose, or it would gate proposals on the wrong deal.
+Trading is **not** part of the action space or the observation: it is resolved by
+the heuristic in :mod:`engine.trade`, which is built on the valuations here
+(:meth:`ObsEncoder._trade_value` and the shared :meth:`ObsEncoder.accepts` rule).
+Group-level economics -- what a set is worth, and what a share of one is worth --
+live in :class:`engine.valuation.SetValuer`, which this encoder owns and exposes
+as ``self.sets`` so the reward reads the same numbers.
 """
 
 import json
@@ -27,13 +26,13 @@ import numpy as np
 from engine.config import RewardConfig
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
-    PHASE_AUCTION, PHASE_TRADE_RESPOND, NUM_PHASES,
+    PHASE_AUCTION, NUM_PHASES,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
-    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, NUM_TRADE_TIERS, TRADE_CASH_TIERS,
-    BID_FRACTIONS, trade_action,
+    A_AUCTION_PASS, A_AUCTION_BID,
+    NUM_OWNABLE, NUM_GROUPS, NUM_ACTIONS, BID_FRACTIONS,
 )
+from engine.valuation import SetValuer
 from models.tiles.properties.street_property import StreetProperty
 from models.tiles.properties.railroad import Railroad
 from models.tiles.properties.utility import Utility
@@ -114,19 +113,6 @@ def base_rent(prop):
     return 28.0               # utility: 4x an average roll of 7
 
 
-def peak_rent(prop):
-    """The rent ``prop`` collects when its group is *fully developed* -- the
-    earning power that makes a monopoly worth holding. Streets: the hotel row of
-    the rent table. Railroads: the four-railroad rent (25 * 2**4 = 400, the
-    engine's doubled table). Utilities: both-owned, at an average roll of 7
-    (10 * 7 = 70). Used to weigh each set's strength in :meth:`ObsEncoder._set_strength`."""
-    if isinstance(prop, StreetProperty):
-        return float(prop.rent_table[-1])
-    if isinstance(prop, Railroad):
-        return 400.0          # 25 * 2**4: rent per railroad when all four are held
-    return 70.0               # utility: 10x an average roll of 7 (both owned)
-
-
 def build_groups(ownable):
     """Groups ownable tiles into the sets that form a monopoly, in a stable
     order (by group key) so the per-group observation features line up
@@ -149,7 +135,6 @@ def observation_length(num_players):
                              # expected profit/turn
             + NUM_OWNABLE * (num_players + 3)
             + NUM_PHASES + 1
-            + 3               # trade context: recv tile, give tile, cash
             + 2               # context flags: completes mine / opp's set
             + NUM_GROUPS * 2  # per-group progress: mine / max-opp frac
             + 5               # context prop economics: price, rent, traffic,
@@ -164,10 +149,11 @@ def observation_length(num_players):
 
 class TradeOffer(NamedTuple):
     """One proposed swap: the initiator hands over ``give`` plus ``cash`` and
-    receives ``receive``. ``cash`` is signed -- negative means the initiator is
-    *asking* the partner for money (a mutual set-for-set)."""
+    receives ``receive``. Both sides are lists -- the heuristic assembles
+    multi-tile packages (:mod:`engine.trade`). ``cash`` is signed: negative means
+    the initiator is *asking* the partner for money (a mutual set-for-set)."""
 
-    give: object
+    give: list
     receive: list
     cash: int
 
@@ -181,8 +167,6 @@ def safe_default(phase):
         return A_DECLINE
     if phase == PHASE_AUCTION:
         return A_AUCTION_PASS
-    if phase == PHASE_TRADE_RESPOND:
-        return A_TRADE_REJECT
     return A_END_MANAGE  # MANAGE / LIQUIDATE: do nothing further
 
 
@@ -206,16 +190,11 @@ class ObsEncoder:
         self._groups = []
         self._group_of = {}
         self._land_freq = {}
-        self._strength_of = {}  # id(tile) -> per-set strength (see _set_strength)
         self._board_size = 40
-        # Transient per-decision state, set by the owner (env / GUI decider).
-        self._cur_trade = None            # offer judged in PHASE_TRADE_RESPOND
-        self._traded_this_manage = set()  # trade targets tried this MANAGE phase
-        # Seats that spend surplus cash to complete a set (build_offer's
-        # ``overpay``): learned policies do, the FP baselines stay conservative.
-        # ``None`` means every seat overpays -- the right default for the encoder
-        # used standalone (tests) or with every seat on one policy (simulate).
-        self.overpay_seats = None
+        # Group economics -- what a set, and a share of one, is worth. Shared
+        # with the reward (engine.rewards reads ``encoder.sets``) so both price a
+        # monopoly identically.
+        self.sets = SetValuer(self.cfg)
 
     def bind(self, game, ownable):
         """Attach to a live game. Must be called before any encoding."""
@@ -227,7 +206,7 @@ class ObsEncoder:
         self._group_of = {id(t): grp for grp in self._groups for t in grp}
         self._land_freq = load_landing_frequencies()
         self._board_size = game.board.length
-        self._compute_set_strengths()
+        self.sets.bind(game, self._groups, self._traffic)
         return self
 
     @property
@@ -237,7 +216,7 @@ class ObsEncoder:
     # -- Tile economics -----------------------------------------------------
     def _group_price(self, grp):
         """Total list price of every tile in a monopoly group."""
-        return sum(t.price for t in grp)
+        return self.sets.group_price(grp)
 
     def _bid_value(self, player, prop):
         """``prop``'s value to ``player`` for auction bidding: its list price,
@@ -325,48 +304,6 @@ class ObsEncoder:
                                            - prop.rent_table[0])
         return rent_gain / build_cost if build_cost else 0.0
 
-    def _set_quality(self, grp):
-        """Development-ROI multiplier for a colour group (~1.0 average), used to
-        prize *completing* an efficient, cheap-to-develop set above a
-        sticker-equal but sluggish one. The average dev-ROI over the group's
-        streets, expressed against ``set_roi_ref`` and clamped to
-        ``set_quality_clamp``: >1 for the orange/light-blue money groups, <1 for
-        the pricey greens/dark-blue. Neutral (1.0) for railroad/utility groups,
-        which never build."""
-        rois = [self._dev_roi(t) for t in grp if isinstance(t, StreetProperty)]
-        if not rois:
-            return 1.0
-        lo, hi = self.cfg.set_quality_clamp
-        return max(lo, min(hi, (sum(rois) / len(rois)) / self.cfg.set_roi_ref))
-
-    def _compute_set_strengths(self):
-        """Precomputes a per-set strength multiplier, cached by tile id.
-
-        Called once per :meth:`bind` (the board is fixed within a game). Each
-        group's raw strength is its traffic-weighted full-development rent
-        (landing traffic x :func:`peak_rent`, summed over the group); the raw
-        scores are normalised by their mean across all groups so the *average*
-        set scores ~1.0. This makes ``_set_strength`` a redistribution of the
-        flat ``trade_monopoly_mult`` -- money sets (orange/red) score above 1,
-        cheap low-traffic sets (utilities/brown) near the clamp floor -- rather
-        than a change to the overall trade-value scale."""
-        raw = [sum(self._traffic(t) * peak_rent(t) for t in grp)
-               for grp in self._groups]
-        mean = (sum(raw) / len(raw)) if raw else 0.0
-        lo, hi = self.cfg.set_strength_clamp
-        self._strength_of = {}
-        for grp, r in zip(self._groups, raw):
-            strength = max(lo, min(hi, r / mean)) if mean > 0 else 1.0
-            for t in grp:
-                self._strength_of[id(t)] = strength
-
-    def _set_strength(self, grp):
-        """The strength multiplier for monopoly ``grp`` (see
-        :meth:`_compute_set_strengths`): how valuable completing/holding this set
-        is, from traffic x full-development rent, normalised to ~1.0 average and
-        clamped. Falls back to 1.0 for an unrecognised group."""
-        return self._strength_of.get(id(grp[0]), 1.0) if grp else 1.0
-
     # -- Trade valuation ----------------------------------------------------
     def _prop_value(self, prop):
         """List-price value of a property, discounted for an unpaid mortgage."""
@@ -375,42 +312,43 @@ class ObsEncoder:
         return float(prop.price)
 
     def _trade_value(self, prop, owner):
-        """Value of ``prop`` to ``owner`` for trading purposes.
+        """Value of ``prop`` to ``owner`` for trading purposes -- four terms:
 
-        Richer than the raw list value: it adds the rent the tile is expected to
-        earn (landing traffic * nominal rent, weighted by ``trade_income_weight``)
-        and the group's monopoly value when the tile completes ``owner``'s own
-        set, or the (weighted) blocking value when it is instead an *opponent*'s
-        last-missing piece. Mirrors the bidding valuation in :meth:`_bid_value`,
-        plus the traffic/rent term."""
-        value = self._prop_value(prop)
-        value += self.cfg.trade_income_weight * self._expected_income(prop)
-        grp = self._group_of.get(id(prop))
-        if grp is None:
-            return value
-        # A monopoly earns many times its sticker price over a game, so trade
-        # valuations prize completing/denying a set at ``trade_monopoly_mult`` x
-        # the sticker premium (auction bidding keeps the plain premium so its
-        # economics stay near retail). ``_set_strength`` then re-weights that
-        # premium per set by real earning power (traffic x rent), so a cheap
-        # low-traffic set (utilities) is no longer valued like the orange set --
-        # the fix for the set-ping-pong. The game's *first* monopoly is a
-        # decisive tempo edge, so it is worth even more to secure -- or refuse.
-        set_value = (self.cfg.monopoly_bonus * self._group_price(grp)
-                     * self._set_strength(grp) * self.cfg.trade_monopoly_mult)
-        if not self._any_monopoly_exists(exclude=grp):
-            set_value *= (1.0 + self.cfg.trade_first_monopoly_weight)
-        if self._completes_monopoly_for(owner, prop):
-            value += set_value
-        elif any(o is not owner and not o.bankrupt
-                 and self._completes_monopoly_for(o, prop)
-                 for o in self.game.players):
-            # Blocking is deliberately worth *less* than completing
-            # (``trade_denial_weight`` < 1). At equal weight the tile is worth the
-            # same to both sides, the swap is zero-sum, and no trade can ever
-            # clear -- see the note on the knob in :mod:`engine.config`.
-            value += self.cfg.trade_denial_weight * set_value
-        return value
+        * its **list price** (discounted for an unpaid mortgage),
+        * the **rent** it is expected to earn (landing traffic x nominal rent,
+          weighted by ``trade_income_weight``),
+        * its **marginal set value** to ``owner`` -- what ``owner``'s position in
+          the tile's colour group is worth holding it, minus what that position is
+          worth without it (:meth:`engine.valuation.SetValuer.marginal`),
+        * its **blocking value** -- the same marginal, computed for whichever
+          opponent it would help most, weighted by ``trade_denial_weight``.
+
+        The marginal term is what killed the junk-for-monopoly exploit. It used to
+        be a step: a set premium *only* when the tile was exactly one away from
+        completing, and sticker price otherwise -- so an agent holding 2/3 of
+        orange priced St. James at $227 and sold it for a brown and $200, while
+        the same tile was worth $4,937 once the set was whole. Every rung of
+        progress now carries real money, and completion is a 2x step rather than a
+        21x cliff.
+
+        ``trade_denial_weight`` must stay below 1.0: at 1.0 the tile is worth the
+        same to holder and acquirer, the swap is zero-sum, and nothing can ever
+        clear (see the knob's note in :mod:`engine.config`).
+
+        Single-tile only -- :meth:`trade_delta` prices a package, because set
+        value is **not** additive across tiles of the same group.
+        """
+        return (self._tile_value(prop, owner)
+                + self.sets.marginal(prop, owner)
+                + self.cfg.trade_denial_weight * self.sets.denial(prop, owner))
+
+    def _tile_value(self, prop, owner):
+        """The part of a tile's worth that *is* additive across a package: its
+        list price (discounted for an unpaid mortgage) plus the rent it is
+        expected to earn. Set value is handled per group, in
+        :meth:`engine.valuation.SetValuer.swap_delta`."""
+        return (self._prop_value(prop)
+                + self.cfg.trade_income_weight * self._expected_income(prop))
 
     def _completes_monopoly_for(self, player, target):
         """Whether acquiring ``target`` would complete a monopoly for ``player``
@@ -419,94 +357,6 @@ class ObsEncoder:
         if grp is None:
             return False
         return all(t.owner is player for t in grp if t is not target)
-
-    def _any_monopoly_exists(self, exclude=None):
-        """Whether any solvent player already owns a complete colour group
-        (optionally ignoring ``exclude``). Used to price the *first*-monopoly
-        tempo premium into trade valuations, mirroring the first-monopolist
-        reward in :mod:`engine.rewards`."""
-        for grp in self._groups:
-            if grp is exclude:
-                continue
-            owner = grp[0].owner
-            if (owner is not None and not owner.bankrupt
-                    and all(t.owner is owner for t in grp)):
-                return True
-        return False
-
-    def _denies_monopoly(self, initiator, partner, target):
-        """Whether acquiring ``target`` from ``partner`` would break up a set the
-        ``partner`` is cornering. True when ``target``'s whole group is split
-        between just ``initiator`` and ``partner`` and the partner holds at least
-        two of it -- a real grip -- so prying ``target`` loose blocks (or breaks)
-        the partner's monopoly. Serves the same monopoly-race motive as the
-        denial reward, but through trades rather than only bank/auction buys."""
-        grp = self._group_of.get(id(target))
-        if grp is None:
-            return False
-        partner_count = sum(1 for t in grp if t.owner is partner)
-        controlled = all(t.owner is partner or t.owner is initiator for t in grp)
-        return controlled and partner_count >= 2
-
-    def _can_propose_trade(self, initiator, target):
-        """Whether ``initiator`` may propose a trade to acquire ``target`` from a
-        solvent opponent: a tradeable tile, with something to hand over, that
-        either **completes the initiator's own set** or **denies the partner** a
-        set they are cornering (see :meth:`_denies_monopoly`)."""
-        owner = target.owner
-        if owner is None or owner is initiator or owner.bankrupt:
-            return False
-        if not self.game.can_trade_property(target):
-            return False
-        if not (self._completes_monopoly_for(initiator, target)
-                or self._denies_monopoly(initiator, owner, target)):
-            return False
-        return self._choose_give_tile(initiator, owner, target) is not None
-
-    def _choose_give_tile(self, initiator, partner, target):
-        """Picks the tile ``initiator`` offers ``partner`` for ``target`` (or
-        ``None``).
-
-        Prefers a *spare* (its group's lone tile, so the trade breaks no
-        progress) of least :meth:`_trade_value` to the initiator. But when
-        acquiring ``target`` completes the initiator's own set and it holds a
-        spare that would complete the *partner*'s set, it offers that instead --
-        a fair, accept-worthy set-for-set swap -- provided the set it gains is
-        worth at least the set it hands over (net-positive by its own valuation;
-        cash then settles the fairness gap, see :meth:`_balancing_cash`).
-        Otherwise it never hands the partner a monopoly."""
-        g = self.game
-        target_group = self._group_of.get(id(target))
-
-        def count(owner, group):
-            return sum(1 for t in group if t.owner is owner)
-
-        candidates = [p for p in initiator.properties
-                      if g.can_trade_property(p)
-                      and self._group_of.get(id(p)) is not target_group]
-        if not candidates:
-            return None
-        spares = [p for p in candidates
-                  if count(initiator, self._group_of[id(p)]) == 1]
-
-        # Mutual set-for-set: a spare that completes the partner's set, offered
-        # only when the set we gain is worth at least the one we give up. Among
-        # such tiles, hand over the one cheapest to us.
-        if self._completes_monopoly_for(initiator, target):
-            mutual = [p for p in spares
-                      if self._completes_monopoly_for(partner, p)]
-            if mutual:
-                best = min(mutual, key=lambda p: self._trade_value(p, initiator))
-                if (self._trade_value(target, initiator)
-                        >= self._trade_value(best, initiator)):
-                    return best
-
-        # Otherwise never gift the partner a monopoly.
-        non_gift = [p for p in (spares or candidates)
-                    if not self._completes_monopoly_for(partner, p)]
-        if not non_gift:
-            return None
-        return min(non_gift, key=lambda p: self._trade_value(p, initiator))
 
     def _rent_exposure(self, player):
         """Expected rent ``player`` pays per board round: for each tile owned by
@@ -529,130 +379,50 @@ class ObsEncoder:
         this reserve is surplus the agent can pour into completing a monopoly."""
         return self.cfg.solvency_cushion_turns * self._rent_exposure(player)
 
-    def _balancing_cash(self, initiator, partner, give, receive):
-        """Net cash the initiator offers to balance a trade, valued from the
-        *partner*'s side with :meth:`_trade_value`, plus a premium for prying
-        loose a set-completing tile.
+    # -- The trade rule -----------------------------------------------------
+    # The single acceptance rule. Every trade decision in the project runs
+    # through it -- the training env, the GUI's AI seats, and the FP baselines
+    # alike -- and :mod:`engine.trade` builds every offer against it. It used to
+    # be three separate accept rules kept in step by comment discipline, and they
+    # had already drifted; worse, the learned policy bypassed it entirely and
+    # accepted ~85% of everything put to it.
 
-        Signed: positive means the initiator pays the partner (the usual case --
-        buying a wanted tile); negative means the initiator *requests* cash,
-        which arises in a mutual set-for-set where the tile it gives completes
-        the partner's set (worth more to the partner than the target given up).
-        ``execute_trade`` handles either direction."""
-        recv_val = sum(self._trade_value(t, partner) for t in receive)
-        give_val = sum(self._trade_value(t, partner) for t in give)
-        grp = self._group_of.get(id(receive[0])) if receive else None
-        set_price = sum(t.price for t in grp) if grp else 0
-        premium = int(round(0.25 * set_price))
-        return int(round(recv_val - give_val)) + premium
-
-    # -- The trade rules: one accept rule, one offer builder ----------------
-    # Every trade decision in the project runs through these two methods -- the
-    # training env, the GUI's AI seats, and the FP baselines alike. They used to
-    # be four separate implementations (two offer builders, three accept rules)
-    # kept in step by comment discipline, and they had already drifted.
-
-    def trade_delta(self, player, gain, lose, cash):
+    def trade_delta(self, player, gain, lose, cash, partner=None):
         """Dollar value to ``player`` of receiving ``gain`` plus ``cash`` while
-        giving up ``lose``, priced with :meth:`_trade_value` (list price, a few
-        turns of expected rent, and the monopoly/denial value of any set it
-        completes or blocks)."""
+        giving up ``lose``. ``gain`` and ``lose`` are lists of any length.
+
+        Two parts, because only one of them is additive:
+
+        * per tile, its list price and expected rent (:meth:`_tile_value`);
+        * per affected colour *group*, the change in set value -- what the whole
+          package does to this player's position and to the best-placed
+          opponent's (:meth:`engine.valuation.SetValuer.swap_delta`).
+
+        Set value cannot be summed tile by tile: two tiles of one group are worth
+        more together than apart, and a tile given while another of its group is
+        taken is a wash. ``partner`` is who the tiles move to and from -- inferred
+        from ``gain`` when not given.
+        """
+        if partner is None and gain:
+            partner = gain[0].owner
         value = float(cash)
-        value += sum(self._trade_value(p, player) for p in gain)
-        value -= sum(self._trade_value(p, player) for p in lose)
+        value += sum(self._tile_value(p, player) for p in gain)
+        value -= sum(self._tile_value(p, player) for p in lose)
+        value += self.sets.swap_delta(player, gain, lose, partner=partner)
         return value
 
-    def accepts(self, player, gain, lose, cash):
+    def accepts(self, player, gain, lose, cash, partner=None):
         """Whether ``player`` takes this deal, and what it is worth to them.
 
-        The single acceptance rule: take any swap that is non-negative by
-        :meth:`trade_delta`, provided the cash owed is actually covered.
+        Take any swap that is non-negative by :meth:`trade_delta`, provided the
+        cash owed is actually covered.
 
         Returns ``(accepted, value)``.
         """
         if cash < 0 and player.balance < -cash:
             return False, float("-inf")
-        value = self.trade_delta(player, gain, lose, cash)
+        value = self.trade_delta(player, gain, lose, cash, partner=partner)
         return value >= 0, value
-
-    def build_offer(self, initiator, target, tier=1, overpay=False):
-        """The offer ``initiator`` makes to acquire ``target`` at cash ``tier``,
-        or ``None`` when there is no sane deal to propose.
-
-        The engine picks the give-tile (:meth:`_choose_give_tile`) and the
-        balancing cash (:meth:`_balancing_cash`, valued from the *partner*'s
-        side); ``tier`` scales that ask -- lowball, fair, or generous.
-
-        Two caps apply to the cash:
-
-        * Normally the offer is capped at the initiator's own **break-even** --
-          the most it could pay and still accept the identical deal handed back
-          to it (:meth:`accepts` is linear in cash with slope 1). An agent that
-          proposes a swap it would itself reject is simply losing value.
-        * When ``overpay`` is set and ``target`` completes the initiator's *own*
-          monopoly, that cap is deliberately dropped in favour of a **surplus**
-          cap: it may spend every dollar above its rent-sized cash reserve
-          (:meth:`_cash_reserve`), because idle cash is worth little and a set is
-          worth a great deal -- but it never digs into the cushion that keeps it
-          solvent. This is what lets a rich agent actually pay a contested ask.
-        """
-        partner = target.owner
-        if not self._can_propose_trade(initiator, target):
-            return None
-        give = self._choose_give_tile(initiator, partner, target)
-        if give is None:
-            return None
-        receive = [target]
-
-        _, self_value = self.accepts(initiator, receive, [give], 0)
-        if self_value <= 0:
-            return None  # a losing swap at any price: the tile we'd give is
-            #              worth more to us than the one we'd get
-        break_even = int(np.ceil(self_value)) - 1
-
-        balancing = self._balancing_cash(initiator, partner, [give], receive)
-        raw = int(round(balancing * TRADE_CASH_TIERS[tier]))
-
-        if raw < 0:
-            # A mutual set-for-set where the tile we hand over is worth more to
-            # the partner than the one we take: *we* get paid. Clamp the request
-            # to their balance so the swap can settle.
-            return TradeOffer(give, receive, -min(-raw, partner.balance))
-
-        if overpay and self._completes_monopoly_for(initiator, target):
-            surplus = max(0, int(initiator.balance - self._cash_reserve(initiator)))
-            cash = min(raw, surplus)
-        else:
-            cash = min(raw, break_even, initiator.balance)
-        return TradeOffer(give, receive, cash)
-
-    def _overpays(self, player):
-        """Whether ``player`` spends surplus cash to complete its own set (see
-        ``build_offer``'s ``overpay``). Reads ``overpay_seats``, which the owner
-        sets; ``None`` means every seat does."""
-        if self.overpay_seats is None:
-            return True
-        return self.game.players.index(player) in self.overpay_seats
-
-    def _offer_would_clear(self, initiator, target, tier):
-        """Whether the offer ``initiator`` would actually make for ``target`` at
-        ``tier`` is one the partner could accept.
-
-        Used by :meth:`_legal_mask` to keep the trade band **honest**: without it
-        the mask offers every set-completing/denying target whether or not any
-        deal exists, and the agent re-proposes the same hopeless offer every
-        MANAGE phase for the rest of the game (measured: ~2,800 rejected
-        proposals per game, 100% of them refused by the accept-guard). Builds the
-        offer exactly as the owner will -- same ``overpay`` -- so the mask and the
-        proposal cannot disagree.
-        """
-        offer = self.build_offer(initiator, target, tier,
-                                 overpay=self._overpays(initiator))
-        if offer is None:
-            return False
-        give, receive, cash = offer
-        accepted, _ = self.accepts(target.owner, [give], receive, cash)
-        return accepted
 
     # -- Liquidation reachability (used by masks / buy hooks) --------------
     def _has_liquidation_options(self, player):
@@ -716,29 +486,6 @@ class ObsEncoder:
                         mask[A_AUCTION_BID + k] = 1
             return mask
 
-        if phase == PHASE_TRADE_RESPOND:
-            # Rejecting is always legal. Accepting is gated on the shared
-            # ``accepts()`` valuation (the same sound rule the FP bots use): the
-            # agent may not accept a swap that is value-losing by its own
-            # strength-weighted trade valuation. This is what structurally stops
-            # it giving up a monopoly (or breaking its own set) for too little --
-            # the learned responder used to accept ~85% of everything. ``accepts``
-            # is strength-aware, so a strong set demands real compensation while a
-            # weak one can still be traded freely. ``_cur_trade`` is set by the
-            # caller before every trade-respond decision; if it is somehow absent
-            # we cannot evaluate, so we leave accept legal rather than over-constrain.
-            mask[A_TRADE_REJECT] = 1
-            tc = self._cur_trade
-            if tc is None:
-                mask[A_TRADE_ACCEPT] = 1
-            else:
-                gain = [tc["recv"]] if tc.get("recv") is not None else []
-                lose = [tc["give"]] if tc.get("give") is not None else []
-                ok, _ = self.accepts(player, gain, lose, tc.get("cash", 0))
-                if ok:
-                    mask[A_TRADE_ACCEPT] = 1
-            return mask
-
         # MANAGE and LIQUIDATE share the property-action masks.
         for i, p in enumerate(self.ownable):
             if p.owner is not player:
@@ -761,22 +508,8 @@ class ObsEncoder:
                 if p.can_unmortgage(g, player):
                     mask[A_UNMORTGAGE + i] = 1
 
-        # Trade proposals target tiles owned by *other* players. For each
-        # proposable opponent tile (not already tried this MANAGE phase), offer
-        # every cash tier whose resulting deal the partner could actually accept,
-        # so the agent picks how generous to be among offers that can really
-        # happen. A tile is tried at most once per phase (any tier), which keeps
-        # the manage loop from spinning on a repeatedly-declined target.
-        if phase == PHASE_MANAGE:
-            for i, p in enumerate(self.ownable):
-                if i in self._traded_this_manage:
-                    continue
-                if not self._can_propose_trade(player, p):
-                    continue
-                for tier in range(NUM_TRADE_TIERS):
-                    if self._offer_would_clear(player, p, tier):
-                        mask[trade_action(i, tier)] = 1
-
+        # No trade band: the policy does not propose trades. The heuristic in
+        # :mod:`engine.trade` runs its own round each MANAGE phase.
         mask[A_END_MANAGE] = 1  # always allowed to stop
         return mask
 
@@ -837,20 +570,6 @@ class ObsEncoder:
         else:
             parts.append(-1.0)
 
-        # Trade context (PHASE_TRADE_RESPOND): the tile this player would
-        # receive, the tile it would give up, and the net cash it gets, all from
-        # its own perspective; -1/-1/0 outside a trade response.
-        tc = self._cur_trade
-        if phase == PHASE_TRADE_RESPOND and tc is not None:
-            recv, give = tc["recv"], tc["give"]
-            parts.append(self._prop_index[id(recv)] / NUM_OWNABLE
-                         if recv is not None else -1.0)
-            parts.append(self._prop_index[id(give)] / NUM_OWNABLE
-                         if give is not None else -1.0)
-            parts.append(squash(tc["cash"] / 1500.0))
-        else:
-            parts.extend([-1.0, -1.0, 0.0])
-
         # Set-awareness. Two context flags for the property in play: does
         # acquiring it complete *my* set, and is it an opponent's last-missing
         # tile (completing it would finish *their* set)?
@@ -871,13 +590,11 @@ class ObsEncoder:
             parts.append(max((sum(1 for t in grp if t.owner is o)
                               for o in opponents), default=0) / size)
 
-        # Economics of the property in play (bought / auctioned / traded for):
-        # price, a nominal rent, landing traffic (1.0 == even), and two
-        # cost-normalised value signals -- buy yield (rent per $ of price) and
-        # development ROI (rent per $ of houses); 0s when none is in play.
+        # Economics of the property in play (bought / auctioned): price, a
+        # nominal rent, landing traffic (1.0 == even), and two cost-normalised
+        # value signals -- buy yield (rent per $ of price) and development ROI
+        # (rent per $ of houses); 0s when none is in play.
         econ = prop
-        if econ is None and phase == PHASE_TRADE_RESPOND and tc is not None:
-            econ = tc.get("recv")
         if econ is not None:
             parts.append(econ.price / 400.0)
             parts.append(base_rent(econ) / 50.0)

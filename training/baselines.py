@@ -4,17 +4,21 @@ These are *state-aware* opponents modelled on the tournament-style strategies in
 Bonjour et al. (2021): they read live game state and emit an action id in the
 env's flat scheme, validated against the legal mask. Unlike the trivial engine
 baseline (:meth:`models.player.Player.decide_purchase`, which buys anything
-affordable and never bids/builds/trades), they buy toward monopolies, bid in
-auctions, build houses, and propose set-completing trades -- a *meaningful*
-stationary yardstick and a stronger self-play opponent than the raw baseline.
+affordable and never bids or builds), they buy toward monopolies, bid in
+auctions, and build houses -- a *meaningful* stationary yardstick and a stronger
+self-play opponent than the raw baseline.
 
 They plug into :class:`engine.rl_env.MonopolyEnv` via the state-aware opponent
 protocol (see ``MonopolyEnv._policy_decide``): each agent exposes
-``bind(game, ownable)`` and ``decide(seat, phase, prop, amount, mask, offer)``.
-All valuations reuse the shared :class:`~engine.observation.ObsEncoder`, so the
-bots' economics stay consistent with the env and the GUI.
+``bind(game, ownable)`` and ``decide(seat, phase, prop, amount, mask)``. All
+valuations reuse the shared :class:`~engine.observation.ObsEncoder`, so the bots'
+economics stay consistent with the env and the GUI.
 
-The three variants differ *only* in their per-group priority weights:
+They no longer decide trades. Trading is resolved for *every* seat by the
+heuristic in :mod:`engine.trade`, so the FP bots and the learned agent negotiate
+identically -- which is the point of a fixed benchmark, and what the paper's
+hybrid architecture does too. What still separates FP-A/B/C is their per-group
+priority weights, which drive buying, bidding, and building:
 
 * ``FP_A`` -- equal priority to every group.
 * ``FP_B`` -- railroads and dark-blue (Park Place / Boardwalk) high, utilities low.
@@ -23,11 +27,11 @@ The three variants differ *only* in their per-group priority weights:
 
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE,
-    PHASE_AUCTION, PHASE_TRADE_RESPOND,
+    PHASE_AUCTION,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
     A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
-    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_BID_LEVELS, BID_FRACTIONS, trade_action,
+    A_AUCTION_PASS, A_AUCTION_BID,
+    NUM_OWNABLE, NUM_BID_LEVELS, BID_FRACTIONS,
 )
 from engine.observation import ObsEncoder, safe_default
 from models.tiles.properties.street_property import StreetProperty
@@ -76,11 +80,13 @@ class HeuristicAgent:
         return self.priorities.get(_tile_key(tile), 1.0)
 
     # -- Top-level dispatch -------------------------------------------------
-    def decide(self, seat, phase, prop, amount, mask, offer=None):
+    def decide(self, seat, phase, prop, amount, mask):
         """Return a mask-legal action id for the decision ``seat`` faces.
 
-        ``offer`` is the ``{recv, give, cash}`` trade dict during
-        ``PHASE_TRADE_RESPOND`` (supplied by the env), ``None`` otherwise.
+        Trading is not among them: it is resolved for every seat alike by the
+        heuristic in :mod:`engine.trade`, which these agents no longer need to
+        duplicate. What still distinguishes FP-A/B/C is their property
+        *priorities*, which drive buying, bidding, and building.
         """
         player = self.game.players[seat]
         if phase == PHASE_JAIL:
@@ -89,8 +95,6 @@ class HeuristicAgent:
             return self._decide_buy(player, prop, mask)
         if phase == PHASE_AUCTION:
             return self._decide_auction(player, prop, mask)
-        if phase == PHASE_TRADE_RESPOND:
-            return self._decide_trade_respond(player, offer, mask)
         if phase == PHASE_LIQUIDATE:
             return self._decide_liquidate(player, mask)
         if phase == PHASE_MANAGE:
@@ -133,26 +137,13 @@ class HeuristicAgent:
                 return A_AUCTION_BID + k
         return A_AUCTION_PASS
 
-    def _decide_trade_respond(self, player, offer, mask):
-        """Accept when the offer is non-negative by the shared trade valuation
-        (receive ``offer['recv']`` + cash, give up ``offer['give']``)."""
-        if offer is None:
-            return A_TRADE_REJECT
-        recv, give, cash = offer.get("recv"), offer.get("give"), offer.get("cash", 0)
-        gain = [recv] if recv is not None else []
-        lose = [give] if give is not None else []
-        accepted, _ = self.encoder.accepts(player, gain, lose, cash)
-        if accepted and mask[A_TRADE_ACCEPT]:
-            return A_TRADE_ACCEPT
-        return A_TRADE_REJECT
-
     def _decide_manage(self, player, mask):
-        """One management step: build on the best completed set, else propose a
-        set-completing / denial trade, else lift a mortgage when flush, else stop.
+        """One management step: build on the best completed set, else lift a
+        mortgage when flush, else stop.
 
         Only ever returns a mask-legal action, so each step makes real progress
-        (houses rise, a trade target is consumed, a mortgage lifts) and the env's
-        uncapped manage loop is guaranteed to terminate at ``END_MANAGE``.
+        (houses rise, a mortgage lifts) and the env's uncapped manage loop is
+        guaranteed to terminate at ``END_MANAGE``.
         """
         # 1. Build a house on the highest-priority buildable tile, keeping a cash
         #    buffer so we don't build ourselves into bankruptcy.
@@ -168,19 +159,7 @@ class HeuristicAgent:
         if best_build is not None:
             return A_BUILD + best_build
 
-        # 2. Propose a trade (fair cash tier) for a proposable target, preferring
-        #    one that completes our own set over a pure denial.
-        best_trade, best_completes = None, False
-        for i, p in enumerate(self.ownable):
-            if not mask[trade_action(i, 1)]:
-                continue
-            completes = self.encoder._completes_monopoly_for(player, p)
-            if best_trade is None or (completes and not best_completes):
-                best_trade, best_completes = i, completes
-        if best_trade is not None:
-            return trade_action(best_trade, 1)
-
-        # 3. Lift a mortgage when we are cash-flush (reactivates rent income).
+        # 2. Lift a mortgage when we are cash-flush (reactivates rent income).
         if player.balance >= 2 * self.cash_buffer:
             for i in range(NUM_OWNABLE):
                 if mask[A_UNMORTGAGE + i]:

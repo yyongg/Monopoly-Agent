@@ -138,7 +138,7 @@ class TestSetStrengthReward:
     """The reward prizes a strong monopoly above a weak one of equal sticker
     price, so losing (or giving away) a money set costs more shaped reward than
     trading a cheap one -- the reward-side lever behind smarter trading. ``w=0``
-    recovers the old flat behaviour exactly."""
+    weights every set flat."""
 
     def _util_group(self, env):
         return next(g for g in env.encoder._groups
@@ -149,10 +149,10 @@ class TestSetStrengthReward:
         red = env.game.players[0]
         orange = group_named(env.encoder, "orange")
         give(red, *orange)
-        # w=0 -> every set weighted 1.0, so the owned-monopoly value is just the
+        # w=0 -> every set weighted 1.0, so a complete set's value is just the
         # group's list price and the effective strength is 1.
         assert env._effective_set_strength(orange) == pytest.approx(1.0)
-        assert env._owned_monopoly_value(red) == pytest.approx(
+        assert env._set_net_worth(red) == pytest.approx(
             sum(t.price for t in orange))
 
     def test_a_strong_set_is_worth_more_than_flat(self):
@@ -160,9 +160,9 @@ class TestSetStrengthReward:
         red = env.game.players[0]
         orange = group_named(env.encoder, "orange")
         give(red, *orange)
-        s = env.encoder._set_strength(orange)
+        s = env.encoder.sets.strength(orange)
         assert s > 1.0
-        assert env._owned_monopoly_value(red) == pytest.approx(
+        assert env._set_net_worth(red) == pytest.approx(
             sum(t.price for t in orange) * s)
 
     def test_a_weak_set_is_worth_less_than_flat(self):
@@ -170,7 +170,57 @@ class TestSetStrengthReward:
         red = env.game.players[0]
         util = self._util_group(env)
         give(red, *util)
-        s = env.encoder._set_strength(util)
+        s = env.encoder.sets.strength(util)
         assert s < 1.0
-        assert env._owned_monopoly_value(red) == pytest.approx(
+        assert env._set_net_worth(red) == pytest.approx(
             sum(t.price for t in util) * s)
+
+
+class TestSetProgressReward:
+    """Progress toward a set carries net worth.
+
+    This used to count only groups owned *outright*, so two of the three oranges
+    scored exactly zero -- the policy had no reason to protect a nearly-finished
+    set, and no way to learn why the trade heuristic protects one.
+    """
+
+    def test_partial_progress_is_worth_something(self):
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        give(red, orange[0], orange[1])
+        assert env._set_net_worth(red) > 0.0
+
+    def test_value_rises_with_every_tile(self):
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        seen = []
+        for tile in orange:
+            give(red, tile)
+            seen.append(env._set_net_worth(red))
+        assert seen[0] < seen[1] < seen[2]
+
+    def test_a_complete_set_still_scores_its_full_value(self):
+        """The curve is 1.0 at completion, so a finished set is worth exactly what
+        it was before this change -- the reward scale is untouched, and only the
+        rungs below completion are new."""
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        give(red, *orange)
+        assert env._set_net_worth(red) == pytest.approx(
+            sum(t.price for t in orange) * env.encoder.sets.strength(orange))
+
+    def test_the_reward_is_stage_free(self):
+        """Trades price sets against the board's live cash; the reward must not.
+        A cash-inflating term here would make the shaping potential drift upward
+        and pay the agent for making everyone richer."""
+        env = _env_with_strength_weight(1.0)
+        red = env.game.players[0]
+        orange = group_named(env.encoder, "orange")
+        give(red, *orange)
+        before = env._set_net_worth(red)
+        for p in env.game.players:
+            p.balance = 50_000
+        assert env._set_net_worth(red) == pytest.approx(before)

@@ -42,13 +42,13 @@ class RewardConfig:
     # Weight on the blocking term in *trade* valuation (``_trade_value``), split
     # from the auction weight above so it can be tuned without touching auctions.
     #
-    # This knob is what makes trade possible at all. At 1.0 a set-completing tile
-    # is worth exactly as much to the holder (who blocks) as to the acquirer (who
-    # completes), so the swap is **zero-sum** and there are no gains from trade --
+    # This knob is what makes trade possible at all. At 1.0 a tile is worth
+    # exactly as much to the holder (who blocks) as to the acquirer (who
+    # progresses), so the swap is **zero-sum** and there are no gains from trade --
     # ``accepts()`` then correctly refuses essentially every offer, monopolies
     # stop forming, and games drag to the turn cap. Below 1.0 blocking is worth
     # less than completing, which opens a bargaining range: a deal clears at a
-    # price both sides gain from, while the accept-guard still blocks a giveaway.
+    # price both sides gain from, while ``accepts()`` still refuses a giveaway.
     trade_denial_weight: float = 0.5
     # Turns of expected rent folded into a tile's trade value (list price +
     # trade_income_weight * landing-traffic * nominal rent).
@@ -56,10 +56,15 @@ class RewardConfig:
     # A completed monopoly earns *far* more over a game than its group sticker
     # price, so in *trade* valuations (only -- auction bidding via _bid_value is
     # deliberately left at the sticker premium to keep auction economics near
-    # retail) we prize completing/denying a set at this multiple of its base
-    # ``monopoly_bonus * group_price`` value. Stops opponents cheaply buying a
-    # set-completer out of the agent for a small cash premium.
+    # retail) a set is priced at this multiple of its base ``monopoly_bonus *
+    # group_price`` value. The dollar scale of the whole set-value model
+    # (``engine.valuation.SetValuer.monopoly_value``); the per-set tilt on top of
+    # it is ``set_strength_clamp`` / ``set_quality_clamp`` below.
     trade_monopoly_mult: float = 3.0
+    # Largest package (tiles per side) the heuristic trade engine will assemble.
+    # The engine's ``execute_trade`` takes arbitrary lists both ways; this only
+    # bounds the greedy search in ``engine.trade``. A human can still stack more.
+    trade_max_package: int = 3
     # Extra weight, in trade valuations, on completing/denying a set that would
     # be the *game's first* monopoly (none owned by anyone yet): the set value is
     # scaled by ``1 + trade_first_monopoly_weight``. Being first to a set (or
@@ -113,40 +118,64 @@ class RewardConfig:
     # harmonic-mean house cost, so the *average* build bonus is unchanged and
     # only its distribution across colours shifts.
     build_roi_ref_house_cost: float = 95.0
-    # Set-completion tilt: avg group dev-ROI / set_roi_ref, clamped so it nudges
-    # rather than dominates the sticker/traffic value in a trade. (Superseded in
-    # the trade path by set_strength below, which weighs traffic AND absolute
-    # rent; kept for back-compat / the sidecar round-trip.)
-    set_roi_ref: float = 1.3
-    set_quality_clamp: tuple = (0.75, 1.25)
 
     # -- Per-set strength: value a monopoly by its real earning power ------
-    # A single per-group multiplier from traffic x full-development rent,
-    # normalised so the *average* group scores ~1.0 (it redistributes the flat
-    # trade_monopoly_mult across sets rather than changing the overall scale).
-    # High-traffic money sets (orange/red) land well above 1; cheap low-traffic
-    # sets (utilities/brown) land near the floor -- which stops a 2-tile $300
-    # Utility "monopoly" from being priced like the orange set and ping-ponged
-    # for cash. Computed in ObsEncoder._set_strength and clamped to this range.
-    set_strength_clamp: tuple = (0.3, 2.0)
-    # How strongly the *reward's* owned-monopoly net worth (and the one-time
-    # first-monopoly / denial bonuses) tilt by set strength: effective strength
-    # is 1 + w*(strength - 1). w=0 recovers the old flat behaviour exactly (a
-    # safe ablation baseline); w=1 is full strength. The trade valuation always
-    # uses full strength; this knob only governs the reward shaping.
+    # See engine.valuation.SetValuer. A per-group multiplier blending two terms,
+    # each normalised by its own mean across the 10 groups so the *average* group
+    # scores ~1.0 -- it redistributes trade_monopoly_mult across sets rather than
+    # changing the overall scale:
+    #
+    #   power(G)      = sum over the group of traffic x full-development rent
+    #   efficiency(G) = power(G) / (group price + cost of a hotel on every tile)
+    #   strength(G)   = clamp(norm(power) * clamp(norm(efficiency), *set_quality_clamp))
+    #
+    # The efficiency term is what makes this match real play. Ranking on power
+    # alone put **green above orange** -- green has the highest hotel rent but
+    # costs $3,000 to develop and has the worst payback of any street set. The
+    # cost tilt flips that: orange 1.73 > red 1.49 > yellow > dark_blue >
+    # green 1.21 > pink > railroad > light_blue > brown/utility (both at the
+    # floor). Utilities score 0.04 raw -- a 2-tile $300 "monopoly" is not a
+    # monopoly, and pricing it like the orange set is what had the agents
+    # ping-ponging sets for cash.
+    set_quality_clamp: tuple = (0.75, 1.25)   # clamp on the efficiency tilt
+    set_strength_clamp: tuple = (0.15, 2.0)   # clamp on the blended strength
+    # How strongly the *reward's* set net worth (and the one-time first-monopoly
+    # / denial bonuses) tilt by set strength: effective strength is
+    # 1 + w*(strength - 1). w=0 recovers flat behaviour exactly (a safe ablation
+    # baseline); w=1 is full strength. Trade valuation always uses full strength;
+    # this knob only governs the reward shaping.
     set_strength_reward_weight: float = 1.0
+    # How set value grows with how much of the group you hold:
+    # ``f(k, n) = (k/n) ** set_progress_exponent``, so a group you own k of n of
+    # is worth ``monopoly_value(G) * f(k, n)``.
+    #
+    # This exponent is the fix for the junk-for-monopoly exploit. The old
+    # valuation gave a set premium **only** when a tile was exactly one away from
+    # completing, so a player 2/3 of the way to orange priced St. James at
+    # sticker ($227) and would sell it for a brown + $200 -- while the same tile
+    # was worth $4,937 once the set was complete. A 21.7x cliff with nothing in
+    # between. The curve replaces that step with a gradient (now ~2x): >1 keeps
+    # completion the biggest single jump, while every rung below it still costs
+    # real money. 1.0 would price each tile of a set identically; very high
+    # values re-create the cliff.
+    set_progress_exponent: float = 2.5
+
+    # -- Game stage: cash inflates, so property costs more cash later ------
+    # Every player collects $200 a lap, so late-game balances dwarf the $1,500
+    # start and a flat set price gets cheap in real terms. Trade set values scale
+    # by ``clamp(1 + w * (mean live balance / 1500 - 1), 1.0, cap)``: $1,500 ->
+    # 1.00, $2,600 -> 1.37, $4,800+ -> 2.00 at the defaults.
+    #
+    # Measured cash on the board, not the turn count: it is what "inflation"
+    # actually means here, and it self-calibrates (a poor, stalled game does not
+    # inflate). Deliberately **not** applied to the reward -- see
+    # engine.rewards._set_net_worth.
+    stage_inflation_weight: float = 0.5
+    stage_inflation_cap: float = 2.0
 
     # -- Observation scaling -----------------------------------------------
     # Divides the expected-profit-per-turn dollar figure into feature range.
     profit_scale: float = 1000.0
-
-    # -- GUI trade heuristic (ui/ai_player.GUIAIDecider) -------------------
-    # Value of a freshly completed monopoly beyond its tiles' list price, as a
-    # multiple of the group price, when judging a trade.
-    set_bonus: float = 1.0
-    # Extra value the AI places on a tile it already owns when deciding to part
-    # with it (list price * (1 + keep_premium)), so it demands a real premium.
-    keep_premium: float = 0.5
 
 
 # Default instance whose fields back the module-level constants below.
@@ -169,13 +198,14 @@ AUCTION_ACQUISITION_BONUS_COEF = DEFAULT_REWARD_CONFIG.auction_acquisition_bonus
 BUY_PREFERENCE_COEF = DEFAULT_REWARD_CONFIG.buy_preference_coef
 BUILD_BONUS_COEF = DEFAULT_REWARD_CONFIG.build_bonus_coef
 BUILD_ROI_REF_HOUSE_COST = DEFAULT_REWARD_CONFIG.build_roi_ref_house_cost
-SET_ROI_REF = DEFAULT_REWARD_CONFIG.set_roi_ref
 SET_QUALITY_CLAMP = DEFAULT_REWARD_CONFIG.set_quality_clamp
 SET_STRENGTH_CLAMP = DEFAULT_REWARD_CONFIG.set_strength_clamp
 SET_STRENGTH_REWARD_WEIGHT = DEFAULT_REWARD_CONFIG.set_strength_reward_weight
+SET_PROGRESS_EXPONENT = DEFAULT_REWARD_CONFIG.set_progress_exponent
+STAGE_INFLATION_WEIGHT = DEFAULT_REWARD_CONFIG.stage_inflation_weight
+STAGE_INFLATION_CAP = DEFAULT_REWARD_CONFIG.stage_inflation_cap
+TRADE_MAX_PACKAGE = DEFAULT_REWARD_CONFIG.trade_max_package
 PROFIT_SCALE = DEFAULT_REWARD_CONFIG.profit_scale
-SET_BONUS = DEFAULT_REWARD_CONFIG.set_bonus
-KEEP_PREMIUM = DEFAULT_REWARD_CONFIG.keep_premium
 
 
 # --- Run metadata: tying a saved model to the knobs it was trained with -----

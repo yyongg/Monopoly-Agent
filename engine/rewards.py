@@ -36,31 +36,45 @@ class RewardMixin:
                 # Value houses above cost (same premium as properties): they
                 # multiply rent, so building should be a small net gain.
                 total += prop.houses * prop.house_cost() * (1.0 + premium)
-        # Reward holding *complete* sets: each fully-owned group adds a bonus,
-        # so the tile that finishes a monopoly is a big net-worth jump.
-        total += self.cfg.monopoly_bonus * self._owned_monopoly_value(player)
+        # Reward progress toward sets, not just finished ones (see
+        # :meth:`_set_net_worth`).
+        total += self.cfg.monopoly_bonus * self._set_net_worth(player)
         return total
 
     def _effective_set_strength(self, grp):
-        """The shared per-set strength (:meth:`ObsEncoder._set_strength`) tilted
-        by ``set_strength_reward_weight`` (w): ``1 + w*(strength - 1)``. ``w=0``
-        recovers the old flat behaviour (every set weighted 1.0); ``w=1`` is full
-        strength. Read by the owned-monopoly net worth and the one-time
-        first-monopoly / denial bonuses, so the reward prizes a high-traffic money
-        set above a cheap one -- the same ordering trades use."""
+        """The shared per-set strength (:meth:`engine.valuation.SetValuer.strength`)
+        tilted by ``set_strength_reward_weight`` (w): ``1 + w*(strength - 1)``.
+        ``w=0`` weights every set 1.0 (a flat ablation baseline); ``w=1`` is full
+        strength. Read by the set net worth and the one-time first-monopoly /
+        denial bonuses, so the reward prizes a high-traffic money set above a
+        cheap one -- the same ordering trades use."""
         w = self.cfg.set_strength_reward_weight
-        return 1.0 + w * (self.encoder._set_strength(grp) - 1.0)
+        return 1.0 + w * (self.encoder.sets.strength(grp) - 1.0)
 
-    def _owned_monopoly_value(self, player):
-        """Strength-weighted value of the monopoly groups ``player`` fully owns:
-        each set's total list price times its :meth:`_effective_set_strength`, so
-        holding (and thus losing) a strong set moves net worth -- and the shaped
-        reward -- more than a weak one of equal sticker price."""
+    def _set_net_worth(self, player):
+        """What ``player``'s progress toward each colour group is worth: for every
+        group, its list price, tilted by :meth:`_effective_set_strength` and
+        scaled by how much of it ``player`` holds
+        (:meth:`engine.valuation.SetValuer.held_fraction`).
+
+        The completion curve is the point. This used to count only groups the
+        player owned *outright*, so holding two of the three oranges scored
+        exactly zero -- the policy had no reason to protect a nearly-finished set,
+        and no way to learn why the trade heuristic protects one. A full set still
+        scores exactly what it did before (the curve is 1.0 there), so the reward
+        scale is unchanged; everything below it is new signal.
+
+        Deliberately **stage-free**, unlike the trade valuation: a cash-inflation
+        multiplier here would make the shaping potential drift upward with the
+        board's cash and pay the agent for making everyone richer. Trades price
+        against today's cash; net worth is absolute.
+        """
         total = 0.0
         for tiles in self.encoder._groups:
-            if all(t.owner is player for t in tiles):
-                total += (sum(t.price for t in tiles)
-                          * self._effective_set_strength(tiles))
+            held = self.encoder.sets.held_fraction(player, tiles)
+            if held > 0.0:
+                total += (self.encoder.sets.group_price(tiles)
+                          * self._effective_set_strength(tiles) * held)
         return total
 
     # -- One-time shaped bonuses -------------------------------------------

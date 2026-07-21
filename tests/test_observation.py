@@ -1,20 +1,30 @@
 """What the policy can actually see.
 
 The observation is shape-locked to a trained model, so these tests double as the
-record of what dimension ``265`` means.
+record of what dimension ``261`` means.
 """
 
 import numpy as np
 
-from engine.constants import PHASE_AUCTION, PHASE_LIQUIDATE, PHASE_MANAGE
+from engine.constants import NUM_ACTIONS, PHASE_AUCTION, PHASE_LIQUIDATE, PHASE_MANAGE
 from engine.observation import observation_length
 from tests.conftest import give, group_named
 
 
 def test_observation_length_matches_the_encoder(encoder):
+    # 261, down from 265 when trading left the policy: the three trade-context
+    # features (tile in, tile out, cash) and the PHASE_TRADE_RESPOND slot of the
+    # phase one-hot all describe a decision the policy is no longer asked to make.
     obs = encoder._encode_obs(0, PHASE_MANAGE, None)
-    assert obs.shape == (observation_length(4),) == (265,)
+    assert obs.shape == (observation_length(4),) == (261,)
     assert obs.dtype == np.float32
+
+
+def test_the_action_space_has_no_trade_actions(encoder):
+    # 125, down from 211: the 84-id trade band (28 tiles x 3 cash tiers) plus
+    # accept/reject. Trades are resolved by engine.trade, never by the policy.
+    assert NUM_ACTIONS == 125
+    assert len(encoder._legal_mask(PHASE_MANAGE, None, 0)) == 125
 
 
 def test_the_agent_can_see_the_debt_it_owes(game, encoder, ownable):

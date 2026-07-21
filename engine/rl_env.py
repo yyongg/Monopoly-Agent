@@ -83,16 +83,17 @@ from data.decks import build_chance_deck, build_community_deck
 # :mod:`engine.config` and the valuations from :mod:`engine.observation`.
 from engine.constants import (
     PHASE_JAIL, PHASE_BUY, PHASE_MANAGE, PHASE_LIQUIDATE, PHASE_TERMINAL,
-    PHASE_AUCTION, PHASE_TRADE_RESPOND,
+    PHASE_AUCTION,
     A_PAY_JAIL, A_USE_CARD, A_ROLL_JAIL, A_BUY, A_DECLINE, A_END_MANAGE,
-    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE, A_TRADE,
-    A_TRADE_ACCEPT, A_TRADE_REJECT, A_AUCTION_PASS, A_AUCTION_BID,
-    NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS, NUM_TRADE_TIERS,
-    BID_FRACTIONS, BID_CEILING_MULT, decode_trade_action,
+    A_BUILD, A_SELL, A_MORTGAGE, A_UNMORTGAGE,
+    A_AUCTION_PASS, A_AUCTION_BID,
+    NUM_OWNABLE, NUM_GROUPS, NUM_BID_LEVELS, NUM_ACTIONS,
+    BID_FRACTIONS, BID_CEILING_MULT,
 )
 from engine.config import RewardConfig
 from engine.observation import ObsEncoder, observation_length, build_groups
 from engine.rewards import RewardMixin
+from engine.trade import TradeEngine
 
 try:  # Gymnasium is optional; the env works standalone without it.
     from gymnasium import Env as _GymEnv
@@ -230,6 +231,9 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         # solvency_penalty_coef=...)`` instead of monkeypatching module globals.
         self.cfg = cfg or RewardConfig()
         self.encoder = ObsEncoder(self.cfg, max_turns=max_turns)
+        # Trades are resolved by heuristic, never by the policy -- see
+        # engine/trade.py for why. One engine drives every seat.
+        self.trades = TradeEngine(self.encoder, on_offer=self._report_trade)
 
         # Cross-thread channels and per-episode worker state.
         self._req_q = queue.Queue()
@@ -242,8 +246,6 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         self._cur_mask = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._cur_prop = None      # property offered (BUY/AUCTION) or liquidated
         self._cur_amount = 0       # shortfall amount (LIQUIDATE)
-        self.encoder._cur_trade = None     # offer being judged (PHASE_TRADE_RESPOND)
-        self.encoder._traded_this_manage = set()  # trade targets tried this MANAGE phase
         # Optional observer, called as on_trade_offer(initiator, partner, offer,
         # accepted, completes_set) for every trade the agent or an opponent
         # proposes. Left as None in training; the analytics harness subscribes.
@@ -384,12 +386,6 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             if hasattr(policy, "bind"):
                 policy.bind(self.game, self.ownable)
             self._deciders[s] = self._make_policy_decider(s)
-        # Tell the encoder which seats overpay for a set, so the trade mask gates
-        # proposals on the *same* offer this env will actually build (see
-        # ``ObsEncoder._offer_would_clear`` / :meth:`_overpay_for_set`).
-        self.encoder.overpay_seats = {
-            s for s in range(self.num_players)
-            if not hasattr(self._opponent_policies.get(s), "decide")}
         for s, decide in self._deciders.items():
             self.game.players[s].decide_purchase = self._make_buy_hook(s, decide)
             self.game.players[s].decide_bid = self._make_bid_hook(s, decide)
@@ -568,11 +564,16 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         g.advance_turn()
 
     def _manage_phase(self, player, decide):
-        """Lets ``player`` issue management actions until it chooses to stop."""
-        # A trade target is offered at most once per MANAGE phase; re-proposing a
-        # rejected trade changes no state, so without this the phase could spin
-        # forever on a repeatedly-declined offer.
-        self.encoder._traded_this_manage = set()
+        """Lets ``player`` issue management actions until it chooses to stop.
+
+        Trading happens first, and is not one of those actions: the heuristic
+        (:mod:`engine.trade`) runs its own round for every seat, policy-driven or
+        not. Trades come before the policy acts so a set completed by trade can be
+        built on in the same phase.
+        """
+        self.trades.run_round(player)
+        if player.bankrupt:
+            return
         while True:
             action = decide(PHASE_MANAGE)
             if action == A_END_MANAGE:
@@ -647,8 +648,7 @@ class MonopolyEnv(RewardMixin, _GymEnv):
         mask = self.encoder._legal_mask(phase, prop, seat)
         if hasattr(policy, "decide"):
             action = int(policy.decide(seat, phase, prop, amount,
-                                       mask.astype(bool),
-                                       offer=self.encoder._cur_trade))
+                                       mask.astype(bool)))
         else:
             obs = self.encoder._encode_obs(seat, phase, prop, amount)
             action = int(policy(obs, mask.astype(bool)))
@@ -663,8 +663,6 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             return A_DECLINE
         if phase == PHASE_AUCTION:
             return A_AUCTION_PASS
-        if phase == PHASE_TRADE_RESPOND:
-            return A_TRADE_REJECT
         return A_END_MANAGE  # MANAGE / LIQUIDATE: do nothing further
 
     # -- Applying actions ---------------------------------------------------
@@ -689,73 +687,15 @@ class MonopolyEnv(RewardMixin, _GymEnv):
             g.mortgage_property(self.ownable[action - A_MORTGAGE], player)
         elif A_UNMORTGAGE <= action < A_UNMORTGAGE + NUM_OWNABLE:
             g.unmortgage_property(self.ownable[action - A_UNMORTGAGE], player)
-        elif A_TRADE <= action < A_TRADE + NUM_OWNABLE * NUM_TRADE_TIERS:
-            i, tier = decode_trade_action(action)
-            self.encoder._traded_this_manage.add(i)
-            self._attempt_trade(player, self.ownable[i], tier)
-
-    def _overpay_for_set(self, initiator, target):
-        """Whether ``initiator`` may spend surplus cash (above its rent reserve)
-        to complete its own monopoly -- the ``overpay`` flag of
-        :meth:`ObsEncoder.build_offer`, which applies it only to a swap that
-        actually completes a set.
-
-        Gated to *learned* policies -- the agent seat and self-play snapshots --
-        so the hand-crafted FP baselines stay the fixed benchmark: a seat driven
-        by a ``HeuristicAgent`` (it has ``.decide``) keeps the conservative
-        break-even cap. An opponent seat with no policy (the trivial baseline)
-        never proposes trades, so it never reaches here.
-
-        Delegates to the encoder (populated in :meth:`_wire_deciders`) so the
-        trade mask and the proposal it gates read one definition."""
-        return self.encoder._overpays(initiator)
-
-    def _attempt_trade(self, initiator, target, tier=1):
-        """Offers a trade to acquire ``target`` at cash ``tier``.
-
-        The offer itself is built by :meth:`ObsEncoder.build_offer` -- the one
-        implementation, shared with the GUI, so the deal the policy learns to
-        propose is the deal it proposes in play. The partner's decider (the agent
-        via the queue, an opponent policy synchronously, or a policy-less
-        baseline via :meth:`ObsEncoder.accepts`) then accepts or rejects, and on
-        acceptance the swap runs through :meth:`Game.execute_trade`.
-        """
-        g = self.game
-        partner = target.owner
-        offer = self.encoder.build_offer(
-            initiator, target, tier,
-            overpay=self._overpay_for_set(initiator, target))
-        if offer is None:
-            self._report_trade(initiator, partner, None, False, False)
-            return
-        give, receive, cash = offer
-        # Evaluated *before* the swap, while the initiator still lacks the tile.
-        completes = self.encoder._completes_monopoly_for(initiator, target)
-
-        partner_seat = g.players.index(partner)
-        decide = self._deciders.get(partner_seat)
-        if decide is not None:
-            # From the partner's view they receive ``give`` plus ``cash`` and
-            # part with ``target``; expose that as the response observation.
-            self.encoder._cur_trade = {"recv": give, "give": target, "cash": cash}
-            action = decide(PHASE_TRADE_RESPOND, target, cash)
-            self.encoder._cur_trade = None
-            accept = action == A_TRADE_ACCEPT
-        else:
-            accept, _ = self.encoder.accepts(partner, [give], receive, cash)
-
-        executed = bool(
-            accept and g.execute_trade(initiator, partner, [give], receive, cash))
-        self._report_trade(initiator, partner, offer, executed, completes)
 
     def _report_trade(self, initiator, partner, offer, accepted, completes):
         """Announces the outcome of a trade proposal to ``on_trade_offer``.
 
         A first-class observation point for the analytics (accept/reject rates,
-        set-completing trades), which used to get at this by monkey-patching
-        ``_attempt_trade`` itself -- so any change to a private method silently
-        broke the harness. ``offer`` is ``None`` when no sane offer could be
-        built (nothing to give, or a swap that loses value at any price).
+        set-completing trades), which used to get at this by monkey-patching the
+        trade internals -- so any change to a private method silently broke the
+        harness. Wired into :class:`~engine.trade.TradeEngine` as its
+        ``on_offer`` callback.
         """
         if self.on_trade_offer is not None:
             self.on_trade_offer(initiator, partner, offer, accepted, completes)

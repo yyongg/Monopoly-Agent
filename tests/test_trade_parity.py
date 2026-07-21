@@ -1,22 +1,22 @@
-"""Train/play parity for trade construction.
+"""Train/play parity for trades.
 
 The project's core guarantee is that the agent you train is the agent you play
-against: one ``ObsEncoder`` computes the observation, the masks, and every
-valuation for both the training env and the GUI. Trades are the one place that
-guarantee is maintained by hand -- ``engine/rl_env.py::_attempt_trade`` and
-``ui/ai_player.py::_attempt_trade`` are two separate implementations, the latter
-carrying the comment *"Kept byte-identical to the env path"*.
+against. Trades used to be where that guarantee was weakest: two offer builders
+(``rl_env._attempt_trade`` and ``ui/ai_player._attempt_trade``, the latter
+carrying the comment *"Kept byte-identical to the env path"*) and three accept
+rules, held together by comment discipline -- and they had already drifted. Worse,
+the GUI put one-for-one offers to the *model* while a human stacking tiles fell
+through to the formula, so the accept rate training measured was not the one a
+human faced.
 
-These tests hold the two to that claim: given the same board, the same seats and
-the same cash tier, both must construct the *same offer* -- the same tile handed
-over and the same cash. If they don't, the policy is trained against economics it
-will never meet in the GUI.
+There is now one :class:`~engine.trade.TradeEngine` and one
+:meth:`ObsEncoder.accepts`, so parity is structural rather than maintained. These
+tests are the guard against a second path quietly growing back.
 """
 
 import numpy as np
 import pytest
 
-from engine.constants import A_TRADE_ACCEPT, PHASE_TRADE_RESPOND
 from engine.rl_env import MonopolyEnv
 from tests.conftest import give, group_named
 from ui.ai_player import GUIAIDecider
@@ -28,187 +28,96 @@ def env():
     env = MonopolyEnv(seat=0, num_players=4, seed=0)
     env.np_random = np.random.default_rng(0)
     env._build_game()
-    env._deciders = {}           # no policy seats: the partner uses the formula
-    env._opponent_policies = {}  # ...and seat 0 counts as a learned policy
+    env._deciders = {}
+    env._opponent_policies = {}
     return env
 
 
-def _capture(game, run):
-    """Runs ``run()`` with acceptance forced and ``execute_trade`` stubbed, and
-    returns the offer that was constructed as ``(give_tile, cash)`` -- or None if
-    the path never got as far as proposing one."""
-    captured = []
-    real_execute = game.execute_trade
-
-    def spy(initiator, partner, give_tiles, receive, cash):
-        captured.append((give_tiles[0], cash))
-        return True
-
-    game.execute_trade = spy
-    try:
-        run()
-    finally:
-        game.execute_trade = real_execute
-    return captured[0] if captured else None
-
-
-def _offers(env, seat, target, tier):
-    """The offer each of the two code paths builds for the same situation.
-
-    Both partners are forced to accept -- via the partner's *decider* in the env
-    and via the app's *arbiter* in the GUI -- so acceptance never masks a
-    difference in the offer itself, and neither stub perturbs the offer builder.
-    """
-    game, initiator = env.game, env.game.players[seat]
-    partner_seat = game.players.index(target.owner)
-
-    # -- training path: MonopolyEnv._attempt_trade
-    env._deciders = {partner_seat: lambda phase, prop=None, amount=0: A_TRADE_ACCEPT}
-    env_offer = _capture(game, lambda: env._attempt_trade(initiator, target, tier))
-
-    # -- play path: GUIAIDecider._attempt_trade, on the same live game
-    gui = GUIAIDecider(env.num_players, model=None)
-    gui.bind(game, env.ownable)
-    gui.trade_arbiter = lambda *a, **k: True
-    gui_offer = _capture(game, lambda: gui._attempt_trade(initiator, target, tier))
-
-    return env_offer, gui_offer
-
-
-@pytest.mark.parametrize("tier", [0, 1, 2])
-def test_set_completing_offer_matches(env, tier):
-    """A rich agent buying the tile that completes its own monopoly -- the
-    'overpay from surplus' path both sides implement."""
+def _one_away(env):
+    """Red holds 2/3 of orange and the cash to buy the third from Blue."""
     enc = env.encoder
     red, blue = env.game.players[0], env.game.players[1]
     orange = group_named(enc, "orange")
-    brown = group_named(enc, "brown")
-
-    give(red, orange[0], orange[1], brown[0])   # brown[0] is the spare to hand over
-    give(blue, orange[2])                       # the contested set-completer
-    red.balance = 5000
-
-    assert enc._completes_monopoly_for(red, orange[2])
-
-    env_offer, gui_offer = _offers(env, 0, orange[2], tier)
-
-    assert env_offer is not None, "the training path proposed nothing"
-    assert gui_offer is not None, "the GUI path proposed nothing"
-    assert env_offer == gui_offer
-
-
-@pytest.mark.parametrize("tier", [0, 1, 2])
-def test_denial_offer_matches(env, tier):
-    """Prying a tile off an opponent who is cornering a set. This is the path
-    where the two implementations diverge: the GUI caps the cash at its own
-    break-even, the env has no such cap."""
-    enc = env.encoder
-    red, blue = env.game.players[0], env.game.players[1]
-    orange = group_named(enc, "orange")
-    brown = group_named(enc, "brown")
-
-    give(red, orange[0], brown[0])
-    give(blue, orange[1], orange[2])            # Blue is one tile off the set
-    red.balance = 5000
-
-    assert not enc._completes_monopoly_for(red, orange[1])
-    assert enc._denies_monopoly(red, blue, orange[1])
-
-    env_offer, gui_offer = _offers(env, 0, orange[1], tier)
-
-    assert env_offer is not None, "the training path proposed nothing"
-    assert gui_offer is not None, "the GUI path proposed nothing"
-    assert env_offer == gui_offer
-
-
-def test_a_poor_agent_keeps_its_rent_cushion(env):
-    """The surplus-overpay rule exists to stop the agent buying a set and going
-    broke: it may spend only the cash above its rent-sized reserve."""
-    enc = env.encoder
-    red, blue = env.game.players[0], env.game.players[1]
-    orange = group_named(enc, "orange")
-    brown = group_named(enc, "brown")
-
-    give(red, orange[0], orange[1], brown[0])
-    give(blue, orange[2])
-    # Give Blue enough developed board presence that Red's reserve is real.
-    for tile in group_named(enc, "red"):
-        give(blue, tile)
-    red.balance = 800
-
-    reserve = enc._cash_reserve(red)
-    assert reserve > 0, "expected Blue's holdings to create rent exposure"
-
-    env_offer, gui_offer = _offers(env, 0, orange[2], tier=2)
-
-    assert env_offer == gui_offer
-    if env_offer is not None:
-        _, cash = env_offer
-        assert cash <= max(0, int(red.balance - reserve))
-
-
-# --- Parity on the *responding* side -------------------------------------
-#
-# The tests above pin how an offer is BUILT. They say nothing about the
-# observation handed to the policy when it is asked to ANSWER one -- which is a
-# separate call site in each path, and is exactly where `amount` was left at its
-# default of 0 in the GUI while the env passed the trade cash.
-
-
-def _respond_obs(env, seat, recv, give_tile, cash, amount):
-    """The observation a PHASE_TRADE_RESPOND decision is encoded from."""
-    enc = env.encoder
-    enc._cur_trade = {"recv": recv, "give": give_tile, "cash": cash}
-    try:
-        return enc._encode_obs(seat, PHASE_TRADE_RESPOND, give_tile, amount)
-    finally:
-        enc._cur_trade = None
-
-
-def test_trade_response_obs_matches(env):
-    """The GUI must ask the model the *same question* the env asks it.
-
-    ``rl_env._attempt_trade`` responds with ``decide(PHASE_TRADE_RESPOND, target,
-    cash)``; the GUI's ``evaluate_trade`` must pass that same cash as ``amount``.
-    Letting it default to 0 changed two of the 265 features (the amount and its
-    coverage) and flipped ~3% of accept decisions -- a divergence invisible to
-    the offer-construction tests above, because the offer is identical either way.
-    """
-    enc = env.encoder
-    red, blue = env.game.players[0], env.game.players[1]
-    orange = group_named(enc, "orange")
-    brown = group_named(enc, "brown")
-
-    give(red, orange[0], orange[1], brown[0])
+    give(red, orange[0], orange[1], group_named(enc, "brown")[0])
     give(blue, orange[2])
     red.balance = 5000
+    return red, blue, orange[2]
 
-    offer = enc.build_offer(red, orange[2], tier=1, overpay=True)
-    assert offer is not None and offer.cash > 0, "need a cash-carrying offer"
 
-    blue_seat = env.game.players.index(blue)
-    as_trained = _respond_obs(env, blue_seat, offer.give, orange[2],
-                              offer.cash, offer.cash)
-    amount_dropped = _respond_obs(env, blue_seat, offer.give, orange[2],
-                                  offer.cash, 0)
-
-    # Guard the guard: if these ever coincide, the test has stopped testing.
-    assert not np.array_equal(as_trained, amount_dropped), (
-        "the amount feature no longer affects the observation -- this test is "
-        "no longer pinning anything")
+def test_the_env_and_the_gui_build_the_same_offer(env):
+    """Same board, same seats, same offer -- tile for tile and dollar for dollar."""
+    red, blue, _ = _one_away(env)
 
     gui = GUIAIDecider(env.num_players, model=None)
     gui.bind(env.game, env.ownable)
 
-    seen = {}
-    gui._decide = lambda seat, phase, prop=None, amount=0: seen.update(
-        obs=_respond_obs(env, seat, offer.give, prop, offer.cash, amount)
-    ) or A_TRADE_ACCEPT
-    gui.model = object()   # take the model branch, not the formula fallback
+    env_offer = env.trades.best_offer(red, blue)
+    gui_offer = gui.trades.best_offer(red, blue)
 
-    gui.evaluate_trade(blue, red, [offer.give], [orange[2]], offer.cash)
+    assert env_offer is not None, "the training path proposed nothing"
+    assert gui_offer is not None, "the GUI path proposed nothing"
+    assert [t.name for t in env_offer.give] == [t.name for t in gui_offer.give]
+    assert [t.name for t in env_offer.receive] == [t.name for t in gui_offer.receive]
+    assert env_offer.cash == gui_offer.cash
 
-    assert "obs" in seen, "the GUI never reached the model branch"
-    np.testing.assert_array_equal(
-        seen["obs"], as_trained,
-        "the GUI encodes a trade response differently than the training env")
+
+def test_the_gui_answers_an_offer_with_the_shared_rule(env):
+    """``GUIAIDecider.evaluate_trade`` *is* ``ObsEncoder.accepts``.
+
+    It used to route one-for-one offers to the model instead, which accepted ~85%
+    of everything -- so a human could hand the AI junk for a monopoly. A model is
+    attached here precisely to prove it no longer gets a vote.
+    """
+    red, blue, target = _one_away(env)
+
+    gui = GUIAIDecider(env.num_players, model=None)
+    gui.bind(env.game, env.ownable)
+
+    class _AlwaysAccepts:
+        def predict(self, *a, **k):
+            raise AssertionError("the model must not decide trades")
+
+    gui.model = _AlwaysAccepts()
+
+    brown = group_named(env.encoder, "brown")[0]
+    gui_verdict, gui_value = gui.evaluate_trade(blue, red, [brown], [target], 50)
+    enc_verdict, enc_value = env.encoder.accepts(blue, [brown], [target], 50)
+    assert (gui_verdict, gui_value) == (enc_verdict, enc_value)
+
+
+def test_a_human_stacking_tiles_is_priced_the_same_way(env):
+    """The offer shape that used to fall through to a *different* rule. Any number
+    of tiles either way, priced by the one valuation."""
+    enc = env.encoder
+    red, blue = env.game.players[0], env.game.players[1]
+    orange = group_named(enc, "orange")
+    browns = group_named(enc, "brown")
+    lights = group_named(enc, "light_blue")
+
+    give(red, orange[0], orange[1])
+    give(blue, *browns, *lights)
+
+    gui = GUIAIDecider(env.num_players, model=None)
+    gui.bind(env.game, env.ownable)
+    gui.model = object()   # must be ignored
+
+    stacked = list(browns) + list(lights)
+    assert gui.evaluate_trade(red, blue, stacked, [orange[0]], 0) == \
+        enc.accepts(red, stacked, [orange[0]], 0)
+
+
+def test_the_junk_for_monopoly_trade_is_refused_in_the_gui(env):
+    """End to end, on the path the bug was actually reported on: a human offering
+    a brown and $200 for the orange tile the AI is one short of."""
+    red, blue = env.game.players[0], env.game.players[1]
+    orange = group_named(env.encoder, "orange")
+    brown = group_named(env.encoder, "brown")[0]
+    give(red, orange[0], orange[1])
+    give(blue, brown)
+
+    gui = GUIAIDecider(env.num_players, model=None)
+    gui.bind(env.game, env.ownable)
+    gui.model = object()
+
+    accepted, _ = gui.evaluate_trade(red, blue, [brown], [orange[0]], 200)
+    assert not accepted
