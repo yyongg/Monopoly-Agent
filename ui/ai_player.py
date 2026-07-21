@@ -45,7 +45,7 @@ class GUIAIDecider:
         # Callback used to report each AI move to the GUI game log. Defaults to
         # a no-op so the decider also works headless; ``MonopolyApp`` sets it to
         # ``add_log`` so the player can see what the AI did.
-        self.log = log or (lambda message: None)
+        self.log = log or (lambda message, **kwargs: None)
         self.game = None
         self.ownable = []
         # Observation encoder: the single shared implementation of obs
@@ -211,13 +211,18 @@ class GUIAIDecider:
             price = f" for ${-cash} back"
         else:
             price = ""
+        # The structured deal rides along with the line so the GUI can show the
+        # cards on hover (headless callers ignore the extra keyword).
+        detail = {"proposer": initiator.name, "partner": partner.name,
+                  "give": list(give), "receive": list(receive), "cash": cash,
+                  "accepted": bool(executed)}
         if not executed:
             self.log(f"{partner.name} declined {initiator.name} [AI]'s offer of "
-                     f"{gave}{price} for {got}.")
+                     f"{gave}{price} for {got}.", trade=detail)
             return
         note = " (completing a set)" if completes else ""
         self.log(f"{initiator.name} [AI] traded {gave}{price} to "
-                 f"{partner.name} for {got}{note}.")
+                 f"{partner.name} for {got}{note}.", trade=detail)
 
     def evaluate_trade(self, me, other, gain, lose, cash_delta):
         """Decides whether ``me`` accepts a trade, and what it is worth to them.

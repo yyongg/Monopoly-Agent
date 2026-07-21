@@ -33,6 +33,12 @@ BOARD_X, BOARD_Y, BOARD_PX = 20, 20, 880
 SIDE_X = 920
 SIDE_W = WIDTH - SIDE_X - 20
 TOKEN_PX = 40
+# Width log text wraps to: the side column minus a permanent scrollbar gutter
+# (so a line's wrapping never changes as the log grows past one screen) and
+# minus the indent that continuation lines are drawn at.
+SCROLLBAR_W = 9
+LOG_INDENT = 14
+LOG_TEXT_W = SIDE_W - SCROLLBAR_W - 8 - LOG_INDENT
 
 
 class _ScaledDisplay:
@@ -274,9 +280,12 @@ def _run_setup(screen, clock, model_available):
             # Human / AI / FP toggle buttons (right side of row). "AI" is the
             # trained model (disabled without one); "FP" is an FP heuristic bot.
             opts = [("Human", "human"), ("AI", "ai"), ("FP", "fp")]
+            bw, bh, bgap = 78, 34, 8
+            # Right-align the whole strip inside the panel: the last button's
+            # right edge lands on the panel's inner margin.
+            strip_x = px + pw - 24 - (len(opts) * bw + (len(opts) - 1) * bgap)
             for j, (label, ptype) in enumerate(opts):
-                bw, bh = 78, 34
-                bx = px + pw - 24 - (len(opts) - 1 - j) * (bw + 8)
+                bx = strip_x + j * (bw + bgap)
                 by = ry + (row_h - bh) // 2
                 btn = pygame.Rect(bx, by, bw, bh)
                 is_selected = types[name] == ptype
@@ -421,6 +430,13 @@ class MonopolyApp:
         # frames (the only input path during all-AI turns) can toggle the
         # inventory view too.
         self._player_rects = []
+        # Scrollbar geometry from the last drawn side panel, and which panel's
+        # bar the mouse is currently dragging (None when not dragging).
+        self._bar = None
+        self._bar_drag = None
+        # Trade detail under the mouse in the log this frame, drawn as a card
+        # tooltip at the very end of the scene so it sits above everything.
+        self._hover_trade = None
         self.roll_display = None
         self.board_dice = None
         self.vpos = {p.name: float(p.pos) for p in game.players}
@@ -520,13 +536,22 @@ class MonopolyApp:
         pygame.draw.rect(self.screen, fill, rect, border_radius=10)
         pygame.draw.rect(self.screen, EDGE, rect, 1, border_radius=10)
 
-    def add_log(self, message):
-        self.log.append((message, self._log_color(message)))
+    def add_log(self, message, trade=None):
+        """Appends one line to the game log.
+
+        ``trade`` optionally attaches the structured deal behind a trade
+        message -- ``{"proposer", "partner", "give", "receive", "cash",
+        "accepted"}`` -- which ``_draw_log`` renders as a card tooltip when the
+        line is hovered.
+        """
+        lines = self._wrap(message, self.f_small, LOG_TEXT_W)
+        self.log.append({"text": message, "color": self._log_color(message),
+                         "trade": trade, "lines": lines})
         self.log = self.log[-200:]
         # Keep the same lines in view when scrolled back into history; when
         # pinned to the bottom (scroll 0) stay following the newest events.
         if self._log_scroll:
-            self._log_scroll = min(self._log_scroll + 1, len(self.log) - 1)
+            self._log_scroll += len(lines)
 
     def _log_color(self, message):
         """Maps a log line to a colour by the kind of action it describes, so
@@ -650,24 +675,39 @@ class MonopolyApp:
         self._draw_board_dice()
 
     def _draw_board_dice(self):
-        if not self.board_dice:
+        """The dice live in the middle of the board (rather than in a side
+        panel, which the log now has all of): big while a roll animates, and
+        left standing afterwards as the record of the most recent roll."""
+        rolling = self.board_dice is not None
+        dice = self.board_dice or (self.roll_display or {}).get("dice")
+        if not dice:
             return
-        d1, d2 = self.board_dice
-        size, gap = 88, 26
+        d1, d2 = dice
+        size, gap = (88, 26) if rolling else (72, 22)
         cx = BOARD_X + BOARD_PX // 2
         cy = BOARD_Y + BOARD_PX // 2
         total_w = size * 2 + gap
         pad = 24
-        back = pygame.Rect(0, 0, total_w + pad * 2, size + pad * 2)
+        name = (self.roll_display or {}).get("name")
+        caption = (self.f_body.render(
+            f"{name} rolled {d1} + {d2} = {d1 + d2}", True, FELT_INK)
+            if name else None)
+        label_h = caption.get_height() + 8 if caption else 0
+        # The backdrop has to clear the wider of the dice pair and the caption.
+        inner_w = max(total_w, caption.get_width() if caption else 0)
+        back = pygame.Rect(0, 0, inner_w + pad * 2, size + label_h + pad * 2)
         back.center = (cx, cy)
         backdrop = pygame.Surface(back.size, pygame.SRCALPHA)
         pygame.draw.rect(backdrop, (10, 38, 24, 180), backdrop.get_rect(),
                          border_radius=20)
         self.screen.blit(backdrop, back.topleft)
         left = cx - total_w // 2
-        top = cy - size // 2
+        top = back.y + pad
         self._draw_die(left, top, size, d1)
         self._draw_die(left + size + gap, top, size, d2)
+        if caption:
+            self.screen.blit(caption, caption.get_rect(
+                midtop=(cx, top + size + 8)))
 
     # ----- dice ----------------------------------------------------------
 
@@ -688,22 +728,6 @@ class MonopolyApp:
         }
         for px, py in layout.get(value, []):
             pygame.draw.circle(self.screen, PIP, (int(px), int(py)), r)
-
-    def _draw_dice_panel(self, y):
-        box = pygame.Rect(SIDE_X, y, SIDE_W, 96)
-        self._panel(box)
-        if not self.roll_display:
-            self._text("Roll the dice to begin.", (box.x + 16, box.y + 36),
-                       self.f_body, MUTED)
-            return box.bottom
-        d1, d2 = self.roll_display["dice"]
-        self._draw_die(box.x + 16, box.y + 16, 64, d1)
-        self._draw_die(box.x + 92, box.y + 16, 64, d2)
-        name = self.roll_display["name"]
-        self._text(f"{name} rolled", (box.x + 176, box.y + 24), self.f_body, INK)
-        self._text(f"{d1} + {d2} = {d1 + d2}", (box.x + 176, box.y + 52),
-                   self.f_head, INK)
-        return box.bottom
 
     # ----- players & inventory ------------------------------------------
 
@@ -828,7 +852,7 @@ class MonopolyApp:
 
         # A scrollbar on the right edge indicates position when overflowing;
         # nudge the row text left of it so they don't overlap.
-        text_right = SIDE_X + SIDE_W - (12 if max_scroll else 0)
+        text_right = SIDE_X + SIDE_W - (SCROLLBAR_W + 6 if max_scroll else 0)
         for prop in props[scroll:scroll + visible]:
             self._draw_property_chip(prop, SIDE_X, y)
             # Houses/hotel/mortgage shown as icons just right of the name chip.
@@ -843,19 +867,81 @@ class MonopolyApp:
             y += self.ROW_H
 
         if max_scroll:
-            self._draw_inventory_scrollbar(list_top, visible, len(props), scroll)
+            self._draw_side_scrollbar("inv", list_top, visible, len(props),
+                                      scroll, self.ROW_H)
 
-    def _draw_inventory_scrollbar(self, top, visible, total, scroll, row_h=None):
-        """Draws a slim scrollbar for a scrolling side list along the panel edge
-        (the inventory, or the log when ``row_h`` overrides the row height)."""
-        track_h = visible * (row_h or self.ROW_H)
-        x = SIDE_X + SIDE_W - 5
-        pygame.draw.rect(self.screen, FELT_SUB,
-                         pygame.Rect(x, top, 3, track_h), border_radius=2)
-        thumb_h = max(18, int(track_h * visible / total))
-        thumb_y = top + int((track_h - thumb_h) * scroll / max(1, total - visible))
-        pygame.draw.rect(self.screen, FELT_INK,
-                         pygame.Rect(x, thumb_y, 3, thumb_h), border_radius=2)
+    def _draw_side_scrollbar(self, kind, top, visible, total, scroll, row_h):
+        """Draws the draggable scrollbar for a side list (``kind`` is ``"log"``
+        or ``"inv"``). ``scroll`` counts rows hidden *above* the view.
+
+        Records the geometry in ``self._bar`` so ``_handle_side_event`` can turn
+        a click or drag anywhere on the track into a scroll position.
+        """
+        track_h = visible * row_h
+        x = SIDE_X + SIDE_W - SCROLLBAR_W
+        track = pygame.Rect(x, top, SCROLLBAR_W, track_h)
+        pygame.draw.rect(self.screen, (24, 96, 62), track, border_radius=4)
+        pygame.draw.rect(self.screen, (14, 62, 40), track, 1, border_radius=4)
+        max_scroll = max(1, total - visible)
+        thumb_h = max(30, int(track_h * visible / total))
+        thumb_y = top + int((track_h - thumb_h) * min(scroll, max_scroll)
+                            / max_scroll)
+        thumb = pygame.Rect(x, thumb_y, SCROLLBAR_W, thumb_h)
+        hot = self._bar_drag == kind or \
+            track.inflate(self.BAR_GRAB, 0).collidepoint(
+                _DISPLAY.mouse() if _DISPLAY else (-1, -1))
+        pygame.draw.rect(self.screen, FELT_INK if hot else FELT_SUB, thumb,
+                         border_radius=4)
+        self._bar = {"kind": kind, "track": track, "thumb_h": thumb_h,
+                     "max_scroll": max(0, total - visible)}
+
+    BAR_GRAB = 16  # extra px either side of the track that still grabs it
+
+    def _bar_scroll_at(self, mouse_y):
+        """Maps a mouse y on the scrollbar track to a from-the-top scroll row,
+        centring the thumb on the cursor."""
+        bar = self._bar
+        track, thumb_h = bar["track"], bar["thumb_h"]
+        span = max(1, track.height - thumb_h)
+        frac = (mouse_y - track.y - thumb_h / 2) / span
+        return int(round(max(0.0, min(1.0, frac)) * bar["max_scroll"]))
+
+    def _drag_side_bar(self, mouse_y):
+        """Applies a scrollbar drag to whichever list owns the bar. The log
+        counts its scroll backwards (from the newest line), so it is flipped."""
+        bar = self._bar
+        if bar is None:
+            return
+        pos = self._bar_scroll_at(mouse_y)
+        if bar["kind"] == "log":
+            self._log_scroll = bar["max_scroll"] - pos
+        else:
+            self._inv_scroll = pos
+
+    def _handle_side_event(self, event):
+        """Wheel notches and scrollbar clicks/drags for the side panel.
+
+        Returns True when the event was consumed, so the callers' own click
+        handling (buttons, animation-skipping) leaves it alone.
+        """
+        if event.type == pygame.MOUSEWHEEL:
+            self._scroll_side_panel(event.y)
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            was_dragging = self._bar_drag is not None
+            self._bar_drag = None
+            return was_dragging
+        if event.type == pygame.MOUSEMOTION and self._bar_drag:
+            self._drag_side_bar(event.pos[1])
+            return True
+        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                and self._bar is not None):
+            if self._bar["track"].inflate(self.BAR_GRAB, 0).collidepoint(
+                    event.pos):
+                self._bar_drag = self._bar["kind"]
+                self._drag_side_bar(event.pos[1])
+                return True
+        return False
 
     def _scroll_inventory(self, dy):
         """Scrolls the open inventory panel by ``dy`` wheel notches (up = +)."""
@@ -1305,37 +1391,121 @@ class MonopolyApp:
                 pygame.Rect(x, rect.bottom - 12 - cash_h, cw, cash_h), cash)
         return max_scroll
 
-    LOG_ROW_H = 24  # pixel height of one log line
+    LOG_ROW_H = 22   # pixel height of one wrapped log line
+    LOG_WHEEL = 3    # lines the log moves per wheel notch
+
+    def _log_display_lines(self):
+        """The log flattened to one entry per *drawn* line: long messages wrap
+        onto continuation lines (indented, so they read as one message), and
+        every line keeps a reference to the entry it came from for hovering."""
+        flat = []
+        for entry in self.log:
+            for i, line in enumerate(entry["lines"]):
+                flat.append((line, entry["color"], entry,
+                             LOG_INDENT if i else 0))
+        return flat
 
     def _draw_log(self, y, bottom):
         self._text("Log", (SIDE_X, y), self.f_title, FELT_INK, shadow=True)
         list_top = y + 40
         rows = max(0, (bottom - list_top) // self.LOG_ROW_H)
+        flat = self._log_display_lines()
         # Clamp the stored scroll (lines back from the newest) to the history
         # above the last page, so the wheel handler can never overshoot.
-        max_scroll = max(0, len(self.log) - rows)
+        max_scroll = max(0, len(flat) - rows)
         self._log_scroll = max(0, min(self._log_scroll, max_scroll))
-        if not rows or not self.log:
+        if not rows or not flat:
             return
 
-        end = len(self.log) - self._log_scroll
+        end = len(flat) - self._log_scroll
         start = max(0, end - rows)
-        # Leave room for a scrollbar on the right edge when the log overflows.
-        text_right = SIDE_X + SIDE_W - (12 if max_scroll else 0)
+        mouse = _DISPLAY.mouse() if _DISPLAY else (-1, -1)
         y = list_top
-        for line, color in self.log[start:end]:
-            text = self._truncate(line, self.f_small, text_right - SIDE_X)
-            self._text(text, (SIDE_X, y), self.f_small, color, shadow=True)
+        for line, color, entry, indent in flat[start:end]:
+            self._text(line, (SIDE_X + indent, y), self.f_small, color,
+                       shadow=True)
+            # Hovering any line of a trade message pops its cards up; the panel
+            # itself is drawn last (in ``_draw_scene``) so it sits over
+            # everything else.
+            if entry["trade"] is not None:
+                row = pygame.Rect(SIDE_X, y, SIDE_W, self.LOG_ROW_H)
+                if row.collidepoint(mouse):
+                    self._hover_trade = entry["trade"]
+                    pygame.draw.rect(self.screen, ACCENT,
+                                     pygame.Rect(SIDE_X - 6, y, 3,
+                                                 self.LOG_ROW_H - 2))
             y += self.LOG_ROW_H
         if max_scroll:
-            self._draw_inventory_scrollbar(list_top, end - start, len(self.log),
-                                           start, row_h=self.LOG_ROW_H)
+            self._draw_side_scrollbar("log", list_top, end - start, len(flat),
+                                      start, self.LOG_ROW_H)
 
     def _scroll_log(self, dy):
         """Scrolls the game log by ``dy`` wheel notches (up = +, back into
         history); only when no inventory panel has taken over the side area."""
         if self.selected is None:
-            self._log_scroll = max(0, self._log_scroll + dy)
+            self._log_scroll = max(0, self._log_scroll + dy * self.LOG_WHEEL)
+
+    # ----- trade hover tooltip -------------------------------------------
+
+    TIP_W = 380
+    TIP_ROW = 26
+
+    def _draw_trade_tooltip(self, trade):
+        """Renders the deal behind a hovered trade log line: what each side put
+        up, as colour-chipped property rows plus a cash chip, and whether it went
+        through. Drawn left of the side column so it never covers the log."""
+        give, receive = trade["give"], trade["receive"]
+        cash = trade["cash"]
+        # One block per side: (header, properties, cash that side pays).
+        sides = [(f"{trade['proposer']} gives", give, max(0, cash)),
+                 (f"{trade['partner']} gives", receive, max(0, -cash))]
+
+        h = 44
+        for _, props, money in sides:
+            h += 24 + self.TIP_ROW * max(1, len(props)) + (32 if money else 0) + 8
+        rect = pygame.Rect(0, 0, self.TIP_W, h)
+        rect.right = SIDE_X - 12
+        mouse_y = (_DISPLAY.mouse()[1] if _DISPLAY else HEIGHT // 2)
+        rect.top = max(10, min(mouse_y - h // 2, HEIGHT - h - 10))
+
+        shadow = pygame.Surface((rect.w + 12, rect.h + 12), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 90), shadow.get_rect(),
+                         border_radius=14)
+        self.screen.blit(shadow, (rect.x - 6, rect.y - 2))
+        self._panel(rect, PANEL)
+
+        accepted = trade.get("accepted", True)
+        title = f"{trade['proposer']} → {trade['partner']}"
+        self._text(title, (rect.x + 14, rect.y + 10), self.f_head, INK)
+        badge = "accepted" if accepted else "declined"
+        surf = self.f_small.render(badge, True,
+                                   MONEY_INK if accepted else NEG_RED)
+        self.screen.blit(surf, surf.get_rect(
+            topright=(rect.right - 14, rect.y + 15)))
+
+        y = rect.y + 44
+        for i, (header, props, money) in enumerate(sides):
+            if i:
+                pygame.draw.line(self.screen, EDGE, (rect.x + 12, y - 6),
+                                 (rect.right - 12, y - 6))
+            self._text(header, (rect.x + 14, y), self.f_small, MUTED)
+            y += 24
+            if not props:
+                self._text("— nothing —", (rect.x + 22, y), self.f_small, MUTED)
+                y += self.TIP_ROW
+            for prop in self._sorted_props(props):
+                self._draw_property_chip(prop, rect.x + 22, y,
+                                         max_w=self.TIP_W - 130)
+                worth = f"${self._property_worth(prop)}"
+                surf = self.f_small.render(worth, True, MUTED)
+                self.screen.blit(surf, surf.get_rect(
+                    topright=(rect.right - 14, y)))
+                y += self.TIP_ROW
+            if money:
+                self._draw_money_card(
+                    pygame.Rect(rect.x + 18, y - 2, 130, 30), money)
+                y += 32
+            y += 8
 
     def _scroll_side_panel(self, dy):
         """Routes a wheel notch to whichever side panel is showing: the open
@@ -1406,8 +1576,10 @@ class MonopolyApp:
         self.screen.fill(BG)
         self._draw_board()
         self._text("Monopoly", (SIDE_X, 16), self.f_title, PANEL, shadow=True)
-        y = self._draw_dice_panel(54)
-        y, player_rects = self._draw_players(y + 14)
+        # Both are refilled by the side-panel draws below, every frame.
+        self._bar = None
+        self._hover_trade = None
+        y, player_rects = self._draw_players(58)
         y += 8
         box, lines = (None, None)
         content_bottom = HEIGHT - 10
@@ -1422,6 +1594,8 @@ class MonopolyApp:
         buttons = []
         if question:
             buttons = self._draw_prompt(box, lines, options, mouse)
+        if self._hover_trade is not None:
+            self._draw_trade_tooltip(self._hover_trade)
         self._player_rects = player_rects
         return buttons, player_rects
 
@@ -1442,8 +1616,8 @@ class MonopolyApp:
             for event in _DISPLAY.events():
                 if event.type == pygame.QUIT:
                     raise QuitGame
-                if event.type == pygame.MOUSEWHEEL:
-                    self._scroll_side_panel(event.y)
+                if self._handle_side_event(event):
+                    continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, value in buttons:
                         if rect.collidepoint(event.pos):
@@ -1466,14 +1640,15 @@ class MonopolyApp:
         for event in _DISPLAY.events():
             if event.type == pygame.QUIT:
                 raise QuitGame
+            # Scrolling or dragging the inventory / log scrollbar must not skip
+            # the animation, so it is consumed before anything else.
+            if self._handle_side_event(event):
+                continue
             # Only a click *on the board* skips animations -- clicks elsewhere
             # (e.g. on player inventory panels) must not, so they stay usable
             # while AI turns animate. Any key press still skips.
             if event.type == pygame.KEYDOWN:
                 skip = True
-            elif event.type == pygame.MOUSEWHEEL:
-                # Scrolling the inventory or log must not skip the animation.
-                self._scroll_side_panel(event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if board_rect.collidepoint(event.pos):
                     skip = True
@@ -2172,6 +2347,15 @@ class MonopolyApp:
         elif event.unicode.isdigit() and len(state[key]) < 6:
             state[key] = (state[key] + event.unicode).lstrip("0") or ""
 
+    @staticmethod
+    def _trade_detail(proposer, partner, give, receive, cash, accepted=True):
+        """The structured deal carried by a trade log line, for the hover card.
+        ``give`` / ``receive`` are from the proposer's side and ``cash`` is what
+        they pay the partner (negative: the partner pays)."""
+        return {"proposer": proposer.name, "partner": partner.name,
+                "give": list(give), "receive": list(receive), "cash": cash,
+                "accepted": accepted}
+
     def _finalize_trade(self, player, state):
         partner = state["partner"]
         give = [t for t in player.properties if t in state["give"]]
@@ -2180,6 +2364,7 @@ class MonopolyApp:
         if not give and not receive and cash == 0:
             return False
 
+        detail = self._trade_detail(player, partner, give, receive, cash)
         if self._is_ai(partner):
             # The AI evaluates the offer with its valuation formula rather than
             # being asked. From the AI's perspective it gains the properties the
@@ -2190,21 +2375,24 @@ class MonopolyApp:
                 partner, player, give, receive, cash)
             if not accepted:
                 self.add_log(f"{partner.name} [AI] declined {player.name}'s "
-                             f"trade (value {value:+.0f}).")
+                             f"trade (value {value:+.0f}).",
+                             trade={**detail, "accepted": False})
                 return True
             if self.game.execute_trade(player, partner, give, receive, cash):
                 self.add_log(f"{partner.name} [AI] accepted {player.name}'s "
-                             f"trade (value {value:+.0f}).")
+                             f"trade (value {value:+.0f}).", trade=detail)
                 return True
             self.ask("Trade couldn't be completed (the cash payer can't "
                      "afford it).", [("OK", "ok")])
             return False
 
         if not self._confirm_trade(player, partner, give, receive, cash):
-            self.add_log(f"{partner.name} declined {player.name}'s trade.")
+            self.add_log(f"{partner.name} declined {player.name}'s trade.",
+                         trade={**detail, "accepted": False})
             return True
         if self.game.execute_trade(player, partner, give, receive, cash):
-            self.add_log(f"{player.name} and {partner.name} made a trade.")
+            self.add_log(f"{player.name} and {partner.name} made a trade.",
+                         trade=detail)
             return True
         self.ask("Trade couldn't be completed (the cash payer can't afford it).",
                  [("OK", "ok")])

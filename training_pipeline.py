@@ -59,7 +59,7 @@ def main():
     # steps/s, 64 envs = 1420 -- 8x the envs and the memory for 25% more speed.
     # 32 is the knee. For real speed, shrink the SERIAL half: --torch-threads and
     # --n-epochs below.
-    parser.add_argument("--n-envs", type=int, default=32,
+    parser.add_argument("--n-envs", type=int, default=64,
                         help="parallel envs for training. A memory knob, not a "
                              "speed one -- throughput saturates around here")
     parser.add_argument("--episodes", type=int, default=200,
