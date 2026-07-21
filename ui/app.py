@@ -211,6 +211,10 @@ def contrast_text(color):
 
 
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+# Where each played game's transcript is saved (one file per game, named by
+# start time and seed). Relative to the project root, not the shell's cwd.
+GAME_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                            "game_logs")
 
 
 class QuitGame(Exception):
@@ -406,18 +410,30 @@ def _show_error(screen, clock, lines):
 class MonopolyApp:
     """Renders the board and drives a hot-seat / AI game loop."""
 
-    def __init__(self, game, auto=None, ai_deciders=None, screen=None):
+    def __init__(self, game, auto=None, ai_deciders=None, screen=None,
+                 seed=None, log_dir=GAME_LOG_DIR):
         """
         Args:
             game: A constructed game (players, board, decks).
             auto: Optional headless responder ``(question, options) -> value``.
             ai_deciders: dict of ``player_name -> GUIAIDecider`` for AI seats.
             screen: An existing pygame surface to reuse (skips display init).
+            seed: The match seed, recorded in the saved transcript so a game can
+                be replayed with ``--seed``.
+            log_dir: Directory the transcript is written to when the game ends;
+                falsy disables saving.
         """
         self.game = game
         self._auto = auto
         self._ai_deciders = ai_deciders or {}
         self.log = []
+        # The on-screen ``log`` is capped at the last 200 entries, so the full
+        # game transcript is accumulated separately for the saved file.
+        self._transcript = []
+        self._seed = seed
+        self._log_dir = log_dir
+        self._started = time.localtime()
+        self._turn = 0
         self.selected = None
         # Row offset for the open inventory panel, so a player owning more
         # properties than fit on screen can be scrolled through (mouse wheel).
@@ -548,6 +564,12 @@ class MonopolyApp:
         self.log.append({"text": message, "color": self._log_color(message),
                          "trade": trade, "lines": lines})
         self.log = self.log[-200:]
+        # ``_turn`` counts *completed* turns, so the one in progress is the next.
+        self._transcript.append(f"[turn {self._turn + 1:>3}]  {message}")
+        if trade is not None:
+            # The message alone can be vague ("Red and Blue made a trade"), so
+            # spell the deal out underneath it.
+            self._transcript.append(" " * 13 + self._trade_summary(trade))
         # Keep the same lines in view when scrolled back into history; when
         # pinned to the bottom (scroll 0) stay following the newest events.
         if self._log_scroll:
@@ -2806,6 +2828,79 @@ class MonopolyApp:
                 continue
             return choice
 
+    # ----- saved transcript ----------------------------------------------
+
+    def _seat_label(self, player):
+        """How a seat is played: ``human``, ``AI`` (the trained model), or the
+        FP bot's profile name (``FP-A`` …)."""
+        ai = self._ai_deciders.get(player.name)
+        if ai is None:
+            return "human"
+        return getattr(getattr(ai, "_bot", None), "name", None) or "AI"
+
+    def _trade_summary(self, trade):
+        """One-line spelling-out of a trade for the saved transcript."""
+        def side(props, cash):
+            parts = [p.name for p in props]
+            if cash:
+                parts.append(f"${cash}")
+            return ", ".join(parts) or "nothing"
+
+        verdict = "accepted" if trade.get("accepted", True) else "declined"
+        return (f"↳ {trade['proposer']} gives "
+                f"{side(trade['give'], max(0, trade['cash']))}  ⇄  "
+                f"{trade['partner']} gives "
+                f"{side(trade['receive'], max(0, -trade['cash']))}"
+                f"   [{verdict}]")
+
+    def _game_log_path(self):
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S", self._started)
+        seed = f"_seed{self._seed}" if self._seed is not None else ""
+        return os.path.join(self._log_dir, f"game_{stamp}{seed}.log")
+
+    def save_game_log(self):
+        """Writes this game's full transcript to ``log_dir``.
+
+        Called from ``run``'s ``finally``, so a game that is quit part-way (or
+        that raises) still leaves its log behind. Returns the path written, or
+        None when saving is disabled or fails -- a transcript is a nicety and
+        must never take the game down with it.
+        """
+        if not self._log_dir or not self._transcript:
+            return None
+        seats = "   ".join(f"{p.name} ({self._seat_label(p)})"
+                           for p in self.game.players)
+        winner = self.game.winner()
+        header = [
+            "Monopoly — game log",
+            f"Started:  {time.strftime('%Y-%m-%d %H:%M:%S', self._started)}",
+            f"Finished: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Seed:     {self._seed}"
+            + (f"  (replay with --seed {self._seed})"
+               if self._seed is not None else ""),
+            f"Seats:    {seats}  (in turn order)",
+            f"Turns:    {self._turn}",
+            f"Result:   {winner.name + ' wins' if winner else 'unfinished'}",
+            "",
+        ]
+        standings = ["Final standings:"]
+        for p in sorted(self.game.players, key=self._net_worth, reverse=True):
+            state = "bankrupt" if p.bankrupt else \
+                f"${p.balance}, {len(p.properties)} properties"
+            standings.append(f"  {p.name:<7} net ${self._net_worth(p):<7} "
+                             f"{state}")
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+            path = self._game_log_path()
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(header + standings + ["", "-" * 72, ""]
+                                   + self._transcript) + "\n")
+            print(f"Game log saved to {path}")
+            return path
+        except OSError as exc:
+            print(f"Could not save the game log ({exc}).")
+            return None
+
     # ----- end-of-game stats screen --------------------------------------
 
     def _stats_lines(self):
@@ -2935,9 +3030,8 @@ class MonopolyApp:
         the window mid-game). Leaves pygame running so the caller can start a new
         game on the same window."""
         try:
-            turns = 0
             self.stats.snapshot(0)
-            while not self.game.is_over() and turns < max_turns:
+            while not self.game.is_over() and self._turn < max_turns:
                 player = self.game.players[self.game.current_player]
                 choice = self._turn_menu(player)
                 if player.in_jail:
@@ -2947,11 +3041,15 @@ class MonopolyApp:
                 if not player.bankrupt:
                     self._post_roll_manage(player)
                 self._end_turn(player)
-                turns += 1
-                self.stats.snapshot(turns)
+                self._turn += 1
+                self.stats.snapshot(self._turn)
             return self._show_result()
         except QuitGame:
             return "quit"
+        finally:
+            # Save the transcript however the game ended -- finished, quit
+            # mid-game, or interrupted.
+            self.save_game_log()
 
 
 # ---------------------------------------------------------------------------
@@ -3033,6 +3131,11 @@ def main():
         "--deterministic", action="store_true",
         help="make AI players act greedily (same move for the same state). "
              "By default the AI samples its policy so games vary.")
+    parser.add_argument(
+        "--log-dir", default=GAME_LOG_DIR,
+        help="directory each game's transcript is written to "
+             f"(default: {os.path.relpath(GAME_LOG_DIR)}/). Pass an empty "
+             "string to stop saving game logs.")
     args, _ = parser.parse_known_args()
 
     # Find a model to offer AI players.
@@ -3103,7 +3206,8 @@ def main():
         game, ai_deciders = _new_match(
             config, model, ai_names, fp_names, args.deterministic, seed,
             cfg=cfg)
-        result = MonopolyApp(game, ai_deciders=ai_deciders, screen=screen).run()
+        result = MonopolyApp(game, ai_deciders=ai_deciders, screen=screen,
+                             seed=seed, log_dir=args.log_dir).run()
         if result != "restart":
             break
 

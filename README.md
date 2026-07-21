@@ -233,6 +233,8 @@ ui/
 
 training_pipeline.py Chains train -> evaluate -> simulate in one command
 play_gui.py          Launch the human-vs-AI GUI
+
+game_logs/           Transcript of each GUI game played (git-ignored)
 ```
 
 ---
@@ -245,6 +247,10 @@ pytest
 
 # Play against the trained agent (GUI)
 python play_gui.py
+
+# Every GUI game writes a transcript to game_logs/ (one file per game, named by
+# start time and seed, and saved even if you quit part-way).
+python play_gui.py --log-dir ""      # ... unless you turn it off
 
 # Train from scratch (clear the snapshot pool first for a clean run)
 rm -f runs/sp_pool/*.zip
