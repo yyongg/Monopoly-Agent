@@ -60,24 +60,48 @@ to a live game, it is the single place that computes:
 
 - the **observation vector** the policy sees,
 - the **legal-action mask** for each decision phase,
-- every economic **valuation** — tile value, trade value, bid value, balancing
-  cash, "completes my set", "denies an opponent", rent exposure, **how strong a
-  monopoly is** (`_set_strength`), and more,
-- and **the trade rules**: `build_offer()` constructs every proposal (which tile to
-  hand over, how much cash), `accepts()` decides every offer. One implementation
-  each, called by the training env and the GUI alike. `accepts()` also *gates the
-  mask* at both ends — see the trade band below.
+- every economic **valuation** — tile value, trade value, bid value, rent exposure,
+  "completes my set", and more,
+- and **the trade rule**: `accepts()` decides every offer, for every seat, in
+  training and in the GUI alike.
 
-Both the training env and the GUI's AI ([`ui/ai_player.py`](ui/ai_player.py)) import
-and use this same encoder, guaranteeing train/play parity. That guarantee is
-enforced by a test ([`tests/test_trade_parity.py`](tests/test_trade_parity.py)) that
-puts both paths on the same board and asserts they build the identical offer — it
-was written because they *didn't*: a comment claiming the two were "byte-identical"
-was wrong by 3× on a contested trade.
+Group-level economics — what a monopoly is worth, and what a *share* of one is worth
+— live next door in [`engine/valuation.py`](engine/valuation.py) (`SetValuer`,
+exposed as `encoder.sets`), because the reward reads them too. The trade heuristic
+itself is [`engine/trade.py`](engine/trade.py).
+
+Both the training env and the GUI's AI ([`ui/ai_player.py`](ui/ai_player.py)) use
+this same encoder and the same `TradeEngine`, guaranteeing train/play parity. It is
+enforced by a test ([`tests/test_trade_parity.py`](tests/test_trade_parity.py)),
+written because the two paths *had* drifted: a comment claiming they were
+"byte-identical" was wrong by 3× on a contested trade.
+
+### Trading is heuristic, not learned
+
+The policy does not trade. Every offer is built and judged by
+[`engine/trade.py`](engine/trade.py), from the valuations above.
+
+This follows the **hybrid** architecture of [Bonjour et al.
+2021](https://arxiv.org/abs/2103.00683) — a fixed heuristic for the rare,
+valuation-heavy trade decisions and DRL for everything else — which beat their
+pure-DRL agent **91.65% to 69.95%** (DDQN: 76.91% vs 47.41%). Their reasoning holds
+here: trade decisions are too rare to learn a good valuation from, and a valuation is
+something you can just write down. Ours is considerably richer than the paper's
+(which is a plain net-worth difference with a 1.5→2.0 monopoly bonus).
+
+It was also, empirically, not working. The learned responder accepted **~85% of every
+offer put to it**, gave away completed sets for junk, moved **$58,747 of trade cash
+per game** on a board where you start with $1,500, and in one measured game
+ping-ponged a single tile **424 times**.
+
+The engine builds **multi-tile packages** both ways (`trade_max_package`, default 3)
+— it can ask for the two tiles it needs and pay in three it doesn't. The old 84-action
+trade band could not name such an offer, which mattered: when a partner holds two of a
+three-tile group, *no* one-for-one swap can ever complete the set.
 
 ### Observation & action spaces
 
-- **Observation:** a `265`-dim float vector — per-player cash/position/jail state,
+- **Observation:** a `261`-dim float vector — per-player cash/position/jail state,
   per-tile ownership/mortgage/development, per-group monopoly progress,
   completes-my-set / completes-an-opponent's-set flags, expected-profit-per-turn
   features, a landing-frequency prior, **the money the current decision is for**
@@ -85,24 +109,17 @@ was wrong by 3× on a contested trade.
   the player could even raise it, and **the clock** (how far into the game we are).
   Unbounded dollar features are log-compressed (`observation.squash`) so a
   late-game balance cannot drown out the rest of the board.
-- **Actions:** a flat `Discrete(211)` space split into phase bands
+- **Actions:** a flat `Discrete(125)` space split into phase bands
   ([`engine/constants.py`](engine/constants.py)): jail, buy/decline, manage
-  (build / mortgage / unmortgage / **trade proposals** / end turn), liquidate,
-  auction bids, and trade accept/reject. Illegal actions are masked every step, so
-  the policy only ever chooses among legal moves.
-- Trade proposals use a **target + cash-tier** scheme: the agent picks which tile to
-  acquire and a cash tier (0.75× / 1.0× / 1.25× the engine's balancing amount); the
-  engine chooses the give-tile and computes the balancing cash.
-- **The trade band is gated at both ends by `accepts()`**, the same rule the FP bots
-  use. A *proposal* is only offered when the deal it would build is one the partner
-  could actually take (`_offer_would_clear`); *accepting* is only legal when the offer
-  on the table is non-negative by the agent's own valuation. Rejecting is always
-  legal. Without these the policy proposed ~2,800 hopeless offers a game and accepted
-  ~85% of everything put to it — see the trade gotchas below.
+  (build / mortgage / unmortgage / end turn), liquidate, and auction bids. Illegal
+  actions are masked every step, so the policy only ever chooses among legal moves.
+- **There are no trade actions.** Trading used to own 86 of 211 ids — an 84-id
+  proposal band plus accept/reject — and `PHASE_TRADE_RESPOND` was a decision phase.
+  Both are gone.
 
 > **Obs/action shape is locked.** Any change to the observation dimension or action
 > count requires a from-scratch retrain — saved models are shape-locked to
-> `265 / 211`. Reward-coefficient and heuristic-only changes do not change the shape.
+> `261 / 125`. Reward-coefficient and heuristic-only changes do not change the shape.
 
 ### Reward design
 
@@ -119,11 +136,15 @@ The reward ([`engine/rewards.py`](engine/rewards.py)) has a **shaped** and a
   the end is what stops the last step paying out the agent's whole net worth
   (a `+5..+12` spike that dwarfed the `±1` saying who won, training it to *end rich*
   rather than to *win*).
-- Net worth prices a **completed set by how good that set actually is**: each
-  fully-owned group contributes `group price × _set_strength` (see the gotchas), so
-  losing the orange set costs the agent far more shaped reward than losing the
-  utilities. `set_strength_reward_weight` scales the tilt — `0` recovers the old flat
-  behaviour exactly, which makes it a clean ablation baseline.
+- Net worth prices a set by **how good it is and how much of it you hold**: each group
+  contributes `group price × strength × f(k/n)` (see the gotchas), so losing the orange
+  set costs far more shaped reward than losing the utilities, and holding two of three
+  oranges is worth real money. It used to count only groups owned *outright* — 2/3 of
+  orange scored exactly zero, so the policy had no reason to protect a nearly-finished
+  set and no way to learn why the trade heuristic protects one. A *complete* set scores
+  exactly what it did before (`f(1) = 1`), so the reward scale is unchanged.
+  `set_strength_reward_weight` scales the strength tilt — `0` makes every set flat, a
+  clean ablation baseline.
 - On top of that sit one-time bonuses for acquiring tiles, building houses, being
   **first** to a set, and **denying** an opponent a set (the last two also weighted by
   set strength), plus a **solvency penalty** that keeps a rent-sized cash cushion so
@@ -177,12 +198,16 @@ clamp; it should stay at 0).
 engine/            The game-as-an-RL-environment (the core)
   game.py          Pure Monopoly rules engine
   rl_env.py        Gymnasium env: decision-point stepping + action decode
-  observation.py   ObsEncoder — single source of truth (obs, masks, valuations,
-                   and the one trade builder / accept rule)
+  observation.py   ObsEncoder — single source of truth (obs, masks, tile
+                   valuations, and the one accept rule)
+  valuation.py     SetValuer — what a monopoly, and a share of one, is worth
+                   (per-set strength, completion curve, game stage)
+  trade.py         The trade heuristic: packages, bargaining, settlement.
+                   Trading is NOT a policy decision — see the README section
   rewards.py       Reward shaping (net-worth advantage + terminal + solvency)
   config.py        RewardConfig — every tunable coefficient in one dataclass,
                    plus the model metadata sidecar
-  constants.py     Phase ids and the flat action-space layout (211 actions)
+  constants.py     Phase ids and the flat action-space layout (125 actions)
 
 models/            Plain game objects: Board, Tile, Card, Deck, Player
 data/              Static board + card-deck definitions, and board_visits.json
@@ -228,9 +253,12 @@ python -m training.train_selfplay --timesteps 15000000 --n-envs 32 --fp-prob 0.3
 # Sweep a reward coefficient (RewardConfig is injectable; nothing to monkeypatch)
 python -m training.train_selfplay --solvency-penalty-coef 0.05 --save-path runs/sweep_005
 
-# The trade-economics knobs (see the trade gotchas below before touching these)
+# The trade-economics knobs (see the trade gotchas below before touching these).
+# set_progress_exponent and trade_denial_weight interact -- sweep them together.
 python -m training.train_selfplay --trade-denial-weight 0.5 --trade-monopoly-mult 3.0 \
-    --set-strength-clamp 0.3 2.0 --set-strength-reward-weight 1.0
+    --set-progress-exponent 2.5 --set-strength-clamp 0.15 2.0 \
+    --set-quality-clamp 0.75 1.25 --set-strength-reward-weight 1.0 \
+    --stage-inflation-weight 0.5 --stage-inflation-cap 2.0 --trade-max-package 3
 
 # Evaluate vs the strong FP trio (the meaningful benchmark)
 PYTHONPATH=. python -m validation.evaluate runs/monopoly_ppo --episodes 200 --opponent fp
@@ -245,7 +273,7 @@ PYTHONPATH=. python -m validation.simulate runs/monopoly_ppo --games 100
 python training_pipeline.py --n-envs 32 --episodes 200 --games 100
 ```
 
-The deployed model is `runs/monopoly_ppo.zip` (`265`-dim obs, `211` actions), beside
+The deployed model is `runs/monopoly_ppo.zip` (`261`-dim obs, `125` actions), beside
 its `runs/monopoly_ppo.meta.json` sidecar recording the `RewardConfig`, the CLI args
 and the git SHA it was trained with. It loads and runs in both evaluation and the GUI.
 
@@ -253,45 +281,59 @@ and the git SHA it was trained with. It loads and runs in both evaluation and th
 
 ## Design notes & gotchas
 
-- **Trade valuation lives in exactly one place.** `ObsEncoder.build_offer()` and
-  `ObsEncoder.accepts()`. There used to be four implementations (two offer builders,
-  three accept rules) kept in step by comment discipline, and they had already
-  drifted apart. Add trade logic there, not in the env or the UI.
+- **Trade logic lives in exactly one place.** `engine/trade.py` builds every offer,
+  `ObsEncoder.accepts()` judges every offer, `engine/valuation.py` prices every set.
+  There used to be four implementations (two offer builders, three accept rules) kept
+  in step by comment discipline, and they had already drifted. Add trade logic there,
+  not in the env or the UI.
+- **Set value is priced per *group*, not per tile — it is not additive.** Two tiles of
+  one group are worth more together than apart, and giving an orange away while taking
+  another orange is a wash. `SetValuer.swap_delta()` compares each affected group's
+  position before and after the *whole* package; summing per-tile marginals
+  double-counts in both directions. Measured while it did: the engine paid **$2,000
+  for a swap that left both sides exactly where they started** — the "exchanges for no
+  apparent reason" symptom, which turned out to be arithmetic, not strategy.
 - **Blocking must be worth less than completing, or nothing can trade.**
-  `trade_denial_weight` is the single most load-bearing trade knob. At `1.0` a
-  set-completing tile is worth `base + set_value` to the acquirer *and*
-  `base + 1.0 × set_value` to the holder who blocks — the same number. The swap is
-  **zero-sum**, there are no gains from trade, and `accepts()` correctly refuses
-  essentially every offer: monopolies stop forming and games drag to the turn cap.
-  It sits at `0.5` so a bargaining range exists. This was invisible for a long time
-  because the learned policy *ignored* `accepts()` and traded anyway (badly); the
-  accept-guard did not cause the problem, it exposed it. It is also why the FP bots
-  traded so little. Note this is **split from `denial_value_weight`**, which still
+  `trade_denial_weight` is the single most load-bearing trade knob. At `1.0` a tile is
+  worth the same to the player blocking with it as to the player who needs it, every
+  swap is **zero-sum**, there are no gains from trade, and `accepts()` correctly
+  refuses essentially every offer: monopolies stop forming and games drag to the turn
+  cap. It sits at `0.5` so a bargaining range exists. Pinned by
+  `test_zero_sum_denial_kills_every_deal`, because the failure is *silent* — nothing
+  errors, sets just quietly stop forming. Split from `denial_value_weight`, which
   governs auction blocking only.
-- **Sets are not equal: `_set_strength` weighs each one.** A per-group multiplier
-  from *landing traffic × full-development rent*, normalised so the average group
-  scores ~1.0 and clamped by `set_strength_clamp` — so it **redistributes** the flat
-  `trade_monopoly_mult` across sets rather than changing the overall scale. It lands
-  around green 1.58 / red 1.51 / orange 1.40 versus utilities and brown pinned to the
-  0.30 floor. Before it, a 2-tile $300 Utility "monopoly" was priced like the orange
-  set (~$1,800 in trade cash with the first-monopoly weight), and the agents
-  ping-ponged it every few turns: one tile changed hands **424 times in a single
-  game** and ~$59k/game in trade cash sloshed around a board where you start with
-  $1,500. One definition, shared by trades and the reward.
-- **The trade band is gated by `accepts()` at both ends** (proposal *and* accept).
-  Dropping either gate re-opens a pathology, and they are not interchangeable:
-  without the accept-guard the learned responder took ~85% of everything, including
-  handing over completed monopolies; without the proposal gate it re-offered the same
-  refused deal every MANAGE phase forever (~2,800 rejected proposals/game, 100% of
-  them refused by the guard). A healthy run looks like ~4 accepted trades/game, all
-  of them set-completing, and **every rejection a policy choice rather than a wall**
-  (`reject: guard forbade accept` should be ~0).
-- **`overpay_seats` must agree with who actually overpays.** The proposal gate builds
-  the offer to test it, so it needs the same `overpay` flag the caller will use, or it
-  gates on a deal nobody will propose. The env sets it in `_wire_deciders`, the GUI in
-  `bind()`; `None` means every seat overpays (the right default standalone/in tests).
+- **…which is exactly why the no-gift rule cannot be left to the valuation.** The same
+  discount that makes trade possible means handing over a set-completer *costs the
+  giver a fraction of what it hands the taker* — pure joint surplus, and a greedy
+  package builder hunts precisely for that. Measured without the rule: agents handed
+  each other **completed sets to buy single tiles**, 47 trades a game. So
+  `TradeEngine._may_hand_over` bars it outright, unless the deal completes a set for us
+  too and the set we gain is at least as strong as the one we give (a genuine
+  set-for-set). The discount is right for *pricing*; it is not a licence to arm your
+  opponent. Tiles from the group you are buying into are excluded from the payment for
+  the same class of reason — they are a wash, so they sorted to the *top* of the
+  surplus order and crowded out the junk that would actually have paid.
+- **Sets are not equal, and cost is half of why.** `SetValuer.strength` blends
+  *traffic × full-development rent* with *that rent per dollar of capital the set
+  needs*, each normalised to a mean of ~1.0 and clamped (`set_quality_clamp` on the
+  cost tilt, `set_strength_clamp` on the blend) — so it **redistributes**
+  `trade_monopoly_mult` across sets rather than changing the overall scale. Landing at
+  **orange 1.73 > red 1.49 > yellow 1.37 > dark_blue 1.28 > green 1.21 > pink 1.05 >
+  railroad 0.83 > light_blue 0.82 > brown/utility at the 0.15 floor**. The cost term is
+  load-bearing: on earning power alone **green outranks orange**, because green has the
+  highest hotel rent on the board — and costs $3,000 to develop, with the worst payback
+  of any street set. Getting that backwards is a Monopoly-strategy error, not a
+  rounding one. One definition, shared by trades and the reward.
+- **The completion curve is what killed junk-for-monopoly.** Set value scales by
+  `f(k, n) = (k/n) ** set_progress_exponent`, so every share of a group is worth
+  something. It replaced a step function that paid a set premium **only** at exactly
+  one-tile-from-complete: a player holding 2/3 of orange priced St. James at its **$227
+  sticker — the same as with 1/3 of the set — and would sell it for a brown and $200**,
+  while the identical tile was worth **$4,937** once the set was whole. A 21.7× cliff
+  with nothing underneath it, which is precisely how a human traded junk to the AI for
+  monopolies. It is now a ~2× step. Pinned by `TestNoCliff`.
 - **Obs/action shape changes ⇒ from-scratch retrain.** All saved models are locked to
-  `265 / 211`. The opponent pool checks the shape and skips stale snapshots.
+  `261 / 125`. The opponent pool checks the shape and skips stale snapshots.
 - **The landing-frequency table is part of the observation.** `data/board_visits.json`
   scales every traffic-derived feature and valuation. It is tracked static data, and
   a missing table now fails loudly instead of silently substituting a uniform prior
@@ -301,8 +343,26 @@ and the git SHA it was trained with. It loads and runs in both evaluation and th
   monopolies far higher; the health metric `mean_set_completion_bid_ratio` (from
   `simulate.py`) should stay near retail. Do not "fix" auctions with the trade
   multiplier. This is why the denial weight is **two knobs**: `denial_value_weight`
-  (auctions, `1.0`) and `trade_denial_weight` (trades, `0.5`). `_set_strength` is
-  likewise trade/reward-only and deliberately not applied to `_bid_value`.
+  (auctions, `1.0`) and `trade_denial_weight` (trades, `0.5`). Set strength and the
+  completion curve are likewise trade/reward-only and deliberately not applied to
+  `_bid_value`.
+- **The stage multiplier is trade-only, on purpose.** Set values scale with the
+  board's cash inflation (`stage()`: mean live balance vs. the $1,500 start, capped) —
+  everyone laps Go, so a fixed set price gets cheap in real terms and the agent would
+  sell a monopoly for what was a fortune on turn 5. But the **reward must not** do
+  this: a cash-inflating term in `Φ` makes the shaping potential drift upward and pays
+  the agent for making everyone richer. Trades price against today's board; net worth
+  is absolute. Pinned by `test_the_reward_is_stage_free`.
+  There is a real tension here worth knowing about: cash inflation argues set prices
+  should *rise* late, while a shrinking rent horizon argues their EV *falls*. Only
+  inflation is modelled. If late-game trading stalls, `stage_inflation_cap` is the knob.
+- **Trade health is measurable without a model**, since trading is pure heuristic —
+  which makes it cheap to check before spending compute on a retrain. A healthy run
+  (25 games, random legal actions elsewhere): **~4 accepted trades/game, one tile
+  changing hands ≤ ~5 times, ~$1.8k of trade cash/game, zero self-set-breaks, zero
+  monopoly gifts.** Compare the old code: 85% accept rate, 424 trades of one tile,
+  $58,747/game. Note the accept rate is ~100% by construction now and means nothing —
+  the engine only proposes deals it has already checked will clear.
 - **Analytics observe, they don't patch.** `simulate.py` used to monkey-patch the
   env's private methods to count trades and bankruptcies, so any refactor silently
   broke it. The engine now reports these (`Game.on_bankrupt`,
